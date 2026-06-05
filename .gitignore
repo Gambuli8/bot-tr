@@ -1,0 +1,40 @@
+# Secretos
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Entorno virtual
+venv/
+.venv/
+env/
+ENV/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Estado runtime del bot (paper trading, journals, audit)
+data/
+logs/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backups locales
+*.bak
+*.before_*
