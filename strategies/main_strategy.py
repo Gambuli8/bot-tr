@@ -6,6 +6,7 @@ Soporta MODO TESTING (sin Claude, reglas técnicas).
 
 import time
 from datetime import datetime, date
+from typing import Optional
 from logs.logger import logger
 from config.settings import Settings
 from core.exchange import ExchangeClient
@@ -63,6 +64,12 @@ class MainStrategy:
         logger.info("MainStrategy inicializada")
 
     def run_once(self) -> dict:
+        """
+        Un ciclo del SCANNER LOOP: recorre los símbolos de settings.symbols de
+        forma SECUENCIAL (no asyncio) para no saturar la API ni arriesgar bans.
+        ccxt ya serializa con enableRateLimit. Cada símbolo se evalúa y opera de
+        forma independiente; el candado de exposición global vive en el OrderManager.
+        """
         cycle_result = {
             "timestamp": datetime.utcnow().isoformat(),
             "action": "ESPERAR", "reason": "", "error": None,
@@ -72,145 +79,59 @@ class MainStrategy:
             # Schedule: detectar transición y notificar.
             self._check_schedule_transition()
 
-            # 0. ¿Pedido de cierre manual via Telegram?
-            if self.controller is not None and self.controller.consume_force_close():
-                if self.order_manager.state.open_position is not None:
-                    df = self.exchange.get_ohlcv()
-                    snapshot = self.indicator_engine.calculate(df)
-                    reason = "Cierre manual via Telegram"
-                    direction_closed = self.order_manager.state.open_position.get(
-                        "direction", "LONG"
-                    )
-                    trade = self.order_manager.close_position(snapshot, reason)
-                    self.telegram.notify_sell(
-                        price=snapshot.price,
-                        pnl_usdt=trade.get("pnl", 0),
-                        pnl_pct=trade.get("pnl_pct", 0),
-                        reason=reason,
-                        direction=direction_closed,
-                    )
-                    cycle_result["action"] = f"CERRAR_{direction_closed}"
-                    cycle_result["reason"] = reason
-                    logger.info("Ciclo abreviado: cierre manual ejecutado")
-                else:
-                    logger.info("Force close pedido pero no había posición abierta")
-                return cycle_result
+            # 0. ¿Pedido(s) de cierre manual via Telegram? (puede targetear símbolos)
+            if self.controller is not None:
+                close_targets = self.controller.consume_force_close()
+                if close_targets:
+                    self._handle_force_close(close_targets, cycle_result)
+                    return cycle_result
 
-            # SLEEP PROFUNDO: si estamos pausados (manualmente o por schedule)
-            # Y no hay posición abierta, salimos sin pegar al exchange ni calcular
-            # indicators. Esto evita gasto de CPU/red cuando no hay nada que hacer.
+            # SLEEP PROFUNDO: pausados (manual o schedule) y SIN posiciones abiertas.
             schedule_paused = self._is_schedule_paused()
             manual_paused = (
                 self.controller is not None and self.controller.is_paused
             )
-            no_position = self.order_manager.state.open_position is None
-            if (manual_paused or schedule_paused) and no_position:
+            if (manual_paused or schedule_paused) and self.order_manager.count_open() == 0:
                 why = "pausado por /off" if manual_paused else "fuera de horario activo"
                 cycle_result["action"] = "ESPERAR"
-                cycle_result["reason"] = f"Dormido ({why}), sin posición abierta"
+                cycle_result["reason"] = f"Dormido ({why}), sin posiciones abiertas"
                 logger.debug(f"Sleep profundo: {why}")
                 return cycle_result
-
-            df = self.exchange.get_ohlcv()
-            snapshot = self.indicator_engine.calculate(df)
-            trade_history = self._load_recent_trades()
-            # MTF context (cacheado 5 min en el exchange)
-            mtf = None
-            if self.settings.require_mtf_confluence:
-                try:
-                    mtf = self.exchange.get_mtf_context()
-                except Exception as e:
-                    logger.warning(f"No pude traer MTF context: {e}")
-            try:
-                decision = self.agent.analyze(snapshot, trade_history, mtf=mtf)
-            except TypeError:
-                # Fallback: el agente no soporta mtf (ej. ClaudeAgent legacy)
-                decision = self.agent.analyze(snapshot, trade_history)
-
-            # Telegram: por defecto NO mandamos diagnóstico por ciclo (es spam).
-            # En su lugar, cada 30 min mandamos un "panorama" amigable.
-            now_ts = time.time()
-            if (now_ts - self._last_panorama_at) >= self._panorama_interval_seconds:
-                try:
-                    stats = self.order_manager.get_stats()
-                    self.telegram.notify_panorama(stats, snapshot, decision, mtf=mtf)
-                    self._last_panorama_at = now_ts
-                except Exception as e:
-                    logger.warning(f"No pude mandar panorama: {e}")
 
             if hasattr(self.agent, 'is_safe_mode') and self.agent.is_safe_mode:
                 self.telegram.notify_critical(
                     "Circuit breaker de Claude activado. Bot en modo SAFE."
                 )
 
-            # ¿TP escalado? Si tocamos TP1, tomamos ganancia parcial y movemos
-            # el SL a breakeven antes de evaluar el cierre del remanente.
-            try:
-                partial = self.order_manager.maybe_take_partial_tp1(snapshot)
-                if partial:
-                    self.telegram.notify_partial_tp(
-                        price=partial["price"],
-                        portion_btc=partial["portion_btc"],
-                        pnl_usdt=partial["pnl_usdt"],
-                        new_stop=partial["new_stop"],
-                        direction=partial["direction"],
-                    )
-            except Exception as e:
-                logger.warning(f"No pude procesar TP1 parcial: {e}")
+            # ── SCANNER: símbolo por símbolo, secuencial ──
+            per_symbol: list[dict] = []
+            actions: list[str] = []
+            for symbol in self.settings.symbols:
+                info = self._process_symbol(symbol, manual_paused, schedule_paused)
+                if info is None:
+                    continue
+                per_symbol.append(info)
+                if info["action"] != "ESPERAR":
+                    actions.append(f"{symbol}:{info['action']}")
 
-            # ¿Cerrar posición? (LONG o SHORT, lógica adentro del order_manager)
-            should_close, close_reason = self.order_manager.should_close(snapshot, decision)
-            if should_close:
-                pos_before = self.order_manager.state.open_position or {}
-                direction_closed = pos_before.get("direction", "LONG")
-                trade = self.order_manager.close_position(snapshot, close_reason)
-                self.telegram.notify_sell(
-                    price=snapshot.price,
-                    pnl_usdt=trade.get("pnl", 0),
-                    pnl_pct=trade.get("pnl_pct", 0),
-                    reason=close_reason,
-                    direction=direction_closed,
-                )
-                cycle_result["action"] = f"CERRAR_{direction_closed}"
-                cycle_result["reason"] = close_reason
-
-            # ¿Pausado por Telegram?  (SL/TP siguen activos arriba)
-            elif self.controller is not None and self.controller.is_paused:
-                cycle_result["action"] = "ESPERAR"
-                cycle_result["reason"] = "Bot pausado por comando /pause"
-                logger.info("Apertura saltada: bot pausado por Telegram")
-
-            # ¿Fuera del horario activo? (igual que pause, sólo afecta aperturas)
-            elif schedule_paused:
-                cycle_result["action"] = "ESPERAR"
-                cycle_result["reason"] = "Fuera del horario activo (/schedule)"
-                logger.info("Apertura saltada: fuera del horario activo")
-
-            # ¿Abrir posición? (LONG si COMPRAR, SHORT si VENDER)
-            elif self.order_manager.should_open(decision, snapshot):
-                position = self.order_manager.open_position(snapshot, decision)
-                if position:
-                    self.telegram.notify_buy(
-                        price=position.entry_price,
-                        amount_btc=position.amount_btc,
-                        stop_loss=position.stop_loss,
-                        take_profit=position.take_profit,
-                        reason=decision.razon,
-                        confidence=position.claude_confidence,
-                        direction=position.direction,
-                    )
-                    cycle_result["action"] = f"ABRIR_{position.direction}"
-                    cycle_result["reason"] = decision.razon
-            else:
-                cycle_result["action"] = "ESPERAR"
-                cycle_result["reason"] = decision.razon
+            # Panorama de PORTAFOLIO cada 30 min (un solo mensaje con las N monedas).
+            now_ts = time.time()
+            if (now_ts - self._last_panorama_at) >= self._panorama_interval_seconds:
+                try:
+                    stats = self.order_manager.get_stats()
+                    self.telegram.notify_multi_panorama(stats, per_symbol)
+                    self._last_panorama_at = now_ts
+                except Exception as e:
+                    logger.warning(f"No pude mandar panorama: {e}")
 
             stats = self.order_manager.get_stats()
+            cycle_result["action"] = "OPERANDO" if actions else "ESPERAR"
+            cycle_result["reason"] = ", ".join(actions) if actions else "sin señales accionables"
             logger.info(
-                f"Ciclo completado | {cycle_result['action']} | "
-                f"Capital: ${stats['capital']:,.2f} | "
-                f"Trades: {stats['total_trades']} | "
-                f"Win rate: {stats['win_rate_pct']:.1f}%"
+                f"Ciclo completado | {len(self.settings.symbols)} símbolos | "
+                f"{cycle_result['reason']} | Equity: ${stats['capital']:,.2f} | "
+                f"Abiertas: {stats['open_positions_count']}/{stats['max_concurrent_trades']} | "
+                f"Trades: {stats['total_trades']} | WR: {stats['win_rate_pct']:.1f}%"
             )
 
             self._maybe_send_daily_report(stats)
@@ -221,6 +142,126 @@ class MainStrategy:
             self.telegram.notify_warning(f"Error en ciclo: {str(e)[:200]}")
 
         return cycle_result
+
+    def _process_symbol(
+        self, symbol: str, manual_paused: bool, schedule_paused: bool,
+    ) -> Optional[dict]:
+        """
+        Evalúa y opera UN símbolo: data → decisión → gestión (TP1/cierre) → entrada.
+        La entrada queda sujeta al candado global dentro de order_manager.should_open.
+        Devuelve un resumen para el panorama, o None si falló la lectura de datos.
+        """
+        try:
+            df = self.exchange.get_ohlcv(symbol)
+            snapshot = self.indicator_engine.calculate(df)
+            # Aseguramos que el snapshot sepa de qué símbolo es (IndicatorEngine
+            # usa settings.symbol como default).
+            try:
+                snapshot.symbol = symbol
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"[{symbol}] No pude leer/computar datos: {e}")
+            return None
+
+        mtf = None
+        if self.settings.require_mtf_confluence:
+            try:
+                mtf = self.exchange.get_mtf_context(symbol)
+            except Exception as e:
+                logger.warning(f"[{symbol}] No pude traer MTF context: {e}")
+
+        trade_history = self._load_recent_trades(symbol)
+        try:
+            decision = self.agent.analyze(snapshot, trade_history, mtf=mtf)
+        except TypeError:
+            decision = self.agent.analyze(snapshot, trade_history)
+
+        action = "ESPERAR"
+        reason = decision.razon
+
+        # TP escalado: parcial en TP1 + breakeven, antes de evaluar el cierre.
+        try:
+            partial = self.order_manager.maybe_take_partial_tp1(snapshot, symbol)
+            if partial:
+                self.telegram.notify_partial_tp(
+                    price=partial["price"], portion_btc=partial["portion_btc"],
+                    pnl_usdt=partial["pnl_usdt"], new_stop=partial["new_stop"],
+                    direction=partial["direction"], symbol=symbol,
+                )
+        except Exception as e:
+            logger.warning(f"[{symbol}] No pude procesar TP1 parcial: {e}")
+
+        # ¿Cerrar?
+        should_close, close_reason = self.order_manager.should_close(snapshot, decision, symbol)
+        if should_close:
+            pos_before = self.order_manager.state.open_positions.get(symbol, {})
+            direction_closed = pos_before.get("direction", "LONG")
+            trade = self.order_manager.close_position(snapshot, close_reason, symbol)
+            self.telegram.notify_sell(
+                price=snapshot.price, pnl_usdt=trade.get("pnl", 0),
+                pnl_pct=trade.get("pnl_pct", 0), reason=close_reason,
+                direction=direction_closed, symbol=symbol,
+            )
+            action, reason = f"CERRAR_{direction_closed}", close_reason
+
+        elif manual_paused:
+            reason = "bot pausado (/off)"
+        elif schedule_paused:
+            reason = "fuera del horario activo"
+
+        # ¿Abrir? (sujeto al candado global)
+        elif self.order_manager.should_open(decision, snapshot, symbol):
+            position = self.order_manager.open_position(snapshot, decision, symbol)
+            if position:
+                self.telegram.notify_buy(
+                    price=position.entry_price, amount_btc=position.amount_btc,
+                    stop_loss=position.stop_loss, take_profit=position.take_profit,
+                    reason=decision.razon, confidence=position.claude_confidence,
+                    direction=position.direction, symbol=symbol,
+                )
+                action, reason = f"ABRIR_{position.direction}", decision.razon
+
+        return {
+            "symbol": symbol, "price": snapshot.price, "action": action,
+            "reason": reason, "decision": decision.accion,
+            "has_position": self.order_manager.has_position(symbol),
+        }
+
+    def _handle_force_close(self, targets: list[str], cycle_result: dict) -> None:
+        """Cierra a mercado los símbolos pedidos por Telegram ('*' = todos)."""
+        syms: list[str] = []
+        for t in targets:
+            if t == "*":
+                syms.extend(self.order_manager.open_symbols())
+            else:
+                syms.append(t)
+        closed = []
+        for sym in dict.fromkeys(syms):   # de-dup preservando orden
+            if not self.order_manager.has_position(sym):
+                continue
+            try:
+                df = self.exchange.get_ohlcv(sym)
+                snapshot = self.indicator_engine.calculate(df)
+                reason = "Cierre manual via Telegram"
+                direction_closed = self.order_manager.state.open_positions[sym].get(
+                    "direction", "LONG"
+                )
+                trade = self.order_manager.close_position(snapshot, reason, sym)
+                self.telegram.notify_sell(
+                    price=snapshot.price, pnl_usdt=trade.get("pnl", 0),
+                    pnl_pct=trade.get("pnl_pct", 0), reason=reason,
+                    direction=direction_closed, symbol=sym,
+                )
+                closed.append(sym)
+            except Exception as e:
+                logger.error(f"[{sym}] Error en cierre manual: {e}")
+        if closed:
+            cycle_result["action"] = "CERRAR_MANUAL"
+            cycle_result["reason"] = f"cerrados: {', '.join(closed)}"
+            logger.info(f"Ciclo abreviado: cierre manual ejecutado ({', '.join(closed)})")
+        else:
+            logger.info("Force close pedido pero no había posiciones que cerrar")
 
     def run_forever(self, interval_seconds: int = 900) -> None:
         # En modo testing, override el intervalo
@@ -308,7 +349,7 @@ class MainStrategy:
             )
         self._was_schedule_paused = now_paused
 
-    def _load_recent_trades(self) -> list[dict]:
+    def _load_recent_trades(self, symbol: Optional[str] = None) -> list[dict]:
         from pathlib import Path
         journal_path = Path(__file__).parent.parent / "data" / "trade_journal.jsonl"
         if not journal_path.exists():
@@ -317,6 +358,12 @@ class MainStrategy:
             import json
             lines = journal_path.read_text().strip().split("\n")
             trades = [json.loads(line) for line in lines if line.strip()]
+            if symbol is not None:
+                # Trades viejos sin "symbol" se asumen del símbolo primario.
+                trades = [
+                    t for t in trades
+                    if t.get("symbol", self.settings.symbol) == symbol
+                ]
             return trades[-10:]
         except Exception as e:
             logger.warning(f"No se pudo cargar journal: {e}")

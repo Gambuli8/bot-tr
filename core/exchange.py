@@ -5,6 +5,7 @@ Manejo de rate limiting, reintentos y validación de conexión.
 """
 
 import time
+import math
 import functools
 from typing import Optional
 import ccxt
@@ -49,9 +50,11 @@ class ExchangeClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.exchange = self._init_exchange()
-        # Cache MTF
-        self._mtf_cache = None
-        self._mtf_cache_at: float = 0.0
+        # Cache MTF por símbolo: {symbol: (mtf, ts)}
+        self._mtf_cache: dict = {}
+        # Filtros del exchange por símbolo (LOT_SIZE/PRICE_FILTER/MIN_NOTIONAL).
+        # Se llenan con load_symbol_filters() al startup.
+        self.filters: dict = {}
         # En testnet, los datos OHLCV están sintéticos (precio cuasi-flat, ATR ínfimo).
         # Para que el motor técnico tenga sobre qué decidir, leemos OHLCV de mainnet
         # (read-only, sin credenciales). Las órdenes siguen yendo a self.exchange.
@@ -90,25 +93,91 @@ class ExchangeClient:
         """
         Verifica que la conexión es válida antes de arrancar el bot.
         Lanza excepción si algo falla — el bot NO debe arrancar.
+        Valida TODOS los símbolos del portafolio y cachea sus filtros.
         """
         # 1. Verificar credenciales y obtener balance
         balance = self.exchange.fetch_balance()
         usdt_balance = balance.get("USDT", {}).get("free", 0)
         logger.info(f"✅ Conexión validada | Balance USDT: {usdt_balance:.2f}")
 
-        # 2. Verificar que el par existe
+        # 2. Cargar markets + filtros de cada símbolo del portafolio
         markets = self.exchange.load_markets()
-        symbol = self.settings.symbol
-        if symbol not in markets:
-            raise ValueError(f"Par {symbol} no disponible en este exchange")
-        logger.info(f"✅ Par {symbol} disponible")
+        for symbol in self.settings.symbols:
+            if symbol not in markets:
+                raise ValueError(f"Par {symbol} no disponible en este exchange")
+        self.load_symbol_filters(markets)
+        logger.info(f"✅ {len(self.settings.symbols)} pares disponibles: "
+                    f"{', '.join(self.settings.symbols)}")
 
-        # 3. Obtener precio actual como último check (de mainnet si estamos en testnet)
+        # 3. Precio actual del primario como último check
+        symbol = self.settings.symbol
         ticker = self.data_exchange.fetch_ticker(symbol)
         source = "mainnet" if self.settings.binance_testnet else "exchange"
         logger.info(f"✅ Precio actual {symbol}: ${ticker['last']:,.2f} ({source})")
 
         return True
+
+    def load_symbol_filters(self, markets: Optional[dict] = None) -> dict:
+        """
+        Carga y cachea en memoria las reglas de cada símbolo del portafolio:
+        LOT_SIZE (stepSize/minQty), PRICE_FILTER (tickSize) y MIN_NOTIONAL.
+        Se aplican para redondear matemáticamente cantidad/precio antes de ordenar.
+        """
+        if markets is None:
+            markets = self.exchange.load_markets()
+        for symbol in self.settings.symbols:
+            market = markets.get(symbol)
+            if not market:
+                logger.warning(f"[{symbol}] sin market data, no puedo cargar filtros")
+                continue
+            self.filters[symbol] = self._extract_filters(market)
+            f = self.filters[symbol]
+            logger.info(
+                f"[{symbol}] filtros | step={f['step']} minQty={f['min_qty']} "
+                f"tick={f['tick']} minNotional={f['min_notional']}"
+            )
+        return self.filters
+
+    @staticmethod
+    def _extract_filters(market: dict) -> dict:
+        """Extrae los filtros relevantes del market de ccxt (Binance)."""
+        raw = {ft.get("filterType"): ft for ft in market.get("info", {}).get("filters", [])}
+        lot = raw.get("LOT_SIZE", {})
+        price = raw.get("PRICE_FILTER", {})
+        notional = raw.get("NOTIONAL", raw.get("MIN_NOTIONAL", {}))
+
+        def _f(d, *keys):
+            for k in keys:
+                v = d.get(k)
+                if v not in (None, ""):
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        pass
+            return 0.0
+
+        return {
+            "step": _f(lot, "stepSize") or None,
+            "min_qty": _f(lot, "minQty"),
+            "tick": _f(price, "tickSize") or None,
+            "min_notional": _f(notional, "minNotional", "notional"),
+        }
+
+    def round_amount(self, symbol: str, amount: float) -> float:
+        """Redondea la cantidad HACIA ABAJO al múltiplo del stepSize (LOT_SIZE)."""
+        flt = self.filters.get(symbol)
+        if not flt or not flt.get("step"):
+            return float(self.exchange.amount_to_precision(symbol, amount))
+        step = flt["step"]
+        return math.floor(amount / step) * step
+
+    def round_price(self, symbol: str, price: float) -> float:
+        """Redondea el precio al múltiplo del tickSize (PRICE_FILTER)."""
+        flt = self.filters.get(symbol)
+        if not flt or not flt.get("tick"):
+            return float(self.exchange.price_to_precision(symbol, price))
+        tick = flt["tick"]
+        return math.floor(price / tick) * tick
 
     @retry(max_attempts=3, base_delay=1.0)
     def get_ohlcv(
@@ -145,19 +214,21 @@ class ExchangeClient:
 
         return df
 
-    def get_mtf_context(self, cache_seconds: int = 300):
+    def get_mtf_context(self, symbol: Optional[str] = None, cache_seconds: int = 300):
         """
-        Devuelve MTFContext (tendencia + ADX en 1h y 4h). Cacheado.
+        Devuelve MTFContext (tendencia + ADX en 1h y 4h) para `symbol`. Cacheado
+        por símbolo (5 min) para no hammear el API en el scanner multi-symbol.
         Lee de mainnet vía data_exchange.
         """
         import time as _time
         from core.mtf_context import build_mtf_context
 
+        symbol = symbol or self.settings.symbol
         now = _time.time()
-        if self._mtf_cache is not None and (now - self._mtf_cache_at) < cache_seconds:
-            return self._mtf_cache
+        cached = self._mtf_cache.get(symbol)
+        if cached is not None and (now - cached[1]) < cache_seconds:
+            return cached[0]
 
-        symbol = self.settings.symbol
         # 1h: 220 velas (warmup EMA200) ≈ 9 días
         raw_1h = self.data_exchange.fetch_ohlcv(symbol, "1h", limit=300)
         df_1h = pd.DataFrame(raw_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -166,10 +237,9 @@ class ExchangeClient:
         df_4h = pd.DataFrame(raw_4h, columns=["timestamp", "open", "high", "low", "close", "volume"])
 
         mtf = build_mtf_context(df_1h, df_4h)
-        self._mtf_cache = mtf
-        self._mtf_cache_at = now
+        self._mtf_cache[symbol] = (mtf, now)
         logger.info(
-            f"MTF actualizado | 1h: {mtf.trend_1h} adx={mtf.adx_1h:.1f} | "
+            f"[{symbol}] MTF actualizado | 1h: {mtf.trend_1h} adx={mtf.adx_1h:.1f} | "
             f"4h: {mtf.trend_4h} adx={mtf.adx_4h:.1f}"
         )
         return mtf
@@ -198,47 +268,52 @@ class ExchangeClient:
         side: str,
         amount_usdt: float,
         client_order_id: str,
+        symbol: Optional[str] = None,
     ) -> dict:
         """
-        Coloca una orden de mercado.
+        Coloca una orden de mercado en `symbol`.
         side: 'buy' o 'sell'
-        amount_usdt: capital a usar en USDT
-        client_order_id: ID único para idempotencia
+        amount_usdt: notional en USDT (en ambos lados) — se convierte a cantidad
+                     del activo base con el precio actual.
+        Aplica redondeo dinámico (stepSize) y valida minQty / MIN_NOTIONAL antes
+        de mandar. Si no llega a los mínimos, lanza ValueError (no manda la orden).
         """
-        symbol = self.settings.symbol
+        symbol = symbol or self.settings.symbol
         price = self.get_price(symbol)
 
-        if side == "buy":
-            # Calculamos cuánto BTC podemos comprar
-            amount_btc = amount_usdt / price
-            # Ajustar a la precisión del par
-            amount_btc = self.exchange.amount_to_precision(symbol, amount_btc)
-        else:
-            # Para vender, amount_usdt representa la cantidad de BTC a vender
-            amount_btc = amount_usdt
-            amount_btc = self.exchange.amount_to_precision(symbol, amount_btc)
+        amount = self.round_amount(symbol, amount_usdt / price)
+        flt = self.filters.get(symbol, {})
+        if flt.get("min_qty") and amount < flt["min_qty"]:
+            raise ValueError(
+                f"{symbol}: cantidad {amount} < minQty {flt['min_qty']} (LOT_SIZE)"
+            )
+        notional = amount * price
+        if flt.get("min_notional") and notional < flt["min_notional"]:
+            raise ValueError(
+                f"{symbol}: notional ${notional:,.2f} < MIN_NOTIONAL "
+                f"${flt['min_notional']:,.2f}"
+            )
 
         params = {"newClientOrderId": client_order_id}
-
         order = self.exchange.create_market_order(
             symbol=symbol,
             side=side,
-            amount=float(amount_btc),
+            amount=float(amount),
             params=params,
         )
 
         logger.info(
-            f"📋 Orden ejecutada | {side.upper()} {amount_btc} BTC "
-            f"@ ~${price:,.2f} | ID: {client_order_id}"
+            f"📋 Orden ejecutada | {side.upper()} {amount} {symbol} "
+            f"@ ~${price:,.2f} (notional ${notional:,.2f}) | ID: {client_order_id}"
         )
         return order
 
     @retry(max_attempts=3, base_delay=1.0)
-    def get_open_orders(self) -> list:
-        """Retorna órdenes abiertas del par configurado."""
-        return self.exchange.fetch_open_orders(self.settings.symbol)
+    def get_open_orders(self, symbol: Optional[str] = None) -> list:
+        """Retorna órdenes abiertas del par dado (o el primario)."""
+        return self.exchange.fetch_open_orders(symbol or self.settings.symbol)
 
     @retry(max_attempts=3, base_delay=1.0)
-    def cancel_order(self, order_id: str) -> dict:
+    def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> dict:
         """Cancela una orden por ID."""
-        return self.exchange.cancel_order(order_id, self.settings.symbol)
+        return self.exchange.cancel_order(order_id, symbol or self.settings.symbol)

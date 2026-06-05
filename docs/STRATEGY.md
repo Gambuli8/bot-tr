@@ -40,6 +40,32 @@ agent-trading/
 └── docs/                            # Este archivo + BACKTESTS.md.
 ```
 
+## Arquitectura Multi-Symbol (pool compartido + candado global)
+
+El bot escanea y opera una **lista de símbolos** (`SYMBOLS`, ej. BTC, ETH, SOL,
+BNB, AVAX) sobre un **único capital compartido** (210 USDT). Pilares:
+
+1. **Estado por símbolo**: `state.json` guarda `open_positions` indexado por
+   símbolo (`{"ETH/USDT": {...}}`). Entradas/salidas independientes por moneda.
+   Migración automática del formato viejo (single-symbol `open_position`).
+2. **Scanner secuencial**: `main_strategy.run_once()` recorre los símbolos uno
+   por uno (no asyncio) apoyándose en `enableRateLimit` de ccxt. ~15 requests por
+   ciclo de 15 min → sin riesgo de ban. MTF cacheado 5 min **por símbolo**.
+3. **Filtros dinámicos**: al startup, `exchange.load_symbol_filters()` cachea
+   LOT_SIZE/PRICE_FILTER/MIN_NOTIONAL de cada par y redondea matemáticamente
+   (`round_amount`/`round_price`) + valida mínimos antes de cada orden.
+4. **Candado de exposición global** (`MAX_CONCURRENT_TRADES`, default 2): si ya
+   hay N posiciones abiertas, se ignora cualquier señal nueva hasta que se cierre
+   una. Vive en `OrderManager.should_open`.
+
+**Sizing del pool compartido**: cada trade arriesga `max_risk_per_trade` del
+**equity total** (cash libre + notional comprometido), y el notional se topea a
+`tradeable / max_concurrent_trades` para que las N posiciones quepan dentro de la
+reserva del 30%. El daily-drawdown se mide sobre el equity, no sobre el cash.
+
+Control por Telegram: `/status` agrega el portafolio, `/positions [símbolo]`
+lista posiciones, `/close [símbolo]` cierra una o todas (bare = todas).
+
 ## Filosofía de la estrategia
 
 Trend-following clásico con **3 capas de filtrado** para reducir falsos positivos:

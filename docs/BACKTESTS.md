@@ -193,6 +193,32 @@ Criterio de aceptación (regla dura del proyecto):
 
 ---
 
+## 2026-06-05 — Arquitectura Multi-Symbol (pool compartido + candado global)
+
+Refactor de single-asset (BTC) a multi-symbol: escanea/opera una lista de pares
+sobre un capital compartido, con candado de exposición global. Implementado en
+`settings`, `exchange` (filtros dinámicos), `order_manager` (estado por símbolo +
+candado + sizing del pool) y `main_strategy` (scanner secuencial). Detrás de
+`SYMBOLS`/`MAX_CONCURRENT_TRADES`; con un solo símbolo es 100% retrocompatible.
+
+### Validación
+- **No toca la lógica de señal por símbolo** (mismo TechnicalEngine/SL/TP), sólo
+  la orquestación y la gestión de capital. El backtest por símbolo sigue siendo
+  válido para medir el edge de cada moneda (correr `scripts/backtest.py --symbol`).
+- **31 tests nuevos/actualizados** (`tests/test_multisymbol.py` + ajustes):
+  candado global, una posición por símbolo, independencia open/close, sizing del
+  pool compartido (cabe N dentro de la reserva), daily-DD sobre equity, y
+  migración del `state.json` viejo. Suite completa: 47 passed.
+- Pendiente: **backtest de PORTAFOLIO** (simular las 5 monedas en paralelo con el
+  candado y el pool compartido) para medir correlación/exposición real. Es un
+  follow-up — el simulador actual es de un símbolo por corrida.
+
+> Nota de sizing: con riesgo 2.5% y stops ~2%, el notional risk-based (>100% del
+> equity) siempre topea contra la reserva. Para que entren 2 trades, cada uno se
+> limita a `tradeable/2` (~73.5 USDT sobre 210). El riesgo real por trade queda
+> por debajo del 2.5% nominal cuando el stop es ajustado — igual que en el bot
+> single-symbol previo.
+
 ## Próximos experimentos pendientes
 
 - [ ] **TP escalado: validar con data real 30d** (baseline vs `--scaled-tp`) ← listo para correr

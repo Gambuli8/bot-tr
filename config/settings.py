@@ -28,7 +28,12 @@ class Settings(BaseModel):
     telegram_readonly_chat_ids: str = ""    # sólo lectura
 
     # Trading
-    symbol: str = "BTC/USDT"
+    symbol: str = "BTC/USDT"                 # símbolo "primario" (retrocompat / single-symbol)
+    # Multi-symbol: lista de pares a escanear y operar. Si vacía, cae a [symbol].
+    symbols: list[str] = ["BTC/USDT"]
+    # Candado de exposición global: máximo de posiciones abiertas en simultáneo
+    # en todo el portafolio. Protege el capital compartido (210 USDT).
+    max_concurrent_trades: int = 2
     timeframe: str = "15m"
     initial_capital: float = 1000.0
     max_risk_per_trade: float = 0.015
@@ -116,7 +121,28 @@ class Settings(BaseModel):
         return v
 
 
+def _parse_symbols(raw: str, primary: str) -> list[str]:
+    """
+    Parsea la lista de símbolos de la env SYMBOLS (separados por coma).
+    Normaliza a formato ccxt "BASE/QUOTE" (acepta "ETHUSDT" o "ETH/USDT").
+    Si la lista queda vacía, cae al símbolo primario. De-duplica preservando orden.
+    """
+    out: list[str] = []
+    for tok in (raw or "").split(","):
+        s = tok.strip().upper().replace(" ", "")
+        if not s:
+            continue
+        if "/" not in s and s.endswith("USDT"):
+            s = f"{s[:-4]}/USDT"
+        if s not in out:
+            out.append(s)
+    if not out:
+        out = [primary]
+    return out
+
+
 def load_settings() -> Settings:
+    primary_symbol = os.getenv("TRADING_SYMBOL", "BTC/USDT")
     return Settings(
         binance_api_key=os.getenv("BINANCE_API_KEY", ""),
         binance_api_secret=os.getenv("BINANCE_API_SECRET", ""),
@@ -126,7 +152,9 @@ def load_settings() -> Settings:
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
         telegram_admin_chat_ids=os.getenv("TELEGRAM_ADMIN_CHAT_IDS", os.getenv("TELEGRAM_CHAT_ID", "")),
         telegram_readonly_chat_ids=os.getenv("TELEGRAM_READONLY_CHAT_IDS", ""),
-        symbol=os.getenv("TRADING_SYMBOL", "BTC/USDT"),
+        symbol=primary_symbol,
+        symbols=_parse_symbols(os.getenv("SYMBOLS", ""), primary_symbol),
+        max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "2")),
         timeframe=os.getenv("TRADING_TIMEFRAME", "15m"),
         initial_capital=float(os.getenv("INITIAL_CAPITAL", "1000")),
         max_risk_per_trade=float(os.getenv("MAX_RISK_PER_TRADE", "0.015")),

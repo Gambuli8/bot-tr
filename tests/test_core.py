@@ -29,6 +29,8 @@ def mock_settings():
     s.telegram_bot_token = "test_telegram"
     s.telegram_chat_id = "12345"
     s.symbol = "BTC/USDT"
+    s.symbols = ["BTC/USDT"]
+    s.max_concurrent_trades = 2
     s.timeframe = "15m"
     s.initial_capital = 1000.0
     s.max_risk_per_trade = 0.02

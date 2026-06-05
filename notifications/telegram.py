@@ -77,8 +77,10 @@ class TelegramNotifier:
 
     def notify_buy(
         self, price, amount_btc, stop_loss, take_profit,
-        reason, confidence, direction: str = "LONG",
+        reason, confidence, direction: str = "LONG", symbol: str = "",
     ):
+        base = symbol.split("/")[0] if symbol else "BTC"
+        tag = f" {symbol}" if symbol else ""
         invertido = price * amount_btc
         if direction == "SHORT":
             ganamos_si = take_profit
@@ -107,8 +109,8 @@ class TelegramNotifier:
         perdida_pct = (perdida / invertido) * 100
 
         text = (
-            f"{emoji} <b>Abrí una operación</b> apostando {apuesta}\n\n"
-            f"💵 Le metí <b>${invertido:,.2f}</b> ({amount_btc:.6f} BTC)\n"
+            f"{emoji} <b>Abrí una operación{tag}</b> apostando {apuesta}\n\n"
+            f"💵 Le metí <b>${invertido:,.2f}</b> ({amount_btc:.6f} {base})\n"
             f"📍 Precio de entrada: <b>${price:,.2f}</b>\n\n"
             f"🎯 Si {ganamos_dir} a <b>${ganamos_si:,.2f}</b> → <b>ganamos +${ganancia:,.2f}</b> ({ganancia_pct:+.2f}%)\n"
             f"🛑 Si {perdemos_dir} a <b>${perdemos_si:,.2f}</b> → cerramos con <b>-${perdida:,.2f}</b> ({-perdida_pct:.2f}%)\n\n"
@@ -120,6 +122,7 @@ class TelegramNotifier:
 
     def notify_sell(
         self, price, pnl_usdt, pnl_pct, reason, direction: str = "LONG",
+        symbol: str = "",
     ):
         ganamos = pnl_usdt > 0
         if ganamos:
@@ -134,9 +137,10 @@ class TelegramNotifier:
             tail = "Mala, sale la próxima."
 
         dir_txt = "SHORT" if direction == "SHORT" else "LONG"
+        tag = f" {symbol}" if symbol else ""
 
         text = (
-            f"{head_emoji} <b>Cerré la operación ({dir_txt})</b>\n\n"
+            f"{head_emoji} <b>Cerré la operación{tag} ({dir_txt})</b>\n\n"
             f"💸 {verb}: <b>{sign}${abs(pnl_usdt):,.2f}</b> ({sign}{abs(pnl_pct):.2f}%)\n"
             f"📍 Precio de salida: <b>${price:,.2f}</b>\n\n"
             f"📝 ¿Por qué cerré? <i>{reason}</i>\n\n"
@@ -156,10 +160,13 @@ class TelegramNotifier:
 
     def notify_partial_tp(
         self, price, portion_btc, pnl_usdt, new_stop, direction: str = "LONG",
+        symbol: str = "",
     ):
+        base = symbol.split("/")[0] if symbol else "BTC"
+        tag = f" {symbol}" if symbol else ""
         text = (
-            f"🎯 <b>¡Tomé ganancia parcial (TP1)!</b>\n\n"
-            f"💰 Cerré <b>{portion_btc:.6f} BTC</b> a <b>${price:,.2f}</b> → "
+            f"🎯 <b>¡Tomé ganancia parcial (TP1){tag}!</b>\n\n"
+            f"💰 Cerré <b>{portion_btc:.6f} {base}</b> a <b>${price:,.2f}</b> → "
             f"<b>+${pnl_usdt:,.2f}</b>\n"
             f"🔒 Moví el stop a <b>breakeven (${new_stop:,.2f})</b>: "
             f"el resto de la operación ya es <b>trade gratis</b>.\n\n"
@@ -292,6 +299,49 @@ class TelegramNotifier:
             f"🎯 Acierto: {wr:.0f}% en {n} operaciones  •  DD máx {dd:.2f}%\n"
             f"{pos_line}\n\n"
             f"<b>Mercado ahora</b>\n{mercado}\n{dec_line}\n\n"
+            f"⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
+        )
+        self._send(text)
+
+    def notify_multi_panorama(self, stats: dict, per_symbol: list) -> None:
+        """
+        Panorama de PORTAFOLIO (multi-symbol): un solo mensaje con el estado del
+        capital compartido + una línea por símbolo escaneado en el ciclo.
+        """
+        cap = stats.get("capital", 0)
+        ret = stats.get("total_return_pct", 0)
+        n = stats.get("total_trades", 0)
+        wr = stats.get("win_rate_pct", 0)
+        dd = stats.get("max_drawdown_pct", 0)
+        n_open = stats.get("open_positions_count", 0)
+        n_max = stats.get("max_concurrent_trades", 0)
+
+        if ret > 0.5:
+            mood = "📈 vamos ganando"
+        elif ret < -0.5:
+            mood = "📉 vamos perdiendo"
+        else:
+            mood = "➖ andamos parejos"
+
+        lines = []
+        for info in per_symbol:
+            sym = info.get("symbol", "?")
+            price = info.get("price", 0)
+            dec = info.get("decision", "ESPERAR")
+            held = "💼" if info.get("has_position") else "  "
+            dec_emoji = {"COMPRAR": "🟢", "VENDER": "🔻", "ESPERAR": "💤"}.get(dec, "💤")
+            act = info.get("action", "ESPERAR")
+            act_txt = "" if act == "ESPERAR" else f"  → <b>{act}</b>"
+            lines.append(f"{held} <b>{sym}</b> ${price:,.2f}  {dec_emoji}{act_txt}")
+        cuerpo = "\n".join(lines) if lines else "<i>(sin datos de símbolos)</i>"
+
+        candado = "🔒" if n_open >= n_max else "🔓"
+        text = (
+            f"<b>📊 Panorama de portafolio</b> — {mood}\n\n"
+            f"💵 Capital: <b>${cap:,.2f}</b> ({ret:+.2f}%)\n"
+            f"🎯 Acierto: {wr:.0f}% en {n} ops  •  DD máx {dd:.2f}%\n"
+            f"{candado} Exposición: <b>{n_open}/{n_max}</b> trades abiertos\n\n"
+            f"<b>Monedas</b>\n{cuerpo}\n\n"
             f"⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
         )
         self._send(text)

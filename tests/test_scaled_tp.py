@@ -33,6 +33,9 @@ def _scaled_settings(**overrides):
         breakeven_offset_pct=0.0,        # sin colchón: breakeven exacto en el entry
         initial_capital=200.0,
         daily_drawdown_limit=0.10,
+        symbol="BTC/USDT",
+        symbols=["BTC/USDT"],
+        max_concurrent_trades=2,
     )
     for k, v in overrides.items():
         setattr(s, k, v)
@@ -130,9 +133,12 @@ class TestScaledTPOrderManager:
         manager.state.capital = 100.0
         return manager
 
+    SYM = "BTC/USDT"
+
     def _open_long(self, om):
-        om.state.open_position = {
+        om.state.open_positions[self.SYM] = {
             "order_id": "PAPER", "client_order_id": "bot_test", "direction": "LONG",
+            "symbol": self.SYM,
             "entry_price": 100.0, "amount_btc": 1.0, "amount_usdt": 100.0,
             "stop_loss": 95.0, "original_stop_loss": 95.0, "take_profit": 110.0,
             "entry_time": "2026-01-01T00:00:00", "entry_reason": "test",
@@ -145,21 +151,22 @@ class TestScaledTPOrderManager:
         om.settings.scaled_tp_enabled = False
         self._open_long(om)
         snap = SimpleNamespace(price=106.0)
-        assert om.maybe_take_partial_tp1(snap) is None
-        assert om.state.open_position["tp1_done"] is False
+        assert om.maybe_take_partial_tp1(snap, self.SYM) is None
+        assert om.state.open_positions[self.SYM]["tp1_done"] is False
 
     def test_no_partial_before_tp1(self, om):
         self._open_long(om)
         snap = SimpleNamespace(price=104.0)   # todavía no tocó 105
-        assert om.maybe_take_partial_tp1(snap) is None
+        assert om.maybe_take_partial_tp1(snap, self.SYM) is None
 
     def test_partial_fill_and_breakeven(self, om):
         self._open_long(om)
         cap_before = om.state.capital
         snap = SimpleNamespace(price=106.0)
-        event = om.maybe_take_partial_tp1(snap)
+        event = om.maybe_take_partial_tp1(snap, self.SYM)
         assert event is not None
-        pos = om.state.open_position
+        assert event["symbol"] == self.SYM
+        pos = om.state.open_positions[self.SYM]
         assert pos["tp1_done"] is True
         assert pos["amount_btc"] == pytest.approx(0.5)
         # ganancia parcial: (106-100)*0.5 = 3.0
@@ -170,16 +177,17 @@ class TestScaledTPOrderManager:
     def test_partial_is_idempotent(self, om):
         self._open_long(om)
         snap = SimpleNamespace(price=106.0)
-        assert om.maybe_take_partial_tp1(snap) is not None
+        assert om.maybe_take_partial_tp1(snap, self.SYM) is not None
         # segundo intento: ya está tp1_done → no vuelve a cerrar
-        assert om.maybe_take_partial_tp1(snap) is None
+        assert om.maybe_take_partial_tp1(snap, self.SYM) is None
 
     def test_close_includes_realized_pnl(self, om):
         self._open_long(om)
-        om.maybe_take_partial_tp1(SimpleNamespace(price=106.0))
+        om.maybe_take_partial_tp1(SimpleNamespace(price=106.0), self.SYM)
         # cerramos el remanente en breakeven (100) → total = realized 3.0
-        rec = om.close_position(SimpleNamespace(price=100.0), "Breakeven post-TP1")
+        rec = om.close_position(SimpleNamespace(price=100.0), "Breakeven post-TP1", self.SYM)
         assert rec["took_tp1"] is True
+        assert rec["symbol"] == self.SYM
         assert rec["realized_tp1_pnl"] == pytest.approx(3.0)
         assert rec["pnl"] == pytest.approx(3.0)
         assert om.state.winning_trades == 1

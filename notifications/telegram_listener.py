@@ -315,9 +315,11 @@ class TelegramListener:
             return
 
         if data == "close:confirm":
-            self.controller.request_force_close()
+            target = getattr(self, "_close_target", "*")
+            self.controller.request_force_close(None if target == "*" else target)
+            que = "todas las posiciones" if target == "*" else target
             self._send(
-                "🔴 Cierre confirmado (botón). Ejecutando ahora mismo.",
+                f"🔴 Cierre confirmado ({que}, botón). Ejecutando ahora mismo.",
                 chat_id=chat_id,
             )
             self._audit("/close_confirm", ["inline"], chat_id, "ok")
@@ -383,11 +385,21 @@ class TelegramListener:
         else:
             ret_line = f"➖ Estamos parejos (sin ganancia ni pérdida todavía)"
 
-        pos_line = "💼 Operación abierta: <b>sí</b>" if stats["open_position"] else "💼 Operación abierta: <b>no</b>"
+        n_open = stats.get("open_positions_count", 0)
+        n_max = stats.get("max_concurrent_trades", 0)
+        syms = stats.get("open_symbols", [])
+        if n_open:
+            pos_line = (
+                f"💼 Operaciones abiertas: <b>{n_open}/{n_max}</b> "
+                f"({', '.join(syms)})"
+            )
+        else:
+            pos_line = f"💼 Operaciones abiertas: <b>0/{n_max}</b>"
 
         text = (
             f"{estado}\n\n"
-            f"💵 Plata ahora: <b>${stats['capital']:,.2f}</b>\n"
+            f"💵 Plata ahora: <b>${stats['capital']:,.2f}</b> "
+            f"(libre ${stats.get('cash_free', stats['capital']):,.2f})\n"
             f"{ret_line}\n"
             f"🎯 Acertamos en <b>{stats['win_rate_pct']:.0f}%</b> de las operaciones (de {stats['total_trades']} totales)\n"
             f"📉 Mayor bajón: <b>{stats['max_drawdown_pct']:.2f}%</b>\n"
@@ -398,17 +410,40 @@ class TelegramListener:
 
     def _cmd_position(self, args: list[str], chat_id: str) -> None:
         om = self.controller.order_manager
-        if om is None or om.state.open_position is None:
+        if om is None or om.count_open() == 0:
             self._send("Por ahora no tengo nada abierto. Estoy mirando el mercado.", chat_id=chat_id)
             return
 
-        pos = om.state.open_position
+        # Filtro opcional por símbolo: /position ETH  o  /position ETH/USDT
+        wanted = None
+        if args:
+            tok = args[0].strip().upper()
+            if "/" not in tok and tok.endswith("USDT"):
+                tok = f"{tok[:-4]}/USDT"
+            elif "/" not in tok:
+                tok = f"{tok}/USDT"
+            wanted = tok
+
+        symbols = om.open_symbols()
+        if wanted is not None:
+            symbols = [s for s in symbols if s == wanted]
+            if not symbols:
+                self._send(f"No tengo posición abierta en {wanted}.", chat_id=chat_id)
+                return
+
+        blocks = [self._format_position(om, sym) for sym in symbols]
+        self._send("\n\n──────────\n\n".join(blocks), chat_id=chat_id)
+
+    def _format_position(self, om, symbol: str) -> str:
+        """Arma el bloque humano de una posición abierta en `symbol`."""
+        pos = om.state.open_positions[symbol]
+        base = symbol.split("/")[0]
         direction = pos.get("direction", "LONG")
         entry = float(pos["entry_price"])
-        amt_btc = float(pos["amount_btc"])
+        amt = float(pos["amount_btc"])
         sl = float(pos["stop_loss"])
         tp = float(pos["take_profit"])
-        invertido = entry * amt_btc
+        invertido = entry * amt
         entry_time = pos.get("entry_time", "")
 
         try:
@@ -419,67 +454,64 @@ class TelegramListener:
         except Exception:
             elapsed = "n/d"
 
-        # P&L actual
         pnl_usdt = pnl_pct = None
         current = None
         try:
             if self.controller.exchange is not None:
-                df = self.controller.exchange.get_ohlcv()
+                df = self.controller.exchange.get_ohlcv(symbol)
                 current = float(df["close"].iloc[-1])
                 if direction == "LONG":
-                    pnl_usdt = (current - entry) * amt_btc
+                    pnl_usdt = (current - entry) * amt
                     pnl_pct = (current - entry) / entry * 100
                 else:
-                    pnl_usdt = (entry - current) * amt_btc
+                    pnl_usdt = (entry - current) * amt
                     pnl_pct = (entry - current) / entry * 100
         except Exception as e:
-            logger.warning(f"No pude obtener precio actual para /position: {e}")
+            logger.warning(f"No pude obtener precio actual para /position {symbol}: {e}")
 
-        # Línea de estado
         if pnl_usdt is None:
             estado = "<i>(no pude leer el precio actual)</i>"
         elif pnl_usdt > 0:
-            estado = f"🎉 <b>Vamos ganando +${pnl_usdt:,.2f}</b> ({pnl_pct:+.2f}%)"
+            estado = f"🎉 <b>Ganando +${pnl_usdt:,.2f}</b> ({pnl_pct:+.2f}%)"
         elif pnl_usdt < 0:
-            estado = f"😬 <b>Vamos perdiendo -${abs(pnl_usdt):,.2f}</b> ({pnl_pct:+.2f}%)"
+            estado = f"😬 <b>Perdiendo -${abs(pnl_usdt):,.2f}</b> ({pnl_pct:+.2f}%)"
         else:
-            estado = f"➖ Justito por ahí, sin ganar ni perder"
+            estado = "➖ Justito, sin ganar ni perder"
 
-        # Cuánto si toca TP/SL
         if direction == "SHORT":
-            ganancia_tp = (entry - tp) * amt_btc
-            perdida_sl = (sl - entry) * amt_btc
+            ganancia_tp = (entry - tp) * amt
+            perdida_sl = (sl - entry) * amt
             dir_humano = "🔻 Aposté a que <b>baja</b>"
             txt_tp = f"si BAJA a <b>${tp:,.2f}</b>"
             txt_sl = f"si SUBE a <b>${sl:,.2f}</b>"
         else:
-            ganancia_tp = (tp - entry) * amt_btc
-            perdida_sl = (entry - sl) * amt_btc
+            ganancia_tp = (tp - entry) * amt
+            perdida_sl = (entry - sl) * amt
             dir_humano = "🟢 Aposté a que <b>sube</b>"
             txt_tp = f"si SUBE a <b>${tp:,.2f}</b>"
             txt_sl = f"si BAJA a <b>${sl:,.2f}</b>"
 
         trailing_line = ""
         if pos.get("trailing_active"):
-            trailing_line = "🎯 <i>Trailing activado: el stop sigue al precio para asegurar ganancia.</i>\n"
-
+            trailing_line = "🎯 <i>Trailing activado.</i>\n"
+        tp1_line = ""
+        if pos.get("tp1_done"):
+            tp1_line = "✅ <i>TP1 tomado, stop en breakeven.</i>\n"
         precio_actual_line = (
             f"💵 Precio ahora: <b>${current:,.2f}</b>\n" if current is not None else ""
         )
 
-        text = (
-            f"{dir_humano}\n\n"
-            f"📍 Compré a: <b>${entry:,.2f}</b>\n"
-            f"💸 Invertí: <b>${invertido:,.2f}</b> ({amt_btc:.6f} BTC)\n"
+        return (
+            f"<b>{symbol}</b> — {dir_humano}\n"
+            f"📍 Entrada: <b>${entry:,.2f}</b>\n"
+            f"💸 Invertido: <b>${invertido:,.2f}</b> ({amt:.6f} {base})\n"
             f"{precio_actual_line}"
-            f"{estado}\n\n"
-            f"🎯 Ganamos +${ganancia_tp:,.2f} {txt_tp}\n"
-            f"🛑 Perdemos -${perdida_sl:,.2f} {txt_sl}\n"
-            f"⏳ Lleva abierta: <b>{elapsed}</b>\n"
-            f"{trailing_line}\n"
-            f"⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
+            f"{estado}\n"
+            f"🎯 +${ganancia_tp:,.2f} {txt_tp}\n"
+            f"🛑 -${perdida_sl:,.2f} {txt_sl}\n"
+            f"⏳ Abierta hace: <b>{elapsed}</b>\n"
+            f"{trailing_line}{tp1_line}"
         )
-        self._send(text, chat_id=chat_id)
 
     def _cmd_pnl(self, args: list[str], chat_id: str) -> None:
         trades = self._load_journal()
@@ -566,7 +598,8 @@ class TelegramListener:
         s = self.settings
         text = (
             f"<b>⚙️ CONFIG ACTIVO</b>\n\n"
-            f"Par: <b>{s.symbol}</b> @ <b>{s.timeframe}</b>\n"
+            f"Símbolos: <b>{', '.join(s.symbols)}</b> @ <b>{s.timeframe}</b>\n"
+            f"Máx. trades concurrentes: <b>{s.max_concurrent_trades}</b>\n"
             f"Testnet: <b>{s.binance_testnet}</b>\n"
             f"Capital inicial: <b>${s.initial_capital:,.2f}</b>\n"
             f"Riesgo/trade: <b>{s.max_risk_per_trade:.2%}</b>\n"
@@ -608,10 +641,27 @@ class TelegramListener:
 
     def _cmd_close(self, args: list[str], chat_id: str) -> None:
         om = self.controller.order_manager
-        if om is None or om.state.open_position is None:
-            self._send("No hay posición abierta para cerrar.", chat_id=chat_id)
+        if om is None or om.count_open() == 0:
+            self._send("No hay posiciones abiertas para cerrar.", chat_id=chat_id)
             return
+
+        # /close            → cierra TODAS las posiciones
+        # /close ETH        → cierra sólo ETH/USDT
+        target = "*"
+        if args:
+            tok = args[0].strip().upper()
+            if "/" not in tok and tok.endswith("USDT"):
+                tok = f"{tok[:-4]}/USDT"
+            elif "/" not in tok:
+                tok = f"{tok}/USDT"
+            if not om.has_position(tok):
+                self._send(f"No tengo posición abierta en {tok}.", chat_id=chat_id)
+                return
+            target = tok
+
+        self._close_target = target
         self.controller.request_confirmation("close")
+        que = "TODAS las posiciones" if target == "*" else f"la posición en <b>{target}</b>"
         keyboard = {
             "inline_keyboard": [[
                 {"text": "✅ Confirmar cierre", "callback_data": "close:confirm"},
@@ -619,7 +669,7 @@ class TelegramListener:
             ]]
         }
         self._send(
-            "⚠️ Vas a <b>cerrar la posición a mercado</b>.\n"
+            f"⚠️ Vas a <b>cerrar {que} a mercado</b>.\n"
             "Tocá un botón o mandá <code>/close_confirm</code> en 30s.",
             chat_id=chat_id,
             reply_markup=keyboard,
@@ -633,9 +683,11 @@ class TelegramListener:
                 chat_id=chat_id,
             )
             return
-        self.controller.request_force_close()
+        target = getattr(self, "_close_target", "*")
+        self.controller.request_force_close(None if target == "*" else target)
+        que = "todas las posiciones" if target == "*" else target
         self._send(
-            "🔴 Cierre confirmado. Ejecutando ahora mismo (sin esperar al próximo ciclo).",
+            f"🔴 Cierre confirmado ({que}). Ejecutando ahora mismo.",
             chat_id=chat_id,
         )
 

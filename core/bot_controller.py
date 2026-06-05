@@ -24,7 +24,8 @@ class BotController:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._is_paused: bool = False
-        self._force_close_position: bool = False
+        # Cierre forzado: set de símbolos a cerrar. "*" = todas las posiciones.
+        self._force_close_symbols: set[str] = set()
         self._pending_confirmations: dict[str, float] = {}
         self._active_hours_utc: str = ""  # override en runtime via /schedule
 
@@ -73,9 +74,10 @@ class BotController:
 
     # ───────── cierre forzado ─────────
 
-    def request_force_close(self) -> None:
+    def request_force_close(self, symbol: Optional[str] = None) -> None:
+        """Pide cerrar `symbol` (o todas las posiciones si symbol es None → '*')."""
         with self._lock:
-            self._force_close_position = True
+            self._force_close_symbols.add(symbol or "*")
         # Despertamos el main loop si está esperando entre ciclos.
         self._wake_event.set()
 
@@ -136,18 +138,22 @@ class BotController:
         except Exception as e:
             logger.warning(f"BotController: no pude persistir state: {e}")
 
-    def consume_force_close(self) -> bool:
-        """Devuelve True una sola vez si se pidió cierre, y resetea el flag."""
+    def consume_force_close(self) -> list[str]:
+        """
+        Devuelve la lista de símbolos pedidos para cerrar (una sola vez) y limpia
+        el set. "*" significa "todas las posiciones abiertas". Lista vacía = nada.
+        """
         with self._lock:
-            if self._force_close_position:
-                self._force_close_position = False
-                return True
-            return False
+            if not self._force_close_symbols:
+                return []
+            out = list(self._force_close_symbols)
+            self._force_close_symbols.clear()
+            return out
 
     @property
     def force_close_position(self) -> bool:
         with self._lock:
-            return self._force_close_position
+            return bool(self._force_close_symbols)
 
     # ───────── confirmaciones con timeout ─────────
 

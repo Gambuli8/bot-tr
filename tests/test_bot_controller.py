@@ -59,10 +59,19 @@ def test_pause_se_persiste_y_recupera(tmp_path, monkeypatch):
 
 def test_force_close_one_shot():
     c = BotController()
-    assert c.consume_force_close() is False
-    c.request_force_close()
-    assert c.consume_force_close() is True
-    assert c.consume_force_close() is False  # ya consumido
+    assert c.consume_force_close() == []
+    c.request_force_close()                      # sin símbolo → "*" (todas)
+    assert c.consume_force_close() == ["*"]
+    assert c.consume_force_close() == []         # ya consumido
+
+
+def test_force_close_targeted_symbols():
+    c = BotController()
+    c.request_force_close("ETH/USDT")
+    c.request_force_close("SOL/USDT")
+    out = c.consume_force_close()
+    assert set(out) == {"ETH/USDT", "SOL/USDT"}
+    assert c.consume_force_close() == []
 
 
 def test_request_force_close_despierta_event():

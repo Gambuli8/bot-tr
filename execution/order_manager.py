@@ -55,6 +55,7 @@ class Position:
     initial_amount_btc: float = 0.0
     tp1_done: bool = False
     realized_pnl_usdt: float = 0.0
+    symbol: str = ""
 
 
 @dataclass
@@ -64,7 +65,9 @@ class BotState:
     capital_peak: float
     daily_capital_start: float
     last_reset_date: str
-    open_position: Optional[dict]
+    # Multi-symbol: posiciones abiertas indexadas por símbolo ("ETH/USDT": {...}).
+    # El capital es un POOL COMPARTIDO global; cada posición descuenta su notional.
+    open_positions: dict
     total_trades: int
     winning_trades: int
     consecutive_failures: int
@@ -81,7 +84,8 @@ class OrderManager:
         self.state = self._load_state()
         logger.info(
             f"OrderManager inicializado | Capital: ${self.state.capital:,.2f} | "
-            f"Posición abierta: {'SÍ' if self.state.open_position else 'NO'}"
+            f"Posiciones abiertas: {self.count_open()} "
+            f"({', '.join(self.open_symbols()) or 'ninguna'})"
         )
 
     # ─────────────────────────────────────────
@@ -95,19 +99,61 @@ class OrderManager:
             return explicit
         return "LONG" if decision.accion == "COMPRAR" else "SHORT"
 
+    # ───────── inventario de posiciones (multi-symbol) ─────────
+
+    def count_open(self) -> int:
+        return len(self.state.open_positions)
+
+    def open_symbols(self) -> list[str]:
+        return list(self.state.open_positions.keys())
+
+    def has_position(self, symbol: str) -> bool:
+        return symbol in self.state.open_positions
+
+    def _committed_notional(self) -> float:
+        """Suma de los notionals comprometidos en posiciones abiertas."""
+        return sum(
+            float(p.get("amount_usdt", 0.0))
+            for p in self.state.open_positions.values()
+        )
+
+    def _equity_basis(self) -> float:
+        """
+        Base de equity para sizing/reserva: capital libre + notional comprometido.
+        (No incluye PnL no realizado, para que el sizing sea estable.) Con esto
+        cada trade arriesga el mismo % del PORTAFOLIO, sin importar cuántos haya.
+        """
+        return self.state.capital + self._committed_notional()
+
     def should_open(
-        self, decision: TradeDecision, snapshot: MarketSnapshot
+        self, decision: TradeDecision, snapshot: MarketSnapshot,
+        symbol: Optional[str] = None,
     ) -> bool:
-        """Decide si abrir una nueva posición (LONG o SHORT)."""
+        """
+        Decide si abrir una nueva posición (LONG o SHORT) en `symbol`.
+        Incluye el CANDADO DE EXPOSICIÓN GLOBAL: no abrir si ya hay
+        max_concurrent_trades posiciones abiertas en el portafolio.
+        """
+        symbol = symbol or self.settings.symbol
         if self.state.is_stopped:
             logger.warning("🛑 Bot detenido por drawdown diario")
             return False
-        if self.state.open_position is not None:
+        # Una sola posición por símbolo.
+        if self.has_position(symbol):
             return False
         if decision.accion not in ("COMPRAR", "VENDER"):
             return False
+
+        # ── CANDADO GLOBAL: techo de posiciones concurrentes en el portafolio ──
+        if self.count_open() >= self.settings.max_concurrent_trades:
+            logger.info(
+                f"🔒 Candado global: {self.count_open()}/"
+                f"{self.settings.max_concurrent_trades} trades abiertos "
+                f"({', '.join(self.open_symbols())}). Ignoro señal en {symbol}."
+            )
+            return False
+
         # Cooldown: tras cerrar una posición, esperamos N velas antes de reabrir.
-        # Esto evita el ruido de oscilar entre señales opuestas en velas adyacentes.
         if self.settings.cooldown_bars > 0 and self.state.last_close_at > 0:
             tf_min = {"1m": 1, "5m": 5, "15m": 15, "30m": 30,
                       "1h": 60, "4h": 240, "1d": 1440}.get(self.settings.timeframe, 15)
@@ -131,32 +177,39 @@ class OrderManager:
                 f"SL={decision.stop_loss_pct:.2%}"
             )
             return False
-        tradeable_capital = self.state.capital * (1 - self.settings.trade_reserve_pct)
+        # Capital del POOL COMPARTIDO: que la nueva no rompa la reserva del 30%.
         trade_size = self._calculate_position_size(snapshot, decision)
-        if trade_size > tradeable_capital:
+        if trade_size <= 0:
             logger.warning(
-                f"Capital insuficiente: {trade_size:.2f} > {tradeable_capital:.2f}"
+                f"Sin capital disponible en el pool para {symbol} "
+                f"(comprometido ${self._committed_notional():,.2f} / "
+                f"equity ${self._equity_basis():,.2f})"
             )
             return False
         return True
 
     # Retrocompatibilidad con código que aún llame a should_buy
-    def should_buy(self, decision: TradeDecision, snapshot: MarketSnapshot) -> bool:
-        return self.should_open(decision, snapshot)
+    def should_buy(
+        self, decision: TradeDecision, snapshot: MarketSnapshot,
+        symbol: Optional[str] = None,
+    ) -> bool:
+        return self.should_open(decision, snapshot, symbol)
 
     def should_close(
-        self, snapshot: MarketSnapshot, decision: TradeDecision
+        self, snapshot: MarketSnapshot, decision: TradeDecision,
+        symbol: Optional[str] = None,
     ) -> tuple[bool, str]:
         """
-        Evalúa si cerrar la posición abierta. Antes de revisar, actualiza el
-        trailing stop en el sentido correcto.
+        Evalúa si cerrar la posición abierta en `symbol`. Antes de revisar,
+        actualiza el trailing stop en el sentido correcto.
         """
-        if self.state.open_position is None:
+        symbol = symbol or self.settings.symbol
+        if not self.has_position(symbol):
             return False, ""
 
-        self._update_trailing_stop(snapshot.price)
+        self._update_trailing_stop(snapshot.price, symbol)
 
-        pos = self._get_open_position()
+        pos = self.get_open_position(symbol)
         current_price = snapshot.price
 
         if pos.direction == "LONG":
@@ -197,27 +250,29 @@ class OrderManager:
 
     # Retrocompat
     def should_sell(
-        self, snapshot: MarketSnapshot, decision: TradeDecision
+        self, snapshot: MarketSnapshot, decision: TradeDecision,
+        symbol: Optional[str] = None,
     ) -> tuple[bool, str]:
-        return self.should_close(snapshot, decision)
+        return self.should_close(snapshot, decision, symbol)
 
     # ─────────────────────────────────────────
     #  TRAILING STOP
     # ─────────────────────────────────────────
 
-    def _update_trailing_stop(self, current_price: float) -> None:
+    def _update_trailing_stop(self, current_price: float, symbol: Optional[str] = None) -> None:
         """
         LONG: activa trailing cuando profit > activation_pct, después rastrea
               el máximo y el stop = highest * (1 - distance_pct). El stop sólo SUBE.
         SHORT: activa trailing cuando profit > activation_pct (precio bajó),
                rastrea el mínimo y el stop = lowest * (1 + distance_pct). El stop sólo BAJA.
         """
+        symbol = symbol or self.settings.symbol
         if not self.settings.trailing_stop_enabled:
             return
-        if self.state.open_position is None:
+        if not self.has_position(symbol):
             return
 
-        pos_dict = self.state.open_position
+        pos_dict = self.state.open_positions[symbol]
         entry_price = pos_dict["entry_price"]
         direction = pos_dict.get("direction", "LONG")
 
@@ -280,8 +335,10 @@ class OrderManager:
     # ─────────────────────────────────────────
 
     def open_position(
-        self, snapshot: MarketSnapshot, decision: TradeDecision
+        self, snapshot: MarketSnapshot, decision: TradeDecision,
+        symbol: Optional[str] = None,
     ) -> Optional[Position]:
+        symbol = symbol or getattr(snapshot, "symbol", None) or self.settings.symbol
         price = snapshot.price
         direction = self._decision_direction(decision)
         trade_size_usdt = self._calculate_position_size(snapshot, decision)
@@ -325,6 +382,7 @@ class OrderManager:
             highest_price_seen=price,
             take_profit_1=round(take_profit_1, 2),
             initial_amount_btc=round(amount_btc, 8),
+            symbol=symbol,
         )
 
         if self.exchange is not None:
@@ -332,38 +390,42 @@ class OrderManager:
                 side = "buy" if direction == "LONG" else "sell"
                 order = self.exchange.place_market_order(
                     side=side, amount_usdt=trade_size_usdt,
-                    client_order_id=client_order_id,
+                    client_order_id=client_order_id, symbol=symbol,
                 )
                 position.order_id = order.get("id", "UNKNOWN")
             except Exception as e:
-                logger.error(f"Error al ejecutar orden: {e}")
+                logger.error(f"Error al ejecutar orden en {symbol}: {e}")
                 return None
 
         self.state.capital -= trade_size_usdt
-        self.state.open_position = asdict(position)
+        self.state.open_positions[symbol] = asdict(position)
         self._save_state()
 
         emoji = "🟢" if direction == "LONG" else "🔻"
         verb = "COMPRA LONG" if direction == "LONG" else "VENTA SHORT"
         logger.info(
-            f"{emoji} {verb} | ${price:,.2f} | {amount_btc:.6f} BTC | "
+            f"{emoji} {verb} {symbol} | ${price:,.2f} | {amount_btc:.6f} | "
             f"SL: ${stop_loss_price:,.2f} ({effective_sl_pct:.2%}) | "
-            f"TP: ${take_profit_price:,.2f} ({decision.take_profit_pct:.2%})"
+            f"TP: ${take_profit_price:,.2f} ({decision.take_profit_pct:.2%}) | "
+            f"abiertas: {self.count_open()}/{self.settings.max_concurrent_trades}"
         )
         return position
 
-    def maybe_take_partial_tp1(self, snapshot: MarketSnapshot) -> Optional[dict]:
+    def maybe_take_partial_tp1(
+        self, snapshot: MarketSnapshot, symbol: Optional[str] = None,
+    ) -> Optional[dict]:
         """
         Si el TP escalado está activo y el precio tocó TP1, cierra una fracción
         (tp1_size_pct del tamaño original), contabiliza la ganancia parcial y
         mueve el SL a breakeven. Devuelve un dict con el evento (para notificar)
         o None si no hubo parcial. El remanente sigue corriendo al TP completo.
         """
+        symbol = symbol or self.settings.symbol
         if not self.settings.scaled_tp_enabled:
             return None
-        if self.state.open_position is None:
+        if not self.has_position(symbol):
             return None
-        pos = self.state.open_position
+        pos = self.state.open_positions[symbol]
         if pos.get("tp1_done"):
             return None
         tp1 = pos.get("take_profit_1", 0.0)
@@ -393,10 +455,10 @@ class OrderManager:
                 side = "sell" if direction == "LONG" else "buy"
                 self.exchange.place_market_order(
                     side=side, amount_usdt=portion_usdt,
-                    client_order_id=f"{pos['client_order_id']}_tp1",
+                    client_order_id=f"{pos['client_order_id']}_tp1", symbol=symbol,
                 )
             except Exception as e:
-                logger.error(f"Error al ejecutar TP1 parcial: {e}")
+                logger.error(f"Error al ejecutar TP1 parcial en {symbol}: {e}")
                 return None
 
         self.state.capital += portion_usdt + pnl
@@ -421,10 +483,11 @@ class OrderManager:
         self._save_state()
 
         logger.info(
-            f"🎯 TP1 PARCIAL | cerré {portion_btc:.6f} BTC @ ${price:,.2f} | "
+            f"🎯 TP1 PARCIAL {symbol} | cerré {portion_btc:.6f} @ ${price:,.2f} | "
             f"+${pnl:,.2f} | SL → breakeven ${pos['stop_loss']:,.2f}"
         )
         return {
+            "symbol": symbol,
             "price": price,
             "portion_btc": portion_btc,
             "pnl_usdt": round(pnl, 2),
@@ -432,11 +495,14 @@ class OrderManager:
             "direction": direction,
         }
 
-    def close_position(self, snapshot: MarketSnapshot, reason: str) -> dict:
-        if self.state.open_position is None:
+    def close_position(
+        self, snapshot: MarketSnapshot, reason: str, symbol: Optional[str] = None,
+    ) -> dict:
+        symbol = symbol or self.settings.symbol
+        if not self.has_position(symbol):
             return {}
 
-        pos = self._get_open_position()
+        pos = self.get_open_position(symbol)
         current_price = snapshot.price
 
         if pos.direction == "LONG":
@@ -460,6 +526,7 @@ class OrderManager:
 
         trade_record = {
             "timestamp": datetime.utcnow().isoformat(),
+            "symbol": pos.symbol or symbol,
             "direction": pos.direction,
             "entry_price": pos.entry_price,
             "exit_price": current_price,
@@ -480,7 +547,7 @@ class OrderManager:
             "entry_reason": pos.entry_reason,
         }
         self._write_journal(trade_record)
-        self.state.open_position = None
+        self.state.open_positions.pop(symbol, None)
         self.state.last_close_at = time.time()
         self._check_daily_drawdown()
         self._save_state()
@@ -490,8 +557,9 @@ class OrderManager:
         verb = "CIERRE LONG" if pos.direction == "LONG" else "CIERRE SHORT"
         tp1_note = f" (incluye +${pos.realized_pnl_usdt:.2f} de TP1)" if pos.tp1_done else ""
         logger.info(
-            f"{emoji} {verb} | ${current_price:,.2f} | P&L: {pnl_pct:+.2f}% "
-            f"(${total_pnl:+.2f}){tp1_note} | {reason}"
+            f"{emoji} {verb} {symbol} | ${current_price:,.2f} | P&L: {pnl_pct:+.2f}% "
+            f"(${total_pnl:+.2f}){tp1_note} | {reason} | "
+            f"abiertas: {self.count_open()}/{self.settings.max_concurrent_trades}"
         )
         return trade_record
 
@@ -503,19 +571,30 @@ class OrderManager:
         self, snapshot: MarketSnapshot, decision: TradeDecision
     ) -> float:
         """
-        Dimensionamiento: arriesgar exactamente max_risk_per_trade del capital.
-        Position size = (capital * risk%) / stop_loss%
+        Dimensionamiento sobre el POOL COMPARTIDO. Arriesga max_risk_per_trade
+        del equity total del portafolio (capital libre + notional comprometido),
+        así cada trade arriesga el mismo % sin importar cuántos haya abiertos.
+        El tamaño se topea por lo que queda disponible dentro de la reserva 30%:
+          disponible = equity*(1-reserve) - notional_ya_comprometido
+        Si no queda lugar, devuelve 0 (la apertura se rechaza aguas arriba).
         """
         risk_pct = self._effective_risk_pct()
-        max_risk_usdt = self.state.capital * risk_pct
+        basis = self._equity_basis()
+        max_risk_usdt = basis * risk_pct
         atr_stop_pct = snapshot.atr_pct * self.settings.atr_sl_multiplier / 100
         effective_sl_pct = max(decision.stop_loss_pct, atr_stop_pct)
         if effective_sl_pct > 0:
             position_size = max_risk_usdt / effective_sl_pct
         else:
             position_size = max_risk_usdt * 10
-        max_usdt = self.state.capital * (1 - self.settings.trade_reserve_pct)
-        return min(position_size, max_usdt)
+        tradeable_total = basis * (1 - self.settings.trade_reserve_pct)
+        # Cupo por trade: repartimos el capital tradeable entre los slots del
+        # candado, así CABEN max_concurrent_trades posiciones dentro de la reserva
+        # (sin esto, la primera se come todo el budget y el candado de 2 es inútil).
+        slots = max(1, self.settings.max_concurrent_trades)
+        per_trade_cap = tradeable_total / slots
+        available = tradeable_total - self._committed_notional()
+        return max(0.0, min(position_size, per_trade_cap, available))
 
     def _effective_risk_pct(self) -> float:
         """
@@ -557,14 +636,18 @@ class OrderManager:
         )
 
     def _check_daily_drawdown(self) -> None:
+        # Medimos sobre el EQUITY del portafolio (cash + notional comprometido),
+        # no sobre el cash libre: con posiciones abiertas el capital descontado
+        # no es una pérdida. Si no, cerrar 1 de N daría un falso drawdown.
         today = str(date.today())
+        equity = self._equity_basis()
         if self.state.last_reset_date != today:
-            self.state.daily_capital_start = self.state.capital
+            self.state.daily_capital_start = equity
             self.state.last_reset_date = today
             self.state.is_stopped = False
-            logger.info(f"Nuevo día | Capital inicial: ${self.state.capital:,.2f}")
+            logger.info(f"Nuevo día | Equity inicial: ${equity:,.2f}")
         daily_dd = (
-            (self.state.daily_capital_start - self.state.capital)
+            (self.state.daily_capital_start - equity)
             / self.state.daily_capital_start
         )
         if daily_dd >= self.settings.daily_drawdown_limit:
@@ -573,32 +656,41 @@ class OrderManager:
                 f"🚨 DAILY DRAWDOWN: {daily_dd:.1%}. Bot detenido hasta mañana."
             )
 
-    def _get_open_position(self) -> Optional[Position]:
-        if self.state.open_position is None:
-            return None
-        return Position(**self.state.open_position)
+    def get_open_position(self, symbol: Optional[str] = None) -> Optional[Position]:
+        symbol = symbol or self.settings.symbol
+        d = self.state.open_positions.get(symbol)
+        return Position(**d) if d else None
 
     def get_stats(self) -> dict:
         win_rate = (
             self.state.winning_trades / self.state.total_trades * 100
             if self.state.total_trades > 0 else 0
         )
+        # Reportamos sobre el equity del portafolio (cash libre + notional
+        # comprometido), no sobre el cash a secas: con posiciones abiertas el
+        # capital descontado no es una pérdida. (No incluye PnL no realizado.)
+        equity = self._equity_basis()
         total_return = (
-            (self.state.capital - self.state.capital_initial)
+            (equity - self.state.capital_initial)
             / self.state.capital_initial * 100
         )
         max_drawdown = (
-            (self.state.capital_peak - self.state.capital) / self.state.capital_peak * 100
+            max(0.0, (self.state.capital_peak - equity) / self.state.capital_peak * 100)
             if self.state.capital_peak > 0 else 0
         )
         return {
-            "capital": round(self.state.capital, 2),
+            "capital": round(equity, 2),
+            "cash_free": round(self.state.capital, 2),
+            "committed": round(self._committed_notional(), 2),
             "total_return_pct": round(total_return, 3),
             "total_trades": self.state.total_trades,
             "win_rate_pct": round(win_rate, 1),
             "max_drawdown_pct": round(max_drawdown, 3),
             "is_stopped": self.state.is_stopped,
-            "open_position": self.state.open_position is not None,
+            "open_position": self.count_open() > 0,
+            "open_positions_count": self.count_open(),
+            "open_symbols": self.open_symbols(),
+            "max_concurrent_trades": self.settings.max_concurrent_trades,
         }
 
     # ─────────────────────────────────────────
@@ -610,6 +702,7 @@ class OrderManager:
             try:
                 with open(STATE_FILE) as f:
                     data = json.load(f)
+                data = self._migrate_state(data)
                 return BotState(**data)
             except Exception as e:
                 logger.warning(f"No se pudo cargar state.json: {e}")
@@ -620,12 +713,31 @@ class OrderManager:
             capital_peak=self.settings.initial_capital,
             daily_capital_start=self.settings.initial_capital,
             last_reset_date=str(date.today()),
-            open_position=None,
+            open_positions={},
             total_trades=0, winning_trades=0,
             consecutive_failures=0, is_stopped=False,
         )
         self._save_state(initial)
         return initial
+
+    @staticmethod
+    def _migrate_state(data: dict) -> dict:
+        """
+        Migra el state.json viejo (single-symbol, clave `open_position`) al nuevo
+        formato multi-symbol (`open_positions` indexado por símbolo). Idempotente.
+        """
+        if "open_positions" in data:
+            data.pop("open_position", None)
+            return data
+        legacy = data.pop("open_position", None)
+        positions: dict = {}
+        if legacy:
+            sym = legacy.get("symbol") or legacy.get("pair") or "BTC/USDT"
+            legacy["symbol"] = sym
+            positions[sym] = legacy
+            logger.info(f"Migrando state.json a multi-symbol | posición legacy → {sym}")
+        data["open_positions"] = positions
+        return data
 
     def _save_state(self, state: Optional[BotState] = None) -> None:
         state = state or self.state
