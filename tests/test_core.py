@@ -47,6 +47,32 @@ def mock_settings():
     s.atr_sl_multiplier = 1.5
     s.min_risk_reward = 2.0
     s.warmup_candles = 200
+    s.donchian_period = 10
+    s.adx_period = 14
+    # Mejoras de precisión (off para no alterar el comportamiento base de los tests)
+    s.cooldown_bars = 0
+    s.adx_min_trending = 0.0
+    s.require_macro_trend = False
+    s.require_mtf_confluence = False
+    s.mtf_strict_4h = False
+    s.active_hours_utc = ""
+    s.use_kelly_sizing = False
+    s.kelly_min_trades = 10
+    s.kelly_fraction = 0.5
+    s.kelly_min_risk_pct = 0.005
+    s.kelly_max_risk_pct = 0.02
+    s.trailing_stop_enabled = True
+    s.trailing_activation_pct = 0.02
+    s.trailing_distance_pct = 0.015
+    s.dynamic_trailing_enabled = False
+    s.dynamic_trailing_atr_mult = 1.5
+    s.disable_fixed_tp_with_trailing = True
+    # TP escalado (off por default)
+    s.scaled_tp_enabled = False
+    s.tp1_r_multiple = 1.0
+    s.tp1_size_pct = 0.5
+    s.breakeven_after_tp1 = True
+    s.breakeven_offset_pct = 0.0005
     return s
 
 

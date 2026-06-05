@@ -154,6 +154,20 @@ class TelegramNotifier:
         )
         self._send(text)
 
+    def notify_partial_tp(
+        self, price, portion_btc, pnl_usdt, new_stop, direction: str = "LONG",
+    ):
+        text = (
+            f"🎯 <b>¡Tomé ganancia parcial (TP1)!</b>\n\n"
+            f"💰 Cerré <b>{portion_btc:.6f} BTC</b> a <b>${price:,.2f}</b> → "
+            f"<b>+${pnl_usdt:,.2f}</b>\n"
+            f"🔒 Moví el stop a <b>breakeven (${new_stop:,.2f})</b>: "
+            f"el resto de la operación ya es <b>trade gratis</b>.\n\n"
+            f"<i>Dejo correr la otra mitad para buscar el TP completo.</i>\n"
+            f"⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
+        )
+        self._send(text)
+
     def notify_warning(self, message):
         text = f"⚠️ <b>Atención</b>\n\n{message}\n\n⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
         self._send(text)

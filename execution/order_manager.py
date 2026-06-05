@@ -48,6 +48,13 @@ class Position:
     claude_confidence: float
     trailing_active: bool = False
     highest_price_seen: float = 0.0
+    # TP escalado: TP1 parcial + breakeven. initial_amount_btc guarda el tamaño
+    # original; amount_btc se reduce tras el parcial. realized_pnl_usdt acumula
+    # lo cobrado en TP1.
+    take_profit_1: float = 0.0
+    initial_amount_btc: float = 0.0
+    tp1_done: bool = False
+    realized_pnl_usdt: float = 0.0
 
 
 @dataclass
@@ -289,6 +296,15 @@ class OrderManager:
             stop_loss_price = price * (1 + effective_sl_pct)
             take_profit_price = price * (1 - decision.take_profit_pct)
 
+        # TP1 escalado: a tp1_r_multiple × la distancia del SL efectivo.
+        take_profit_1 = 0.0
+        if self.settings.scaled_tp_enabled:
+            tp1_dist = effective_sl_pct * self.settings.tp1_r_multiple
+            if direction == "LONG":
+                take_profit_1 = price * (1 + tp1_dist)
+            else:
+                take_profit_1 = price * (1 - tp1_dist)
+
         client_order_id = f"bot_{uuid.uuid4().hex[:12]}"
         amount_btc = trade_size_usdt / price
 
@@ -307,6 +323,8 @@ class OrderManager:
             claude_confidence=decision.confianza,
             trailing_active=False,
             highest_price_seen=price,
+            take_profit_1=round(take_profit_1, 2),
+            initial_amount_btc=round(amount_btc, 8),
         )
 
         if self.exchange is not None:
@@ -334,6 +352,86 @@ class OrderManager:
         )
         return position
 
+    def maybe_take_partial_tp1(self, snapshot: MarketSnapshot) -> Optional[dict]:
+        """
+        Si el TP escalado está activo y el precio tocó TP1, cierra una fracción
+        (tp1_size_pct del tamaño original), contabiliza la ganancia parcial y
+        mueve el SL a breakeven. Devuelve un dict con el evento (para notificar)
+        o None si no hubo parcial. El remanente sigue corriendo al TP completo.
+        """
+        if not self.settings.scaled_tp_enabled:
+            return None
+        if self.state.open_position is None:
+            return None
+        pos = self.state.open_position
+        if pos.get("tp1_done"):
+            return None
+        tp1 = pos.get("take_profit_1", 0.0)
+        if not tp1:
+            return None
+
+        price = snapshot.price
+        direction = pos.get("direction", "LONG")
+        hit = price >= tp1 if direction == "LONG" else price <= tp1
+        if not hit:
+            return None
+
+        entry = pos["entry_price"]
+        initial_btc = pos.get("initial_amount_btc") or pos.get("amount_btc", 0.0)
+        portion_btc = round(min(initial_btc * self.settings.tp1_size_pct, pos["amount_btc"]), 8)
+        if portion_btc <= 0:
+            return None
+        portion_usdt = portion_btc * entry
+        if direction == "LONG":
+            pnl = (price - entry) * portion_btc
+        else:
+            pnl = (entry - price) * portion_btc
+
+        # Exchange real: cerrar el parcial a mercado en sentido contrario.
+        if self.exchange is not None:
+            try:
+                side = "sell" if direction == "LONG" else "buy"
+                self.exchange.place_market_order(
+                    side=side, amount_usdt=portion_usdt,
+                    client_order_id=f"{pos['client_order_id']}_tp1",
+                )
+            except Exception as e:
+                logger.error(f"Error al ejecutar TP1 parcial: {e}")
+                return None
+
+        self.state.capital += portion_usdt + pnl
+        pos["amount_btc"] = round(pos["amount_btc"] - portion_btc, 8)
+        pos["amount_usdt"] = round(pos["amount_usdt"] - portion_usdt, 2)
+        pos["realized_pnl_usdt"] = round(pos.get("realized_pnl_usdt", 0.0) + pnl, 2)
+        pos["tp1_done"] = True
+
+        if self.settings.breakeven_after_tp1:
+            off = self.settings.breakeven_offset_pct
+            if direction == "LONG":
+                be = round(entry * (1 + off), 2)
+                if be > pos["stop_loss"]:
+                    pos["stop_loss"] = be
+            else:
+                be = round(entry * (1 - off), 2)
+                if be < pos["stop_loss"]:
+                    pos["stop_loss"] = be
+
+        if self.state.capital > self.state.capital_peak:
+            self.state.capital_peak = self.state.capital
+        self._save_state()
+
+        logger.info(
+            f"🎯 TP1 PARCIAL | cerré {portion_btc:.6f} BTC @ ${price:,.2f} | "
+            f"+${pnl:,.2f} | SL → breakeven ${pos['stop_loss']:,.2f}"
+        )
+        return {
+            "price": price,
+            "portion_btc": portion_btc,
+            "pnl_usdt": round(pnl, 2),
+            "new_stop": pos["stop_loss"],
+            "direction": direction,
+        }
+
     def close_position(self, snapshot: MarketSnapshot, reason: str) -> dict:
         if self.state.open_position is None:
             return {}
@@ -343,16 +441,19 @@ class OrderManager:
 
         if pos.direction == "LONG":
             pnl_usdt = (current_price - pos.entry_price) * pos.amount_btc
-            pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
         else:  # SHORT
             pnl_usdt = (pos.entry_price - current_price) * pos.amount_btc
-            pnl_pct = ((pos.entry_price - current_price) / pos.entry_price) * 100
 
         exit_usdt = pos.amount_usdt + pnl_usdt
+        # PnL total del trade = remanente + lo ya cobrado en TP1. El % se mide
+        # sobre el notional original para que sea comparable entre trades.
+        total_pnl = pnl_usdt + pos.realized_pnl_usdt
+        base_usdt = (pos.initial_amount_btc or pos.amount_btc) * pos.entry_price
+        pnl_pct = (total_pnl / base_usdt) * 100 if base_usdt else 0.0
 
         self.state.capital += exit_usdt
         self.state.total_trades += 1
-        if pnl_usdt > 0:
+        if total_pnl > 0:
             self.state.winning_trades += 1
         if self.state.capital > self.state.capital_peak:
             self.state.capital_peak = self.state.capital
@@ -364,10 +465,12 @@ class OrderManager:
             "exit_price": current_price,
             "entry_time": pos.entry_time,
             "exit_time": datetime.utcnow().isoformat(),
-            "amount_btc": pos.amount_btc,
+            "amount_btc": pos.initial_amount_btc or pos.amount_btc,
             "amount_usdt": pos.amount_usdt,
-            "pnl": round(pnl_usdt, 2),
+            "pnl": round(total_pnl, 2),
             "pnl_pct": round(pnl_pct, 4),
+            "realized_tp1_pnl": round(pos.realized_pnl_usdt, 2),
+            "took_tp1": pos.tp1_done,
             "exit_reason": reason,
             "trailing_was_active": pos.trailing_active,
             "highest_price_seen": pos.highest_price_seen,
@@ -382,12 +485,13 @@ class OrderManager:
         self._check_daily_drawdown()
         self._save_state()
 
-        win = pnl_usdt > 0
+        win = total_pnl > 0
         emoji = "🟢" if win else "🔴"
         verb = "CIERRE LONG" if pos.direction == "LONG" else "CIERRE SHORT"
+        tp1_note = f" (incluye +${pos.realized_pnl_usdt:.2f} de TP1)" if pos.tp1_done else ""
         logger.info(
             f"{emoji} {verb} | ${current_price:,.2f} | P&L: {pnl_pct:+.2f}% "
-            f"(${pnl_usdt:+.2f}) | {reason}"
+            f"(${total_pnl:+.2f}){tp1_note} | {reason}"
         )
         return trade_record
 

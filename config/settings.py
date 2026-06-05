@@ -71,6 +71,16 @@ class Settings(BaseModel):
     # Si dynamic_trailing_enabled, ignoramos TP fijo: dejamos correr con el trailing.
     disable_fixed_tp_with_trailing: bool = True
 
+    # ─── TP escalado + breakeven shift ───
+    # Toma ganancia parcial en TP1 (a tp1_r_multiple × la distancia del SL) y,
+    # al tocarlo, mueve el SL a breakeven. El remanente corre al TP completo
+    # (o al trailing si está activo). "Trade gratis" para la segunda mitad.
+    scaled_tp_enabled: bool = False
+    tp1_r_multiple: float = 1.0            # TP1 a 1× el riesgo (R:R 1:1)
+    tp1_size_pct: float = 0.5             # fracción de la posición cerrada en TP1
+    breakeven_after_tp1: bool = True      # tras TP1, mover SL al entry
+    breakeven_offset_pct: float = 0.0005  # colchón sobre el entry (cubre fees/slippage)
+
     # ─── Mejoras de precisión (off por default; se activan con env vars) ───
     # Cooldown: N velas mínimas entre cerrar una posición y abrir otra.
     cooldown_bars: int = 0
@@ -131,4 +141,8 @@ def load_settings() -> Settings:
         require_mtf_confluence=os.getenv("REQUIRE_MTF_CONFLUENCE", "false").lower() == "true",
         active_hours_utc=os.getenv("ACTIVE_HOURS_UTC", ""),
         dynamic_trailing_enabled=os.getenv("DYNAMIC_TRAILING", "false").lower() == "true",
+        scaled_tp_enabled=os.getenv("SCALED_TP", "false").lower() == "true",
+        tp1_r_multiple=float(os.getenv("TP1_R_MULTIPLE", "1.0")),
+        tp1_size_pct=float(os.getenv("TP1_SIZE_PCT", "0.5")),
+        breakeven_after_tp1=os.getenv("BREAKEVEN_AFTER_TP1", "true").lower() == "true",
     )

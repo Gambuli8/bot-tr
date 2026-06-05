@@ -72,6 +72,19 @@ Todos cumplen además el filtro global ADX y la confluencia MTF (si activada).
 | `min_risk_reward` | 2.0 | TP ≥ 2x SL |
 | `trailing_activation_pct` | 2% | Activa trailing cuando profit > 2% |
 | `trailing_distance_pct` | 1.5% | Trailing sigue al precio a 1.5% |
+| `scaled_tp_enabled` | off | TP escalado: parcial en TP1 + breakeven (ver abajo) |
+| `tp1_r_multiple` | 1.0 | TP1 a 1× la distancia del SL (R:R 1:1) |
+| `tp1_size_pct` | 50% | Fracción de la posición cerrada en TP1 |
+| `breakeven_after_tp1` | on | Tras TP1, mover SL al entry ("trade gratis") |
+
+### TP escalado + breakeven shift (off por default, roadmap #1)
+
+Al tocar **TP1** (a `tp1_r_multiple` × la distancia del SL) se cierra
+`tp1_size_pct` de la posición y el SL salta a **breakeven**. El remanente corre
+al TP completo (o al trailing). Asegura parte de la ganancia temprano y elimina
+el riesgo de la segunda mitad. Implementado en `order_manager.maybe_take_partial_tp1`
+(vivo) y `backtest.py` (`--scaled-tp`). **Pendiente de validar con backtest real**
+antes de activar — ver [BACKTESTS.md](BACKTESTS.md).
 
 ### Kelly fraccionado (activo)
 
@@ -92,6 +105,7 @@ Ver [BACKTESTS.md](BACKTESTS.md) para los números completos.
 | Cooldown entre trades | ❌ rechazado | PF cae a 1.09 |
 | Macro EMA200 | ❌ rechazado | Neutro |
 | Trailing dinámico 1:1 | ⏸ pendiente | Primera implementación dio PF 1.00 (muy agresivo) |
+| TP escalado + breakeven | ⏸ implementado, sin validar | Mecánica testeada; falta backtest real (Binance bloqueado en remoto) |
 
 ## Configuración recomendada (`.env`)
 

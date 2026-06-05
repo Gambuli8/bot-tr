@@ -54,6 +54,13 @@ class SimPosition:
     entry_reason: str
     trailing_active: bool = False
     extreme_price: float = 0.0     # max para LONG, min para SHORT
+    # TP escalado: TP1 parcial + breakeven. initial_* guardan el tamaño original
+    # (amount_* se reducen tras el parcial). realized_pnl acumula lo cobrado en TP1.
+    initial_amount_btc: float = 0.0
+    initial_amount_usdt: float = 0.0
+    tp1_price: float = 0.0
+    tp1_done: bool = False
+    realized_pnl: float = 0.0
 
 
 @dataclass
@@ -68,6 +75,7 @@ class Trade:
     entry_reason: str
     exit_reason: str
     trailing_was_active: bool
+    took_tp1: bool = False
 
 
 # ───────── descarga histórica ─────────
@@ -272,6 +280,10 @@ class Simulator:
         else:
             sl = price * (1 - sl_pct)
             tp = price * (1 + tp_pct)
+        tp1 = 0.0
+        if self.s.scaled_tp_enabled:
+            tp1_dist = sl_pct * self.s.tp1_r_multiple
+            tp1 = price * (1 - tp1_dist) if dec.direction == "SHORT" else price * (1 + tp1_dist)
         self.position = SimPosition(
             direction=dec.direction,
             entry_price=price,
@@ -283,8 +295,36 @@ class Simulator:
             entry_idx=idx,
             entry_reason=f"[{dec.razon[:80]}]",
             extreme_price=price,
+            initial_amount_btc=amt_btc,
+            initial_amount_usdt=size_usdt,
+            tp1_price=tp1,
         )
         self.capital -= size_usdt
+
+    def _take_partial_tp1(self, price: float, idx: int) -> None:
+        """Cierra tp1_size_pct de la posición original en TP1 y mueve SL a breakeven."""
+        p = self.position
+        portion_btc = min(p.initial_amount_btc * self.s.tp1_size_pct, p.amount_btc)
+        portion_usdt = p.initial_amount_usdt * self.s.tp1_size_pct
+        if p.direction == "LONG":
+            pnl = (price - p.entry_price) * portion_btc
+        else:
+            pnl = (p.entry_price - price) * portion_btc
+        self.capital += portion_usdt + pnl
+        p.realized_pnl += pnl
+        p.amount_btc -= portion_btc
+        p.amount_usdt -= portion_usdt
+        p.tp1_done = True
+        if self.s.breakeven_after_tp1:
+            off = self.s.breakeven_offset_pct
+            if p.direction == "LONG":
+                be = p.entry_price * (1 + off)
+                if be > p.stop_loss:
+                    p.stop_loss = be
+            else:
+                be = p.entry_price * (1 - off)
+                if be < p.stop_loss:
+                    p.stop_loss = be
 
     def _close(self, exit_price: float, reason: str, idx: int) -> None:
         if self.position is None:
@@ -294,8 +334,12 @@ class Simulator:
             pnl = (exit_price - p.entry_price) * p.amount_btc
         else:
             pnl = (p.entry_price - exit_price) * p.amount_btc
-        pnl_pct = pnl / p.amount_usdt * 100
         self.capital += p.amount_usdt + pnl
+        # PnL total del trade = remanente + lo cobrado en TP1. El % se mide sobre
+        # el notional original para que sea comparable con trades sin escalado.
+        total_pnl = pnl + p.realized_pnl
+        base_usdt = p.initial_amount_usdt or p.amount_usdt
+        pnl_pct = total_pnl / base_usdt * 100 if base_usdt else 0.0
         if self.capital > self.peak:
             self.peak = self.capital
         dd = (self.peak - self.capital) / self.peak * 100
@@ -305,13 +349,14 @@ class Simulator:
             direction=p.direction,
             entry_price=p.entry_price,
             exit_price=exit_price,
-            amount_btc=p.amount_btc,
-            pnl_usdt=pnl,
+            amount_btc=p.initial_amount_btc or p.amount_btc,
+            pnl_usdt=total_pnl,
             pnl_pct=pnl_pct,
             bars_held=idx - p.entry_idx,
             entry_reason=p.entry_reason,
             exit_reason=reason,
             trailing_was_active=p.trailing_active,
+            took_tp1=p.tp1_done,
         ))
         self.position = None
         self.last_close_idx = idx
@@ -389,16 +434,25 @@ class Simulator:
             tp_enabled = not (
                 self.s.dynamic_trailing_enabled and self.s.disable_fixed_tp_with_trailing
             )
+            scaled = self.s.scaled_tp_enabled
             if p.direction == "LONG":
                 if low <= p.stop_loss:
-                    self._close(p.stop_loss, "Stop-loss", idx)
-                elif tp_enabled and high >= p.take_profit and not p.trailing_active:
-                    self._close(p.take_profit, "Take-profit", idx)
+                    self._close(p.stop_loss, "Stop-loss" if not p.tp1_done else "Breakeven post-TP1", idx)
+                else:
+                    if scaled and not p.tp1_done and p.tp1_price and high >= p.tp1_price:
+                        self._take_partial_tp1(p.tp1_price, idx)
+                    if (self.position is not None and tp_enabled
+                            and not p.trailing_active and high >= p.take_profit):
+                        self._close(p.take_profit, "Take-profit", idx)
             else:  # SHORT
                 if high >= p.stop_loss:
-                    self._close(p.stop_loss, "Stop-loss", idx)
-                elif tp_enabled and low <= p.take_profit and not p.trailing_active:
-                    self._close(p.take_profit, "Take-profit", idx)
+                    self._close(p.stop_loss, "Stop-loss" if not p.tp1_done else "Breakeven post-TP1", idx)
+                else:
+                    if scaled and not p.tp1_done and p.tp1_price and low <= p.tp1_price:
+                        self._take_partial_tp1(p.tp1_price, idx)
+                    if (self.position is not None and tp_enabled
+                            and not p.trailing_active and low <= p.take_profit):
+                        self._close(p.take_profit, "Take-profit", idx)
 
         # 2) Si no hay posición, evaluar señal de entrada
         if self.position is None:
@@ -475,6 +529,10 @@ def report(sim: Simulator, settings) -> None:
     for r, c in sorted(by_reason.items(), key=lambda x: -x[1]):
         print(f"  • {r}: {c}")
 
+    if settings.scaled_tp_enabled:
+        tp1_count = sum(1 for t in sim.trades if t.took_tp1)
+        print(f"\nTP1 parciales tomados: {tp1_count}/{n} trades")
+
     print()
     print("Últimas 5 operaciones:")
     for t in sim.trades[-5:]:
@@ -497,6 +555,7 @@ def main():
     parser.add_argument("--kelly", action="store_true", help="Position sizing por Kelly")
     parser.add_argument("--mtf", action="store_true", help="Filtro de confluencia con TF 1h")
     parser.add_argument("--dyn-trailing", action="store_true", help="Trailing dinámico (sin TP fijo)")
+    parser.add_argument("--scaled-tp", action="store_true", help="TP escalado: parcial en TP1 (R:R 1:1) + breakeven")
     args = parser.parse_args()
 
     settings = load_settings()
@@ -516,6 +575,8 @@ def main():
         settings.require_mtf_confluence = True
     if args.dyn_trailing:
         settings.dynamic_trailing_enabled = True
+    if args.scaled_tp:
+        settings.scaled_tp_enabled = True
 
     flags = []
     if settings.cooldown_bars > 0:
@@ -530,6 +591,10 @@ def main():
         flags.append("mtf")
     if settings.dynamic_trailing_enabled:
         flags.append("dyn-trailing")
+    if settings.scaled_tp_enabled:
+        flags.append(
+            f"scaled-tp({settings.tp1_size_pct:.0%}@{settings.tp1_r_multiple:.1f}R)"
+        )
     print(f"Mejoras activas: {', '.join(flags) if flags else 'ninguna (baseline)'}")
 
     print(f"Bajando {args.days} días de {settings.symbol} @ {settings.timeframe} de Binance mainnet...")

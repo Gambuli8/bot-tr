@@ -141,8 +141,61 @@ Esperado en producción (30 días):
 
 ⚠️ El backtest **no incluye comisiones** (0.075% por lado en taker = 0.15% round-trip). Con $140 por trade × 46 trades = ~$10 en fees en 30 días = ~5% del capital. **El resultado real esperado es ~+7% en 30 días con comisiones**, no +12.47%.
 
+## 2026-06-05 — TP escalado + breakeven shift (roadmap #1)
+
+Implementado el TP escalado: al tocar **TP1** (a `TP1_R_MULTIPLE` × la distancia
+del SL, default R:R 1:1) se cierra `TP1_SIZE_PCT` de la posición (default 50%) y
+el SL se mueve a **breakeven**. El remanente corre al TP completo (o al trailing).
+La idea: asegurar ganancia parcial y convertir la segunda mitad en "trade gratis".
+
+Implementado en los 3 lugares y detrás de flags (off por default):
+- `config/settings.py`: `SCALED_TP`, `TP1_R_MULTIPLE`, `TP1_SIZE_PCT`, `BREAKEVEN_AFTER_TP1`.
+- `scripts/backtest.py`: flag `--scaled-tp` + parcial en `_take_partial_tp1`.
+- `execution/order_manager.py`: `maybe_take_partial_tp1()` + breakeven, contabiliza
+  el parcial en `close_position`. Notificación Telegram `notify_partial_tp`.
+
+### ⚠️ Validación con data real: PENDIENTE
+
+El backtest 30d **no se pudo correr en el entorno remoto**: la política de red
+bloquea el acceso a Binance (y a toda fuente de OHLCV) con `403`. Por eso **NO se
+activó en producción** — `SCALED_TP=false` por default, el bot vivo no cambia.
+
+Lo que SÍ se validó acá (determinístico, sin red):
+- **Mecánica** (9 tests en `tests/test_scaled_tp.py`, simulador + OrderManager):
+  parcial cierra la fracción correcta, breakeven mueve el SL al entry, el PnL total
+  del trade = parcial + remanente, y el "trade gratis" cierra en verde aunque el
+  precio vuelva al entry. Espejo LONG/SHORT cubierto.
+- **Integración** del pipeline del backtester con data sintética: corre de punta a
+  punta en ambos modos sin errores y los parciales se toman como se espera.
+
+### Para validar con data real (correr en tu máquina, con acceso a Binance):
+
+```bash
+# 1) Baseline (config viva actual)
+python scripts/backtest.py --days 30 --timeframe 15m --adx-min 20 --kelly --mtf
+
+# 2) Con TP escalado
+python scripts/backtest.py --days 30 --timeframe 15m --adx-min 20 --kelly --mtf --scaled-tp
+```
+
+Criterio de aceptación (regla dura del proyecto):
+- Si **PF sube o se mantiene** y el **max DD no sube** → aplicar (`SCALED_TP=true` en `.env`).
+- Si baja el PF o sube el DD → descartar, o probar variantes:
+  `TP1_R_MULTIPLE` 1.5 (TP1 más lejos, menos parciales prematuros) y/o
+  `TP1_SIZE_PCT` 0.33 (asegurar menos, dejar correr más).
+
+> Nota de diseño: el baseline ya corre con trailing legacy activo
+> (`trailing_stop_enabled=True`, activación 2%), así que el TP escalado se mide
+> *encima* de eso. Ojo con la interacción breakeven vs trailing: ambos sólo
+> endurecen el SL, no hay conflicto, pero el breakeven temprano puede aumentar
+> las salidas a breakeven (menos ganadoras grandes). Eso es justo lo que el
+> backtest tiene que medir.
+
+---
+
 ## Próximos experimentos pendientes
 
+- [ ] **TP escalado: validar con data real 30d** (baseline vs `--scaled-tp`) ← listo para correr
 - [ ] Trailing dinámico recalibrado (activar al 2:1, distance min 1%)
 - [ ] Breakout por cierre confirmado (no intra-vela)
 - [ ] SL estructural en niveles Donchian

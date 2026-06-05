@@ -143,6 +143,21 @@ class MainStrategy:
                     "Circuit breaker de Claude activado. Bot en modo SAFE."
                 )
 
+            # ¿TP escalado? Si tocamos TP1, tomamos ganancia parcial y movemos
+            # el SL a breakeven antes de evaluar el cierre del remanente.
+            try:
+                partial = self.order_manager.maybe_take_partial_tp1(snapshot)
+                if partial:
+                    self.telegram.notify_partial_tp(
+                        price=partial["price"],
+                        portion_btc=partial["portion_btc"],
+                        pnl_usdt=partial["pnl_usdt"],
+                        new_stop=partial["new_stop"],
+                        direction=partial["direction"],
+                    )
+            except Exception as e:
+                logger.warning(f"No pude procesar TP1 parcial: {e}")
+
             # ¿Cerrar posición? (LONG o SHORT, lógica adentro del order_manager)
             should_close, close_reason = self.order_manager.should_close(snapshot, decision)
             if should_close:
