@@ -24,13 +24,12 @@ RUN pip install -r requirements.txt
 # Copiamos el código del proyecto
 COPY . .
 
-# Carpetas runtime (state, journal, audit, logs rotados)
-RUN mkdir -p /app/data /app/logs
+# Carpeta runtime persistente (state, journal, audit, bot.log)
+RUN mkdir -p /app/data
 
 # Healthcheck: el bot está vivo si el log se actualizó en los últimos 3 min.
-# Útil para `docker ps` y para detectar bots colgados (ej. red caída).
 HEALTHCHECK --interval=2m --timeout=10s --start-period=60s --retries=2 \
-    CMD test $(($(date +%s) - $(stat -c %Y /app/logs/bot.log 2>/dev/null || echo 0))) -lt 180 || exit 1
+    CMD test $(($(date +%s) - $(stat -c %Y /app/data/bot.log 2>/dev/null || echo 0))) -lt 180 || exit 1
 
 # El bot por sí solo no expone puertos (no HTTP, sólo Telegram polling).
 # Si en el futuro agregás un /metrics, exponé acá.

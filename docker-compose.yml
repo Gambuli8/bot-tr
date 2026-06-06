@@ -32,10 +32,11 @@ services:
       PYTHONIOENCODING: "utf-8"    # emojis en stdout
       TZ: "UTC"                    # timestamps consistentes
 
-    # Estado runtime persistente — sobrevive a `compose down`, rebuilds y reboots
+    # Estado runtime persistente — sobrevive a `compose down`, rebuilds y reboots.
+    # IMPORTANTE: NO montamos ./logs porque ahí vive código (logs/logger.py).
+    # El bot.log se guarda en data/ junto con el resto del runtime state.
     volumes:
-      - ./data:/app/data           # state.json, trade_journal.jsonl, audit
-      - ./logs:/app/logs           # bot.log con rotación
+      - ./data:/app/data           # state.json, trade_journal.jsonl, audit, bot.log
 
     # Recursos limitados para que el bot no se coma el VPS si hay leak
     deploy:

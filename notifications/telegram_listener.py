@@ -544,7 +544,7 @@ class TelegramListener:
 
     def _cmd_logs(self, args: list[str], chat_id: str) -> None:
         n = self._parse_int_arg(args, default=20, lo=1, hi=100)
-        log_file = Path(__file__).parent.parent / "logs" / "bot.log"
+        log_file = Path(__file__).parent.parent / "data" / "bot.log"
         if not log_file.exists():
             self._send("No hay log todavía.", chat_id=chat_id)
             return

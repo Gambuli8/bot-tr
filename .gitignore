@@ -22,9 +22,15 @@ __pycache__/
 build/
 dist/
 
-# Estado runtime del bot (paper trading, journals, audit)
+# Estado runtime del bot (paper trading, journals, audit, bot.log).
+# NOTA: la carpeta logs/ NO se ignora porque ahí vive el código (logger.py).
+# El bot.log se persiste en data/, junto al state.json.
 data/
-logs/
+
+# Pero sí ignoramos los logs runtime que históricamente quedaron en logs/
+logs/bot.log
+logs/bot.log.*
+logs/run_stdout.log
 
 # IDE / OS
 .vscode/
