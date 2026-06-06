@@ -148,3 +148,73 @@ Esperado en producción (30 días):
 - [ ] SL estructural en niveles Donchian
 - [ ] Comisiones simuladas en el backtest (0.15% round-trip)
 - [ ] Walk-forward analysis (training 20d, testing 10d, rolling)
+
+---
+
+## 2026-06-06 — TP escalado
+
+Datos: `2026-05-07 → 2026-06-06` (30 días)  •  Símbolo: BTC/USDT  •  TF: 15m
+
+### J) Baseline actualizado (ADX + Kelly + MTF, mismo período)
+```
+python scripts/backtest.py --days 30 --timeframe 15m --adx-min 20 --kelly --mtf
+```
+- Capital: $200 → $231.57 (+10.27%)
+- WR: 46.0%  •  PF: 1.93  •  Max DD: 2.40%
+- Trades: 50 (6L / 44S)
+
+### K) Sweep de TP escalado
+Comando: `... --tp-scaling --tp1-rr <r> --tp1-pct <p>`
+
+| TP1 ratio | Frac cerrada | Retorno | WR | PF | Max DD |
+|---|---|---|---|---|---|
+| 0.7 | 0.3 | +3.48% | 77.8% | 1.29 | 3.08% |
+| 0.7 | 0.5 | +3.69% | 77.8% | 1.31 | 2.66% |
+| 0.7 | 0.7 | +3.89% | 77.8% | 1.33 | 2.29% |
+| 1.0 | 0.3 | +8.05% | 76.9% | 1.90 | 1.95% |
+| 1.0 | 0.5 | +8.14% | 76.9% | 1.91 | 1.89% |
+| 1.0 | 0.7 | +8.22% | 76.9% | 1.92 | 1.89% |
+| **1.3** | **0.3** | **+10.47%** | **70.7%** | **2.14** | **2.11%** |
+| 1.3 | 0.5 | +10.35% | 70.7% | 2.13 | 2.15% |
+| 1.3 | 0.7 | +10.21% | 70.7% | 2.11 | 2.20% |
+| 1.5 | 0.3 | +9.33% | 68.8% | 1.91 | 2.09% |
+| 1.5 | 0.5 | +9.22% | 68.8% | 1.90 | 2.12% |
+| 1.5 | 0.7 | +9.02% | 68.8% | 1.88 | 2.15% |
+
+### L) TP1 a 1.3× SL, cerrar 30% — DESCARTADO tras agregar comisiones
+Sin fees parecía ganador. Pero al modelar fee 0.1% por lado, perdió contra el baseline:
+
+| Config (con fee 0.1%) | Retorno | WR | PF | DD |
+|---|---|---|---|---|
+| Baseline (ADX+Kelly+MTF) | +4.66% | 46.9% | **1.33** | 3.97% |
+| TP escalado 1.3×, 0.3 | +2.59% | 59.8% | 1.20 | 4.80% |
+| TP escalado 1.5×, 0.3 | +1.66% | 58.8% | 1.11 | 4.40% |
+| TP escalado 2.0×, 0.5 | -0.21% | 57.1% | 0.98 | 5.50% |
+| TP escalado 2.5×, 0.3 | +2.57% | 56.2% | 1.17 | 4.11% |
+
+❌ **REVERTIDO.** El fill extra de TP1 cuesta ~0.15% del capital invertido cada vez. La ganancia parcial chica del TP1 no compensa esa fricción.
+
+---
+
+## 2026-06-06 — Comisiones reales
+
+Agregamos `commission_pct_per_side=0.001` (Binance Spot taker sin BNB) al simulador.
+
+### M) Re-evaluación de todo el stack con comisiones reales
+
+| Variante (30d) | Sin fees | Con fees 0.1%/side | Δ retorno |
+|---|---|---|---|
+| Sin filtros (baseline original) | +8.86% | n/d | — |
+| ADX≥20 + Kelly + MTF | +11.96% | **+4.66%** | **-7.30pp** |
+| ADX≥20 + Kelly + MTF + TP escalado | +10.47% | +2.59% | -7.88pp |
+
+**Lectura crítica**:
+- Las comisiones se llevan **más del 60% del retorno bruto** sobre 30 días.
+- El bot real va a dar **~+5% / mes** (sin gente que pague comisiones reducidas con BNB).
+- El PF cae de 2.14 a 1.33 — sigue siendo positivo pero el margen es chico.
+- TP escalado, contrintuitivo, EMPEORA con fees por el fill extra.
+
+**Acción tomada**:
+- TP escalado: revertido (`TP_SCALING_ENABLED=false`)
+- Config activa del bot: ADX≥20 + Kelly + MTF
+- Expectativa realista comunicada al usuario: ~+5% mensual neto.

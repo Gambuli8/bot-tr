@@ -54,6 +54,11 @@ class SimPosition:
     entry_reason: str
     trailing_active: bool = False
     extreme_price: float = 0.0     # max para LONG, min para SHORT
+    # TP escalado:
+    tp1_price: float = 0.0         # nivel del TP parcial (1:1 vs SL por defecto)
+    tp1_filled: bool = False
+    tp1_partial_pct: float = 0.0   # fracción cerrada en TP1
+    original_amount_btc: float = 0.0  # cantidad inicial (para reportar bien)
 
 
 @dataclass
@@ -62,12 +67,14 @@ class Trade:
     entry_price: float
     exit_price: float
     amount_btc: float
-    pnl_usdt: float
+    pnl_usdt: float          # PnL NETO (ya descontó fees)
     pnl_pct: float
     bars_held: int
     entry_reason: str
     exit_reason: str
     trailing_was_active: bool
+    fee_paid: float = 0.0    # Fees pagadas (entrada + salida)
+    pnl_gross: float = 0.0   # PnL BRUTO (sin descontar fees)
 
 
 # ───────── descarga histórica ─────────
@@ -266,12 +273,17 @@ class Simulator:
             return
         price = snap.price
         amt_btc = size_usdt / price
+
+        # TP1 (parcial) a 1:1 vs SL por defecto.
         if dec.direction == "SHORT":
             sl = price * (1 + sl_pct)
             tp = price * (1 - tp_pct)
+            tp1 = price * (1 - sl_pct * self.s.tp1_rr_multiple)
         else:
             sl = price * (1 - sl_pct)
             tp = price * (1 + tp_pct)
+            tp1 = price * (1 + sl_pct * self.s.tp1_rr_multiple)
+
         self.position = SimPosition(
             direction=dec.direction,
             entry_price=price,
@@ -283,17 +295,69 @@ class Simulator:
             entry_idx=idx,
             entry_reason=f"[{dec.razon[:80]}]",
             extreme_price=price,
+            tp1_price=tp1,
+            tp1_partial_pct=self.s.tp1_partial_pct if self.s.tp_scaling_enabled else 0.0,
+            original_amount_btc=amt_btc,
         )
         self.capital -= size_usdt
+
+    def _partial_close(self, exit_price: float, reason: str, idx: int) -> None:
+        """Cierra una fracción tp1_partial_pct de la posición y mueve SL a breakeven."""
+        if self.position is None:
+            return
+        p = self.position
+        fraction = p.tp1_partial_pct
+        close_btc = p.original_amount_btc * fraction
+        close_usdt = close_btc * p.entry_price  # capital que estaba reservado para esta fracción
+
+        if p.direction == "LONG":
+            pnl_gross = (exit_price - p.entry_price) * close_btc
+        else:
+            pnl_gross = (p.entry_price - exit_price) * close_btc
+
+        # Comisión sobre el valor de la entrada parcial + valor del cierre parcial.
+        fee = (close_usdt + close_btc * exit_price) * self.s.commission_pct_per_side
+        pnl = pnl_gross - fee
+
+        pnl_pct = pnl / close_usdt * 100 if close_usdt else 0.0
+        self.capital += close_usdt + pnl
+        if self.capital > self.peak:
+            self.peak = self.capital
+        self.trades.append(Trade(
+            direction=p.direction,
+            entry_price=p.entry_price,
+            exit_price=exit_price,
+            amount_btc=close_btc,
+            pnl_usdt=pnl,
+            pnl_pct=pnl_pct,
+            bars_held=idx - p.entry_idx,
+            entry_reason=p.entry_reason,
+            exit_reason=reason,
+            trailing_was_active=False,
+            fee_paid=fee,
+            pnl_gross=pnl_gross,
+        ))
+        # Actualizar la posición restante
+        p.amount_btc -= close_btc
+        p.amount_usdt -= close_usdt
+        p.tp1_filled = True
 
     def _close(self, exit_price: float, reason: str, idx: int) -> None:
         if self.position is None:
             return
         p = self.position
         if p.direction == "LONG":
-            pnl = (exit_price - p.entry_price) * p.amount_btc
+            pnl_gross = (exit_price - p.entry_price) * p.amount_btc
         else:
-            pnl = (p.entry_price - exit_price) * p.amount_btc
+            pnl_gross = (p.entry_price - exit_price) * p.amount_btc
+
+        # Comisión: entrada (sobre amount_usdt original, que NO incluye lo cerrado en TP1)
+        # + salida (sobre el valor final). Si hubo TP1, la entrada ya pagó su parte en _partial_close.
+        entry_value = p.amount_usdt
+        exit_value = p.amount_btc * exit_price
+        fee = (entry_value + exit_value) * self.s.commission_pct_per_side
+        pnl = pnl_gross - fee
+
         pnl_pct = pnl / p.amount_usdt * 100
         self.capital += p.amount_usdt + pnl
         if self.capital > self.peak:
@@ -312,6 +376,8 @@ class Simulator:
             entry_reason=p.entry_reason,
             exit_reason=reason,
             trailing_was_active=p.trailing_active,
+            fee_paid=fee,
+            pnl_gross=pnl_gross,
         ))
         self.position = None
         self.last_close_idx = idx
@@ -389,6 +455,26 @@ class Simulator:
             tp_enabled = not (
                 self.s.dynamic_trailing_enabled and self.s.disable_fixed_tp_with_trailing
             )
+
+            # TP1 (parcial): si la vela tocó el nivel y todavía no se llenó.
+            tp1_active = (
+                self.s.tp_scaling_enabled
+                and not p.tp1_filled
+                and p.tp1_partial_pct > 0
+            )
+            if tp1_active:
+                tp1_touched = (
+                    (p.direction == "LONG" and high >= p.tp1_price) or
+                    (p.direction == "SHORT" and low <= p.tp1_price)
+                )
+                if tp1_touched:
+                    self._partial_close(p.tp1_price, "TP1 (parcial)", idx)
+                    # Mover SL a breakeven + buffer (free trade)
+                    if p.direction == "LONG":
+                        p.stop_loss = max(p.stop_loss, p.entry_price * (1 + self.s.breakeven_buffer_pct))
+                    else:
+                        p.stop_loss = min(p.stop_loss, p.entry_price * (1 - self.s.breakeven_buffer_pct))
+
             if p.direction == "LONG":
                 if low <= p.stop_loss:
                     self._close(p.stop_loss, "Stop-loss", idx)
@@ -497,6 +583,9 @@ def main():
     parser.add_argument("--kelly", action="store_true", help="Position sizing por Kelly")
     parser.add_argument("--mtf", action="store_true", help="Filtro de confluencia con TF 1h")
     parser.add_argument("--dyn-trailing", action="store_true", help="Trailing dinámico (sin TP fijo)")
+    parser.add_argument("--tp-scaling", action="store_true", help="TP escalado: TP1 al 1:1 cierra 50% y mueve SL a breakeven")
+    parser.add_argument("--tp1-pct", type=float, default=None, help="Fracción cerrada en TP1 (0-1)")
+    parser.add_argument("--tp1-rr", type=float, default=None, help="Multiplicador de SL para TP1 (1.0 = 1:1 RR)")
     args = parser.parse_args()
 
     settings = load_settings()
@@ -516,6 +605,12 @@ def main():
         settings.require_mtf_confluence = True
     if args.dyn_trailing:
         settings.dynamic_trailing_enabled = True
+    if args.tp_scaling:
+        settings.tp_scaling_enabled = True
+    if getattr(args, "tp1_pct", None) is not None:
+        settings.tp1_partial_pct = args.tp1_pct
+    if getattr(args, "tp1_rr", None) is not None:
+        settings.tp1_rr_multiple = args.tp1_rr
 
     flags = []
     if settings.cooldown_bars > 0:
@@ -530,6 +625,8 @@ def main():
         flags.append("mtf")
     if settings.dynamic_trailing_enabled:
         flags.append("dyn-trailing")
+    if settings.tp_scaling_enabled:
+        flags.append("tp-scaling")
     print(f"Mejoras activas: {', '.join(flags) if flags else 'ninguna (baseline)'}")
 
     print(f"Bajando {args.days} días de {settings.symbol} @ {settings.timeframe} de Binance mainnet...")

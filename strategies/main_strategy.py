@@ -6,14 +6,18 @@ Soporta MODO TESTING (sin Claude, reglas técnicas).
 
 import time
 from datetime import datetime, date
+from typing import Optional
 from logs.logger import logger
 from config.settings import Settings
 from core.exchange import ExchangeClient
 from core.indicators import IndicatorEngine
 from core.claude_agent import ClaudeAgent
 from core.technical_engine import TechnicalEngine
+from core.scalping_engine import ScalpingEngine
+from core.price_action_engine import PriceActionEngine
 from execution.order_manager import OrderManager
 from notifications.telegram import TelegramNotifier
+import notifier as nf  # Wrapper simple para alertas críticas
 
 
 class MainStrategy:
@@ -23,15 +27,28 @@ class MainStrategy:
         self.exchange = ExchangeClient(settings)
         self.indicator_engine = IndicatorEngine(settings)
 
-        # Elegir motor de decisión según modo
-        if settings.testing_mode:
-            self.agent = TechnicalEngine(settings)
-            logger.warning("⚠️  MODO TESTING ACTIVO — operando sin Claude")
-        else:
+        # Elegir motor: settings.engine (env ENGINE) tiene prioridad sobre testing_mode.
+        engine_name = (getattr(settings, "engine", "") or "").lower()
+        if not engine_name:
+            engine_name = "technical" if settings.testing_mode else "claude"
+        if engine_name == "scalping":
+            self.agent = ScalpingEngine(settings)
+            logger.info("⚡ Motor: SCALPING (BB squeeze + expansion, TF 5m)")
+        elif engine_name == "price_action":
+            self.agent = PriceActionEngine(settings)
+            logger.info("📊 Motor: PRICE ACTION (1h trigger + 4h structure)")
+        elif engine_name == "claude":
             self.agent = ClaudeAgent(settings)
-            logger.info("Modo producción — usando Claude API")
+            logger.info("🧠 Motor: Claude API")
+        else:
+            self.agent = TechnicalEngine(settings)
+            logger.warning("⚠️  Motor: TechnicalEngine (legacy — sin edge en backtest 90d+)")
+        self.engine_name = engine_name
 
-        self.order_manager = OrderManager(settings, exchange_client=None)
+        # exchange_client conectado al testnet: SL/TP van como órdenes reales
+        # al exchange (idempotentes vs sleep/crash del proceso). Sólo soporta LONG
+        # en Spot; SHORT en Spot va a fallar en place_market_order.
+        self.order_manager = OrderManager(settings, exchange_client=self.exchange)
         self.telegram = TelegramNotifier(settings)
         self._last_report_date = None
 
@@ -60,6 +77,24 @@ class MainStrategy:
                 self.controller.set_active_hours(settings.active_hours_utc)
         self._was_schedule_paused: Optional[bool] = None
 
+        # Reconciliación periódica con el exchange
+        self._last_reconcile_at: float = 0.0
+        self._reconcile_interval_seconds: int = 5 * 60
+
+        # Reconciliación al startup (recupera de crashes previos durante una orden)
+        try:
+            rec = self.order_manager.reconcile_with_exchange()
+            if rec.get("actions") or rec.get("issues"):
+                logger.warning(f"Reconciliación al startup: {rec}")
+                msg = self._format_reconcile_msg(rec, where="startup")
+                if msg:
+                    self.telegram.notify_warning(msg)
+            else:
+                logger.info("Reconciliación al startup: OK (sin inconsistencias)")
+            self._last_reconcile_at = time.time()
+        except Exception as e:
+            logger.error(f"Reconciliación al startup falló: {e}", exc_info=True)
+
         logger.info("MainStrategy inicializada")
 
     def run_once(self) -> dict:
@@ -71,6 +106,10 @@ class MainStrategy:
         try:
             # Schedule: detectar transición y notificar.
             self._check_schedule_transition()
+
+            # Reconciliación periódica con el exchange (cada 5 min).
+            # Se hace acá para que aplique incluso en sleep profundo.
+            self._maybe_reconcile()
 
             # 0. ¿Pedido de cierre manual via Telegram?
             if self.controller is not None and self.controller.consume_force_close():
@@ -121,11 +160,9 @@ class MainStrategy:
                     mtf = self.exchange.get_mtf_context()
                 except Exception as e:
                     logger.warning(f"No pude traer MTF context: {e}")
-            try:
-                decision = self.agent.analyze(snapshot, trade_history, mtf=mtf)
-            except TypeError:
-                # Fallback: el agente no soporta mtf (ej. ClaudeAgent legacy)
-                decision = self.agent.analyze(snapshot, trade_history)
+
+            # Dispatch por tipo de engine (interfaces distintas)
+            decision = self._call_engine(df, snapshot, trade_history, mtf)
 
             # Telegram: por defecto NO mandamos diagnóstico por ciclo (es spam).
             # En su lugar, cada 30 min mandamos un "panorama" amigable.
@@ -143,21 +180,45 @@ class MainStrategy:
                     "Circuit breaker de Claude activado. Bot en modo SAFE."
                 )
 
-            # ¿Cerrar posición? (LONG o SHORT, lógica adentro del order_manager)
-            should_close, close_reason = self.order_manager.should_close(snapshot, decision)
-            if should_close:
-                pos_before = self.order_manager.state.open_position or {}
-                direction_closed = pos_before.get("direction", "LONG")
-                trade = self.order_manager.close_position(snapshot, close_reason)
-                self.telegram.notify_sell(
-                    price=snapshot.price,
-                    pnl_usdt=trade.get("pnl", 0),
-                    pnl_pct=trade.get("pnl_pct", 0),
-                    reason=close_reason,
-                    direction=direction_closed,
-                )
-                cycle_result["action"] = f"CERRAR_{direction_closed}"
-                cycle_result["reason"] = close_reason
+            # ¿Cerrar alguna posición? (iteramos TODAS — multi-trade)
+            closes_to_do = self.order_manager.should_close_any(snapshot, decision)
+            if closes_to_do:
+                for client_id, close_reason in closes_to_do:
+                    # Apuntar open_position al que vamos a cerrar (compat con close_position)
+                    target = next(
+                        (p for p in self.order_manager.state.open_positions
+                         if p.get("client_order_id") == client_id),
+                        None,
+                    )
+                    if target is None:
+                        continue
+                    self.order_manager.state.open_position = target
+                    direction_closed = target.get("direction", "LONG")
+                    trade = self.order_manager.close_position(snapshot, close_reason)
+                    pnl = trade.get("pnl", 0)
+                    pnl_pct = trade.get("pnl_pct", 0)
+                    self.telegram.notify_sell(
+                        price=snapshot.price,
+                        pnl_usdt=pnl,
+                        pnl_pct=pnl_pct,
+                        reason=close_reason,
+                        direction=direction_closed,
+                    )
+                    # Notifier crítico: cierre con PnL y balance total
+                    try:
+                        nf.notify_close(
+                            symbol=self.settings.symbol,
+                            direction=direction_closed,
+                            exit_price=snapshot.price,
+                            pnl_usdt=pnl,
+                            pnl_pct=pnl_pct,
+                            balance=self.order_manager.state.capital,
+                            reason=close_reason,
+                        )
+                    except Exception:
+                        pass
+                cycle_result["action"] = f"CERRAR x{len(closes_to_do)}"
+                cycle_result["reason"] = closes_to_do[0][1] if closes_to_do else ""
 
             # ¿Pausado por Telegram?  (SL/TP siguen activos arriba)
             elif self.controller is not None and self.controller.is_paused:
@@ -184,6 +245,18 @@ class MainStrategy:
                         confidence=position.claude_confidence,
                         direction=position.direction,
                     )
+                    # Notifier crítico: apertura con símbolo, dirección, precio
+                    try:
+                        nf.notify_open(
+                            symbol=self.settings.symbol,
+                            direction=position.direction,
+                            entry_price=position.entry_price,
+                            amount_usdt=position.amount_usdt,
+                            sl=position.stop_loss,
+                            tp=position.take_profit,
+                        )
+                    except Exception:
+                        pass
                     cycle_result["action"] = f"ABRIR_{position.direction}"
                     cycle_result["reason"] = decision.razon
             else:
@@ -239,6 +312,90 @@ class MainStrategy:
             logger.critical(f"Error fatal en loop: {e}", exc_info=True)
             self.telegram.notify_critical(f"Error fatal — bot detenido:\n{str(e)[:300]}")
             raise
+
+    def _call_engine(self, df, snapshot, trade_history, mtf):
+        """Dispatcher por tipo de engine. Cada uno tiene su firma."""
+        name = (self.engine_name or "").lower()
+        if name == "scalping":
+            # ScalpingEngine necesita df completo + índice de la última vela
+            return self.agent.analyze(df, len(df) - 1)
+        if name == "price_action":
+            # PriceActionEngine necesita df_1h y df_4h. Si TF base = 1h, lo usamos
+            # como 1h; el 4h lo trae el exchange con MTF.
+            try:
+                # En este caso, asumimos que df ES el TF 1h. Si no, hay que resamplear.
+                df_4h = self.exchange.data_exchange.fetch_ohlcv(
+                    self.settings.symbol, "4h", limit=300,
+                )
+                import pandas as _pd
+                df_4h = _pd.DataFrame(
+                    df_4h, columns=["timestamp", "open", "high", "low", "close", "volume"]
+                )
+                df_4h["timestamp"] = _pd.to_datetime(df_4h["timestamp"], unit="ms")
+                df_4h.set_index("timestamp", inplace=True)
+                return self.agent.analyze(df_1h=df, df_4h=df_4h)
+            except Exception as e:
+                logger.warning(f"PA engine error: {e}")
+                return self._fallback_decision_wait(f"engine error: {e}")
+
+        # Default: TechnicalEngine / ClaudeAgent (snapshot + history)
+        try:
+            return self.agent.analyze(snapshot, trade_history, mtf=mtf)
+        except TypeError:
+            return self.agent.analyze(snapshot, trade_history)
+
+    def _fallback_decision_wait(self, motivo: str):
+        """Decisión genérica de ESPERAR cuando el engine falla."""
+        from dataclasses import dataclass
+
+        @dataclass
+        class _D:
+            accion: str = "ESPERAR"
+            direction: str = "LONG"
+            confianza: float = 0.0
+            razon: str = motivo
+            stop_loss_pct: float = 0.0
+            take_profit_pct: float = 0.0
+            advertencias: list = None
+
+            def __post_init__(self):
+                if self.advertencias is None:
+                    self.advertencias = []
+
+        return _D(razon=motivo)
+
+    def _format_reconcile_msg(self, rec: dict, where: str) -> str:
+        """Convierte el dict de reconciliación a un mensaje legible."""
+        if not rec.get("actions") and not rec.get("issues"):
+            return ""
+        lines = [f"🔧 <b>Reconciliación con exchange ({where})</b>\n"]
+        if rec.get("actions"):
+            lines.append("<b>Acciones tomadas:</b>")
+            for a in rec["actions"][:5]:
+                lines.append(f"  • {a}")
+        if rec.get("issues"):
+            lines.append("\n<b>⚠️ Issues:</b>")
+            for i in rec["issues"][:5]:
+                lines.append(f"  • {i[:120]}")
+        return "\n".join(lines)
+
+    def _maybe_reconcile(self) -> None:
+        """Llama a reconciliación con el exchange cada N segundos."""
+        if self.order_manager.exchange is None:
+            return
+        now = time.time()
+        if (now - self._last_reconcile_at) < self._reconcile_interval_seconds:
+            return
+        try:
+            rec = self.order_manager.reconcile_with_exchange()
+            self._last_reconcile_at = now
+            if rec.get("actions") or rec.get("issues"):
+                logger.warning(f"Reconciliación periódica: {rec}")
+                msg = self._format_reconcile_msg(rec, where="periódica")
+                if msg:
+                    self.telegram.notify_warning(msg)
+        except Exception as e:
+            logger.error(f"Reconciliación periódica falló: {e}")
 
     def _is_schedule_paused(self) -> bool:
         """

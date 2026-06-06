@@ -83,6 +83,13 @@ class ExchangeClient:
             exchange.set_sandbox_mode(True)
             logger.info("🔧 Modo TESTNET activado — dinero ficticio (órdenes)")
 
+        # Pre-cargar markets para que amount_to_precision/price_to_precision
+        # funcionen siempre, incluso antes de validate_connection.
+        try:
+            exchange.load_markets()
+        except Exception as e:
+            logger.warning(f"No pude pre-cargar markets ({e}); se cargarán on-demand")
+
         return exchange
 
     @retry(max_attempts=3, base_delay=1.0)
@@ -192,6 +199,54 @@ class ExchangeClient:
         ticker = self.data_exchange.fetch_ticker(symbol)
         return float(ticker["last"])
 
+    def validate_order_filters(
+        self,
+        amount_btc: float,
+        amount_usdt: float,
+        symbol: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        """
+        Valida que la orden cumpla los filtros del exchange ANTES de enviarla.
+        - LOT_SIZE (min, step) → cantidad en BTC
+        - MIN_NOTIONAL → monto en USDT
+        - MARKET_LOT_SIZE → cantidad para órdenes a mercado (si distinto a LOT_SIZE)
+
+        Devuelve (ok, reason). Si ok=False, no mandes la orden.
+        """
+        symbol = symbol or self.settings.symbol
+        try:
+            market = self.exchange.market(symbol)
+        except Exception as e:
+            return False, f"Market {symbol} no disponible: {e}"
+
+        limits = market.get("limits") or {}
+        amt_limits = limits.get("amount") or {}
+        cost_limits = limits.get("cost") or {}
+
+        amt_min = amt_limits.get("min")
+        amt_max = amt_limits.get("max")
+        cost_min = cost_limits.get("min")
+        cost_max = cost_limits.get("max")
+
+        if amt_min is not None and amount_btc < float(amt_min):
+            return False, (
+                f"Cantidad {amount_btc:.8f} BTC < LOT_SIZE.min {amt_min}"
+            )
+        if amt_max is not None and amount_btc > float(amt_max):
+            return False, (
+                f"Cantidad {amount_btc:.8f} BTC > LOT_SIZE.max {amt_max}"
+            )
+        if cost_min is not None and amount_usdt < float(cost_min):
+            return False, (
+                f"Notional ${amount_usdt:.2f} < MIN_NOTIONAL ${float(cost_min):.2f}"
+            )
+        if cost_max is not None and amount_usdt > float(cost_max):
+            return False, (
+                f"Notional ${amount_usdt:.2f} > NOTIONAL.max ${float(cost_max):.2f}"
+            )
+
+        return True, "OK"
+
     @retry(max_attempts=3, base_delay=1.0)
     def place_market_order(
         self,
@@ -213,10 +268,19 @@ class ExchangeClient:
             amount_btc = amount_usdt / price
             # Ajustar a la precisión del par
             amount_btc = self.exchange.amount_to_precision(symbol, amount_btc)
+            check_notional = amount_usdt
         else:
             # Para vender, amount_usdt representa la cantidad de BTC a vender
             amount_btc = amount_usdt
             amount_btc = self.exchange.amount_to_precision(symbol, amount_btc)
+            check_notional = float(amount_btc) * price
+
+        # Pre-flight: validar filtros antes de mandar (evita errores genéricos)
+        ok, reason = self.validate_order_filters(
+            float(amount_btc), float(check_notional), symbol=symbol,
+        )
+        if not ok:
+            raise ValueError(f"Orden rechazada por filtros: {reason}")
 
         params = {"newClientOrderId": client_order_id}
 
@@ -242,3 +306,75 @@ class ExchangeClient:
     def cancel_order(self, order_id: str) -> dict:
         """Cancela una orden por ID."""
         return self.exchange.cancel_order(order_id, self.settings.symbol)
+
+    @retry(max_attempts=3, base_delay=1.0)
+    def get_order(self, order_id: str) -> dict:
+        """Consulta el estado de una orden por ID."""
+        return self.exchange.fetch_order(order_id, self.settings.symbol)
+
+    @retry(max_attempts=3, base_delay=1.0)
+    def place_stop_loss_market(
+        self,
+        side: str,
+        amount_btc: float,
+        stop_price: float,
+        client_order_id: str,
+    ) -> dict:
+        """
+        STOP_LOSS_MARKET: cuando el precio toca stop_price, se ejecuta a mercado.
+        Para cerrar un LONG: side='sell' (vendemos cuando baja a SL).
+        Para cerrar un SHORT (en Futures): side='buy'.
+        Esta orden vive en el exchange aunque el bot esté caído — protección real.
+        """
+        symbol = self.settings.symbol
+        amount_btc = self.exchange.amount_to_precision(symbol, amount_btc)
+        stop_price = self.exchange.price_to_precision(symbol, stop_price)
+        params = {
+            "stopPrice": float(stop_price),
+            "newClientOrderId": client_order_id,
+        }
+        order = self.exchange.create_order(
+            symbol=symbol,
+            type="STOP_LOSS",   # ccxt mapea a STOP_LOSS (market) en Binance Spot
+            side=side,
+            amount=float(amount_btc),
+            params=params,
+        )
+        logger.info(
+            f"🛑 SL colocado en exchange | trigger ${float(stop_price):,.2f} | "
+            f"{side.upper()} {amount_btc} BTC | ID: {client_order_id}"
+        )
+        return order
+
+    @retry(max_attempts=3, base_delay=1.0)
+    def place_take_profit_limit(
+        self,
+        side: str,
+        amount_btc: float,
+        limit_price: float,
+        client_order_id: str,
+    ) -> dict:
+        """
+        TAKE_PROFIT_LIMIT: limit order que se ejecuta al alcanzar el precio objetivo.
+        Para cerrar un LONG: side='sell' (vendemos al precio target).
+        """
+        symbol = self.settings.symbol
+        amount_btc = self.exchange.amount_to_precision(symbol, amount_btc)
+        limit_price = self.exchange.price_to_precision(symbol, limit_price)
+        params = {
+            "timeInForce": "GTC",
+            "newClientOrderId": client_order_id,
+        }
+        order = self.exchange.create_order(
+            symbol=symbol,
+            type="LIMIT",
+            side=side,
+            amount=float(amount_btc),
+            price=float(limit_price),
+            params=params,
+        )
+        logger.info(
+            f"🎯 TP colocado en exchange | limit ${float(limit_price):,.2f} | "
+            f"{side.upper()} {amount_btc} BTC | ID: {client_order_id}"
+        )
+        return order

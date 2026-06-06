@@ -1,0 +1,54 @@
+services:
+  bot:
+    build: .
+    image: agent-trading:latest
+    container_name: agent-trading
+
+    # Re-arranca solo si crashea o si el VPS reboota — clave para 24/7
+    restart: unless-stopped
+
+    # Las credenciales y config vienen del .env (no se hardcodean en la imagen)
+    env_file:
+      - .env
+
+    # Variables requeridas del .env (documentadas acá para que sepas qué pedir):
+    #
+    #   BINANCE_API_KEY        — Futures USDT-M (NO Spot keys)
+    #   BINANCE_API_SECRET     — idem
+    #   BINANCE_TESTNET        — "false" en producción
+    #   TELEGRAM_BOT_TOKEN     — del @BotFather
+    #   TELEGRAM_CHAT_ID       — tu chat_id (@userinfobot)
+    #   ANTHROPIC_API_KEY      — solo si ENGINE=claude
+    #   ENGINE                 — "scalping" | "price_action" | "claude"
+    #   INITIAL_CAPITAL        — capital nominal (ej. 210)
+    #   MAX_RISK_PER_TRADE     — ej. 0.08 (8%)
+    #   DAILY_DRAWDOWN_LIMIT   — ej. 0.05 (5%)
+    #   MAX_CONCURRENT_TRADES  — ej. 2
+    #   ACTIVE_HOURS_UTC       — vacío = 24/7
+    #
+    # Si querés inyectar overrides desde el host (sin tocar el .env):
+    environment:
+      PYTHONUNBUFFERED: "1"        # logs en tiempo real (sin buffer)
+      PYTHONIOENCODING: "utf-8"    # emojis en stdout
+      TZ: "UTC"                    # timestamps consistentes
+
+    # Estado runtime persistente — sobrevive a `compose down`, rebuilds y reboots
+    volumes:
+      - ./data:/app/data           # state.json, trade_journal.jsonl, audit
+      - ./logs:/app/logs           # bot.log con rotación
+
+    # Recursos limitados para que el bot no se coma el VPS si hay leak
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "0.50"
+        reservations:
+          memory: 128M
+
+    # Política de logs: 5 archivos de 20 MB = 100 MB max en /var/lib/docker
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
