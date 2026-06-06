@@ -66,6 +66,22 @@ reserva del 30%. El daily-drawdown se mide sobre el equity, no sobre el cash.
 Control por Telegram: `/status` agrega el portafolio, `/positions [símbolo]`
 lista posiciones, `/close [símbolo]` cierra una o todas (bare = todas).
 
+## Resiliencia: reconciliación + manejo de errores (roadmap #4 y #6)
+
+- **Retry selectivo por tipo de error** (`exchange.py`): el decorator `retry`
+  discrimina excepciones de ccxt. `InsufficientFunds`/`InvalidOrder`/`OrderNotFound`/
+  auth → NO reintenta (re-lanza para que el caller decida). `RateLimitExceeded`/
+  `DDoSProtection` → backoff más largo. `NetworkError`/timeout → backoff normal.
+  Cualquier otro `ExchangeError` → no reintenta (fail-safe).
+- **Reconciliación con el exchange** (`order_manager.reconcile`): compara el estado
+  local contra las posiciones reales. **RESUME** si coinciden, **DRIFT** si el
+  exchange está plano (la posición se cerró por afuera → la suelta), **MISMATCH**
+  si las direcciones difieren (confía en el exchange), **ORPHAN** si el exchange
+  tiene una posición que el bot no trackea (avisa, NO la adopta). Se corre al
+  **startup en modo fail-closed** (si no puede leer el estado, NO arranca) y cada
+  `RECONCILE_INTERVAL_SECONDS` en runtime (sin fail-closed). Default OFF
+  (`RECONCILE_ENABLED`); se enciende al ir a live. Patrón inspirado en GRVTBot.
+
 ## Filosofía de la estrategia
 
 Trend-following clásico con **3 capas de filtrado** para reducir falsos positivos:

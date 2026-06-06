@@ -54,6 +54,9 @@ class MainStrategy:
         self._last_panorama_at: float = 0.0
         self._panorama_interval_seconds: int = 30 * 60
 
+        # Reconciliación con el exchange (roadmap #4): timer del chequeo periódico.
+        self._last_reconcile_at: float = 0.0
+
         # Schedule: tracking del último estado para detectar transiciones.
         # Si el controller no tiene schedule seteado, fallback al settings.
         if self.controller is not None and not self.controller.get_active_hours():
@@ -123,6 +126,10 @@ class MainStrategy:
                     self._last_panorama_at = now_ts
                 except Exception as e:
                     logger.warning(f"No pude mandar panorama: {e}")
+
+            # Reconciliación periódica (cada N seg). En runtime NO es fail-closed:
+            # si falla, logueamos crítico y seguimos (no matamos un bot vivo).
+            self._maybe_reconcile()
 
             stats = self.order_manager.get_stats()
             cycle_result["action"] = "OPERANDO" if actions else "ESPERAR"
@@ -274,6 +281,23 @@ class MainStrategy:
         logger.info(f"🚀 Bot arrancado | {mode}")
         self.telegram.notify_bot_started(mode)
 
+        # Reconciliación de STARTUP (fail-closed): si está activada y no podemos
+        # verificar el estado contra el exchange, NO arrancamos (evita operar con
+        # un estado local que no coincide con la realidad).
+        if self.settings.reconcile_enabled:
+            try:
+                self.reconcile(source="startup")
+            except Exception as e:
+                logger.critical(
+                    f"🚨 Reconciliación de startup falló: {e}. "
+                    f"Abortando arranque (fail-closed)."
+                )
+                self.telegram.notify_critical(
+                    f"No pude verificar el estado contra el exchange al arrancar.\n"
+                    f"No arranco para no operar a ciegas.\n{str(e)[:200]}"
+                )
+                raise
+
         try:
             while True:
                 start = time.time()
@@ -295,6 +319,47 @@ class MainStrategy:
             logger.critical(f"Error fatal en loop: {e}", exc_info=True)
             self.telegram.notify_critical(f"Error fatal — bot detenido:\n{str(e)[:300]}")
             raise
+
+    def reconcile(self, source: str = "startup") -> dict:
+        """
+        Trae las posiciones reales del exchange y reconcilia contra el estado
+        local. Propaga la excepción si no puede leer el snapshot (para que el
+        startup falle-closed). Avisa por Telegram si encuentra discrepancias.
+        """
+        if not self.settings.reconcile_enabled:
+            return {"skipped": True}
+        positions = self.exchange.fetch_position_sizes(self.settings.symbols)
+        report = self.order_manager.reconcile(positions, source=source)
+        if not report.get("ok", True):
+            problemas = []
+            if report.get("drifts"):
+                problemas.append(f"cerradas por afuera: {', '.join(report['drifts'])}")
+            if report.get("mismatches"):
+                problemas.append(f"dirección opuesta: {', '.join(report['mismatches'])}")
+            if report.get("orphans"):
+                problemas.append(f"huérfanas en exchange: {', '.join(report['orphans'])}")
+            try:
+                self.telegram.notify_warning(
+                    f"🔧 Reconciliación [{source}] encontró diferencias con el exchange:\n"
+                    + "\n".join(f"• {p}" for p in problemas)
+                )
+            except Exception as e:
+                logger.warning(f"No pude notificar reconciliación: {e}")
+        return report
+
+    def _maybe_reconcile(self) -> None:
+        """Reconciliación periódica con throttle. No fail-closed (no aborta el loop)."""
+        if not self.settings.reconcile_enabled:
+            return
+        now = time.time()
+        if (now - self._last_reconcile_at) < self.settings.reconcile_interval_seconds:
+            return
+        try:
+            self.reconcile(source="periódico")
+        except Exception as e:
+            logger.critical(f"🚨 Reconciliación periódica falló: {e}")
+        finally:
+            self._last_reconcile_at = now
 
     def _is_schedule_paused(self) -> bool:
         """

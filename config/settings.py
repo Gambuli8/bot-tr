@@ -34,6 +34,11 @@ class Settings(BaseModel):
     # Candado de exposición global: máximo de posiciones abiertas en simultáneo
     # en todo el portafolio. Protege el capital compartido (210 USDT).
     max_concurrent_trades: int = 2
+    # Reconciliación con el exchange (roadmap #4): al startup + cada N seg compara
+    # el estado local contra las posiciones reales. Default OFF (en paper no aplica;
+    # encender al ir a live con órdenes reales / Futures).
+    reconcile_enabled: bool = False
+    reconcile_interval_seconds: int = 300
     timeframe: str = "15m"
     initial_capital: float = 1000.0
     max_risk_per_trade: float = 0.015
@@ -155,6 +160,8 @@ def load_settings() -> Settings:
         symbol=primary_symbol,
         symbols=_parse_symbols(os.getenv("SYMBOLS", ""), primary_symbol),
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "2")),
+        reconcile_enabled=os.getenv("RECONCILE_ENABLED", "false").lower() == "true",
+        reconcile_interval_seconds=int(os.getenv("RECONCILE_INTERVAL_SECONDS", "300")),
         timeframe=os.getenv("TRADING_TIMEFRAME", "15m"),
         initial_capital=float(os.getenv("INITIAL_CAPITAL", "1000")),
         max_risk_per_trade=float(os.getenv("MAX_RISK_PER_TRADE", "0.015")),

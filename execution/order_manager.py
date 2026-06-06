@@ -564,6 +564,116 @@ class OrderManager:
         return trade_record
 
     # ─────────────────────────────────────────
+    #  RECONCILIACIÓN CON EL EXCHANGE (roadmap #4)
+    # ─────────────────────────────────────────
+
+    def reconcile(
+        self, exchange_positions: dict, *, source: str = "startup",
+        auto_heal: bool = True,
+    ) -> dict:
+        """
+        Compara el estado local (open_positions) contra las posiciones REALES del
+        exchange y resuelve las discrepancias (patrón RESUME / FRESH / orphan,
+        inspirado en GRVTBot). `exchange_positions` = {symbol: signed_size}
+        (positivo = LONG, negativo = SHORT; ausente/0 = plano en el exchange).
+
+        Casos:
+          - RESUME   : local abierto y el exchange coincide en signo → OK, seguimos.
+          - DRIFT    : local abierto pero el exchange está plano → la posición se
+                       cerró por afuera (SL/TP/liquidación/cierre manual mientras el
+                       bot estaba caído). auto_heal → la sacamos del estado local.
+          - MISMATCH : local y exchange en direcciones opuestas → grave. auto_heal
+                       → confiamos en el exchange y soltamos la local.
+          - ORPHAN   : el exchange tiene posición que el bot NO trackea → NUNCA la
+                       adoptamos automáticamente (no sabemos su SL/TP). Avisamos.
+
+        Devuelve un reporte. NO hace de fail-closed por sí mismo: el caller decide
+        (en el startup, si el fetch del snapshot falla, debe abortar el arranque).
+        """
+        report = {"source": source, "resumed": [], "drifts": [],
+                  "mismatches": [], "orphans": [], "ok": True}
+
+        # 1) Revisar cada posición local contra el exchange.
+        for symbol in self.open_symbols():
+            pos = self.state.open_positions[symbol]
+            direction = pos.get("direction", "LONG")
+            ex_size = exchange_positions.get(symbol, 0.0)
+            ex_dir = "LONG" if ex_size > 0 else ("SHORT" if ex_size < 0 else "FLAT")
+
+            if ex_dir == "FLAT":
+                report["drifts"].append(symbol)
+                report["ok"] = False
+                logger.warning(
+                    f"🔧 RECONCILE [{source}] DRIFT: local cree {direction} en "
+                    f"{symbol} pero el exchange está PLANO. "
+                    f"{'Soltando posición local.' if auto_heal else 'Sin auto-heal.'}"
+                )
+                if auto_heal:
+                    self._reconcile_drop(symbol, f"reconciliación [{source}]: ausente en exchange")
+            elif ex_dir != direction:
+                report["mismatches"].append(symbol)
+                report["ok"] = False
+                logger.critical(
+                    f"🚨 RECONCILE [{source}] MISMATCH: local {direction} pero "
+                    f"exchange {ex_dir} en {symbol}. "
+                    f"{'Soltando local, confiar en exchange.' if auto_heal else 'Sin auto-heal.'}"
+                )
+                if auto_heal:
+                    self._reconcile_drop(symbol, f"reconciliación [{source}]: dirección opuesta en exchange")
+            else:
+                report["resumed"].append(symbol)
+                logger.info(f"✅ RECONCILE [{source}] RESUME: {symbol} {direction} coincide con el exchange.")
+
+        # 2) Posiciones en el exchange que el bot no trackea → orphans.
+        for symbol, size in exchange_positions.items():
+            if size == 0:
+                continue
+            if not self.has_position(symbol):
+                report["orphans"].append(symbol)
+                report["ok"] = False
+                logger.critical(
+                    f"🚨 RECONCILE [{source}] ORPHAN: el exchange tiene "
+                    f"{'LONG' if size > 0 else 'SHORT'} {abs(size)} en {symbol} que "
+                    f"el bot NO trackea. NO la administro automáticamente — revisá manualmente."
+                )
+
+        if report["ok"]:
+            logger.info(f"✅ RECONCILE [{source}]: estado local y exchange consistentes.")
+        return report
+
+    def _reconcile_drop(self, symbol: str, reason: str) -> None:
+        """
+        Saca una posición fantasma del estado local (dejó de existir en el
+        exchange). Devuelve el notional al pool y registra en el journal con
+        PnL marcado como desconocido (necesita revisión manual del operador).
+        """
+        pos = self.state.open_positions.pop(symbol, None)
+        if pos is None:
+            return
+        # Best-effort: devolvemos el notional comprometido al pool. El PnL real
+        # no se puede reconstruir sin los fills; queda flagueado para revisión.
+        self.state.capital += float(pos.get("amount_usdt", 0.0))
+        record = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "symbol": symbol,
+            "direction": pos.get("direction", "LONG"),
+            "entry_price": pos.get("entry_price"),
+            "exit_price": pos.get("entry_price"),
+            "pnl": 0.0,
+            "pnl_pct": 0.0,
+            "exit_reason": reason,
+            "reconciled": True,
+            "pnl_unknown": True,
+            "entry_reason": pos.get("entry_reason", ""),
+        }
+        self._write_journal(record)
+        self._save_state()
+        logger.warning(
+            f"🔧 {symbol}: posición local soltada por reconciliación. "
+            f"PnL real desconocido (revisar journal) | {reason}"
+        )
+
+    # ─────────────────────────────────────────
     #  HELPERS
     # ─────────────────────────────────────────
 

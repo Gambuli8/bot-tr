@@ -14,8 +14,30 @@ from logs.logger import logger
 from config.settings import Settings
 
 
-def retry(max_attempts: int = 3, base_delay: float = 1.0):
-    """Decorator con backoff exponencial para llamadas al exchange."""
+# Clasificación de errores de ccxt para el retry (roadmap #6).
+#   - NO reintentables: el reintento no va a cambiar el resultado; re-lanzamos
+#     para que el caller decida (ej. InsufficientFunds → achicar/saltar trade;
+#     OrderNotFound → tratar como ya cerrada; InvalidOrder → bug de filtros).
+#   - Rate-limit: reintentar con backoff MÁS largo (el exchange nos está frenando).
+#   - Reintentables: problemas de red transitorios → backoff normal.
+NON_RETRYABLE_ERRORS = (
+    ccxt.InsufficientFunds,   # plata insuficiente
+    ccxt.InvalidOrder,        # incluye OrderNotFound, BadSymbol vía mensaje
+    ccxt.AuthenticationError, # incluye PermissionDenied — credenciales
+    ccxt.BadRequest,          # request mal formado (filtros, params)
+)
+RATE_LIMIT_ERRORS = (ccxt.DDoSProtection, ccxt.RateLimitExceeded)
+RETRYABLE_ERRORS = (ccxt.NetworkError, ccxt.RequestTimeout, ccxt.ExchangeNotAvailable)
+
+
+def retry(max_attempts: int = 3, base_delay: float = 1.0, rate_limit_multiplier: float = 3.0):
+    """
+    Decorator con backoff exponencial y manejo de errores POR TIPO (ccxt):
+      - InsufficientFunds / InvalidOrder / OrderNotFound / Auth → NO reintenta.
+      - RateLimitExceeded / DDoSProtection → reintenta con backoff más largo.
+      - NetworkError / RequestTimeout / ExchangeNotAvailable → reintenta normal.
+      - Cualquier otro ExchangeError → NO reintenta (más seguro ante lo desconocido).
+    """
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -23,17 +45,35 @@ def retry(max_attempts: int = 3, base_delay: float = 1.0):
             for attempt in range(1, max_attempts + 1):
                 try:
                     return func(*args, **kwargs)
-                except (ccxt.NetworkError, ccxt.RequestTimeout) as e:
+                except NON_RETRYABLE_ERRORS as e:
+                    logger.error(
+                        f"[{func.__name__}] Error NO reintentable "
+                        f"({type(e).__name__}): {e}"
+                    )
+                    raise
+                except RATE_LIMIT_ERRORS as e:
+                    last_error = e
+                    delay = base_delay * (2 ** (attempt - 1)) * rate_limit_multiplier
+                    logger.warning(
+                        f"[{func.__name__}] Rate limit ({type(e).__name__}) "
+                        f"intento {attempt}/{max_attempts}. Esperando {delay:.1f}s..."
+                    )
+                    time.sleep(delay)
+                except RETRYABLE_ERRORS as e:
                     last_error = e
                     delay = base_delay * (2 ** (attempt - 1))
                     logger.warning(
-                        f"[{func.__name__}] Intento {attempt}/{max_attempts} falló: {e}. "
+                        f"[{func.__name__}] Red ({type(e).__name__}) "
+                        f"intento {attempt}/{max_attempts}: {e}. "
                         f"Reintentando en {delay:.1f}s..."
                     )
                     time.sleep(delay)
                 except ccxt.ExchangeError as e:
-                    # Errores del exchange no se reintentan
-                    logger.error(f"[{func.__name__}] Error del exchange (no reintentable): {e}")
+                    # Errores del exchange desconocidos: no reintentar (fail-safe).
+                    logger.error(
+                        f"[{func.__name__}] Error del exchange no reintentable "
+                        f"({type(e).__name__}): {e}"
+                    )
                     raise
             logger.error(f"[{func.__name__}] Todos los reintentos fallaron: {last_error}")
             raise last_error
@@ -261,6 +301,40 @@ class ExchangeClient:
         symbol = symbol or self.settings.symbol
         ticker = self.data_exchange.fetch_ticker(symbol)
         return float(ticker["last"])
+
+    @retry(max_attempts=3, base_delay=1.0)
+    def fetch_position_sizes(self, symbols: Optional[list] = None) -> dict:
+        """
+        Lee del exchange el tamaño REAL de posición por símbolo, para reconciliar
+        contra el estado local. Devuelve {symbol: signed_size} (positivo = LONG,
+        negativo = SHORT). Símbolos sin posición no aparecen (o aparecen en 0).
+
+        Futures USDT-M: usa fetch_positions(). Spot no tiene "posiciones" como tal
+        (la tenencia es el balance del activo base) → en spot devuelve {} y la
+        reconciliación de posiciones queda inactiva hasta el switch a Futures (#7).
+
+        NO atrapa la excepción: si falla, propaga para que el caller decida
+        (fail-closed en el startup).
+        """
+        symbols = symbols or self.settings.symbols
+        # Spot no soporta fetch_positions de forma fiable.
+        if not self.exchange.has.get("fetchPositions"):
+            logger.info("fetch_position_sizes: exchange spot sin posiciones; reconciliación de posición inactiva")
+            return {}
+        raw = self.exchange.fetch_positions(symbols)
+        out: dict = {}
+        for p in raw or []:
+            sym = p.get("symbol")
+            if not sym:
+                continue
+            contracts = p.get("contracts")
+            size = float(contracts) if contracts is not None else 0.0
+            if size == 0:
+                continue
+            side = (p.get("side") or "").lower()
+            signed = -size if side == "short" else size
+            out[sym] = signed
+        return out
 
     @retry(max_attempts=3, base_delay=1.0)
     def place_market_order(
