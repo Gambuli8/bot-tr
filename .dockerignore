@@ -11,9 +11,14 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Estado runtime (se monta como volumen, no se copia en el build)
+# Estado runtime (se monta como volumen, no se copia en el build).
+# OJO: NO ignoramos logs/ porque ahí vive el código (logs/logger.py).
+# Solo ignoramos los archivos generados dentro de logs/.
 data/
-logs/
+logs/bot.log
+logs/bot.log.*
+logs/run_stdout.log
+logs/__pycache__/
 
 # Secretos (se inyectan vía env_file en compose)
 .env
