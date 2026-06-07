@@ -16,6 +16,10 @@ class TelegramNotifier:
         self.token = settings.telegram_bot_token
         self.chat_id = settings.telegram_chat_id
         self.api_url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        # Símbolo base para los mensajes (ej. "BTC/USDT" → "BTC"). Permite que
+        # cuando hay varios bots multi-asset, cada uno reporte con su propio
+        # ticker en vez del "BTC" hardcoded.
+        self.base_asset = (settings.symbol.split("/")[0] if settings.symbol else "BTC")
         logger.info("TelegramNotifier inicializado")
 
     def _send(self, text: str) -> None:
@@ -63,7 +67,7 @@ class TelegramNotifier:
 
         text = (
             f"{titulo}\n\n"
-            f"💵 BTC: <b>${snapshot.price:,.2f}</b>  "
+            f"💵 {self.base_asset}: <b>${snapshot.price:,.2f}</b>  "
             f"(1h: {snapshot.price_change_1h:+.2f}% | 24h: {snapshot.price_change_24h:+.2f}%)\n"
             f"{trend_emoji}  •  confianza {decision.confianza:.0%}\n\n"
             f"{extra}\n\n"
@@ -108,7 +112,7 @@ class TelegramNotifier:
 
         text = (
             f"{emoji} <b>Abrí una operación</b> apostando {apuesta}\n\n"
-            f"💵 Le metí <b>${invertido:,.2f}</b> ({amount_btc:.6f} BTC)\n"
+            f"💵 Le metí <b>${invertido:,.2f}</b> ({amount_btc:.6f} {self.base_asset})\n"
             f"📍 Precio de entrada: <b>${price:,.2f}</b>\n\n"
             f"🎯 Si {ganamos_dir} a <b>${ganamos_si:,.2f}</b> → <b>ganamos +${ganancia:,.2f}</b> ({ganancia_pct:+.2f}%)\n"
             f"🛑 Si {perdemos_dir} a <b>${perdemos_si:,.2f}</b> → cerramos con <b>-${perdida:,.2f}</b> ({-perdida_pct:.2f}%)\n\n"
@@ -185,7 +189,7 @@ class TelegramNotifier:
     def notify_bot_started(self, mode="PAPER TRADING"):
         text = (
             f"🤖 <b>¡Arranqué!</b>\n\n"
-            f"Voy a operar BTC en modo: <b>{mode}</b>\n"
+            f"Voy a operar <b>{self.base_asset}</b> en modo: <b>{mode}</b>\n"
             f"<i>Te aviso cuando vea oportunidad o abra/cierre algo.</i>\n\n"
             f"⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
         )
@@ -249,7 +253,7 @@ class TelegramNotifier:
             snapshot.trend, snapshot.trend
         )
         mercado = (
-            f"BTC <b>${snapshot.price:,.2f}</b> "
+            f"{self.base_asset} <b>${snapshot.price:,.2f}</b> "
             f"({snapshot.price_change_1h:+.2f}% 1h)\n"
             f"Tendencia: {trend_emoji}  •  ADX {snapshot.adx:.0f}"
         )
