@@ -165,3 +165,47 @@ chmod 600 .env
 - Considerá usar [Watchtower](https://containrrr.dev/watchtower/) para auto-update de la imagen.
 - Logs centralizados con Loki/Promtail si tenés más de un bot.
 - Alertas dual-channel: Telegram + email (vía `notify_critical` también podría tirar a un webhook).
+
+---
+
+## Monitoreo 24/7: heartbeat + dead-man's switch (roadmap #1)
+
+El bot tiene **dos capas** para que NO se quede colgado en silencio:
+
+### 1. Heartbeat local + healthcheck de Docker (incluido, sin config)
+
+`health.beat()` escribe `data/heartbeat` (epoch) al final de **cada ciclo** del
+loop. El `HEALTHCHECK` del `Dockerfile` lo lee: si quedó viejo (>5 min, el loop
+se colgó), Docker marca el container **`unhealthy`**.
+
+```bash
+docker compose ps            # mirá la columna STATUS: "healthy" / "unhealthy"
+cat data/heartbeat           # epoch del último ciclo
+docker inspect --format '{{.State.Health.Status}}' agent-trading
+```
+
+El sidecar **`autoheal`** (en el `docker-compose.yml`) vigila ese estado y
+**reinicia el bot automáticamente** si queda `unhealthy` — porque
+`restart: unless-stopped` NO reinicia por unhealthy, sólo por exit.
+
+> Seguridad: `autoheal` monta el `docker.sock` (read-only). Es lo estándar para
+> auto-restart, pero si preferís no exponerlo, sacá ese service: el dead-man's
+> switch externo igual te avisa y reiniciás a mano con `docker compose restart bot`.
+
+### 2. Dead-man's switch externo (recomendado — detecta muerte del VPS)
+
+El healthcheck interno no sirve si **se cae el VPS entero o Docker**. Para eso,
+un servicio externo que te avise cuando el bot deja de dar señales:
+
+1. Creá una check gratis en [healthchecks.io](https://healthchecks.io) (período
+   ej. 5 min, grace 5 min). Te da una URL de ping.
+2. Pegala en el `.env`:
+   ```bash
+   HEALTHCHECK_URL=https://hc-ping.com/tu-uuid-aca
+   ```
+3. `docker compose up -d`. El bot pinguea esa URL en cada ciclo (`/start` al
+   arrancar, ping en cada ciclo OK, `/fail` si crashea).
+
+Si los pings dejan de llegar (VPS apagado, red caída, Docker muerto, loop
+colgado), healthchecks.io te manda alerta a Telegram/email. Es la única forma de
+enterarte **desde afuera** de que el bot murió.

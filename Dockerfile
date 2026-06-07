@@ -27,9 +27,12 @@ COPY . .
 # Carpeta runtime persistente (state, journal, audit, bot.log)
 RUN mkdir -p /app/data
 
-# Healthcheck: el bot está vivo si el log se actualizó en los últimos 3 min.
-HEALTHCHECK --interval=2m --timeout=10s --start-period=60s --retries=2 \
-    CMD test $(($(date +%s) - $(stat -c %Y /app/data/bot.log 2>/dev/null || echo 0))) -lt 180 || exit 1
+# Healthcheck: el bot está vivo si el heartbeat (data/heartbeat) se actualizó en
+# los últimos 5 min. health.beat() lo reescribe al final de cada ciclo del loop;
+# si el loop se cuelga, el archivo queda viejo y el container pasa a "unhealthy".
+# (Más explícito que mirar el mtime del log: es una señal de vida dedicada.)
+HEALTHCHECK --interval=60s --timeout=10s --start-period=120s --retries=3 \
+    CMD test $(($(date +%s) - $(cat /app/data/heartbeat 2>/dev/null || echo 0))) -lt 300 || exit 1
 
 # El bot por sí solo no expone puertos (no HTTP, sólo Telegram polling).
 # Si en el futuro agregás un /metrics, exponé acá.

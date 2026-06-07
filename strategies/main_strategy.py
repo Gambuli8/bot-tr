@@ -18,6 +18,7 @@ from core.price_action_engine import PriceActionEngine
 from execution.order_manager import OrderManager
 from notifications.telegram import TelegramNotifier
 import notifier as nf  # Wrapper simple para alertas críticas
+import health          # Heartbeat local + dead-man's switch externo
 
 
 class MainStrategy:
@@ -290,11 +291,19 @@ class MainStrategy:
 
         logger.info(f"🚀 Bot arrancado | {mode}")
         self.telegram.notify_bot_started(mode)
+        # Dead-man's switch: marcamos arranque y dejamos un primer heartbeat.
+        health.beat()
+        health.ping("/start")
 
         try:
             while True:
                 start = time.time()
                 self.run_once()
+                # Heartbeat al final de CADA iteración (incluye sleep profundo y
+                # cierres manuales que retornan temprano de run_once): si el loop
+                # se cuelga, el archivo queda viejo y el healthcheck lo detecta.
+                health.beat()
+                health.ping()
                 elapsed = time.time() - start
                 sleep_time = max(0, interval_seconds - elapsed)
                 logger.debug(f"Próximo ciclo en {sleep_time:.0f}s")
@@ -311,6 +320,8 @@ class MainStrategy:
         except Exception as e:
             logger.critical(f"Error fatal en loop: {e}", exc_info=True)
             self.telegram.notify_critical(f"Error fatal — bot detenido:\n{str(e)[:300]}")
+            # Avisar al dead-man's switch externo del fallo antes de morir.
+            health.ping("/fail")
             raise
 
     def _call_engine(self, df, snapshot, trade_history, mtf):

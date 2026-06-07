@@ -7,6 +7,12 @@ services:
     # Re-arranca solo si crashea o si el VPS reboota — clave para 24/7
     restart: unless-stopped
 
+    # Etiqueta para el sidecar autoheal: reinicia este container si el HEALTHCHECK
+    # lo marca "unhealthy" (loop colgado). restart: unless-stopped NO reinicia por
+    # unhealthy — sólo por exit; autoheal cubre ese hueco.
+    labels:
+      - autoheal=true
+
     # Las credenciales y config vienen del .env (no se hardcodean en la imagen)
     env_file:
       - .env
@@ -53,3 +59,21 @@ services:
       options:
         max-size: "20m"
         max-file: "5"
+
+  # ─────────────────────────────────────────
+  #  Autoheal: reinicia el bot si queda "unhealthy" (loop colgado).
+  #  Monitorea contenedores con label autoheal=true cada AUTOHEAL_INTERVAL seg.
+  #  NOTA DE SEGURIDAD: monta el docker.sock (read-only acá) → acceso al daemon
+  #  Docker. Es estándar para autoheal, pero tenelo en cuenta. Si preferís no
+  #  montar el sock, sacá este service: el dead-man's switch externo igual te
+  #  avisa y reiniciás a mano con `docker compose restart bot`.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: agent-trading-autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: "30"        # chequea cada 30s
+      AUTOHEAL_START_PERIOD: "120"   # gracia tras (re)arranque
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
