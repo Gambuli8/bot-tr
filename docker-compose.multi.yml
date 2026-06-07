@@ -1,0 +1,104 @@
+# docker-compose.multi.yml
+# 4 bots en paralelo, uno por símbolo del portafolio aprobado en Fase 2
+# (BTC, SOL, AVAX, LINK) — todos con PriceActionEngine en 1h.
+#
+# Cada bot usa su propio .env (.env.btc, .env.sol, .env.avax, .env.link),
+# su propio directorio data/<sym>/ y su propio nombre de container, pero
+# comparten la imagen y la API key de Binance.
+#
+# Setup detallado: docs/DEPLOYMENT_MULTI_ASSET.md
+#
+# Comandos:
+#   docker compose -f docker-compose.multi.yml build
+#   docker compose -f docker-compose.multi.yml up -d
+#   docker compose -f docker-compose.multi.yml logs -f bot-btc
+#   docker compose -f docker-compose.multi.yml down
+
+x-bot-defaults: &bot-defaults
+  build: .
+  image: agent-trading:latest
+  restart: unless-stopped
+  labels:
+    - autoheal=true
+  environment:
+    PYTHONUNBUFFERED: "1"
+    PYTHONIOENCODING: "utf-8"
+    TZ: "UTC"
+  deploy:
+    resources:
+      limits:
+        memory: 384M
+        cpus: "0.40"
+      reservations:
+        memory: 96M
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+services:
+  bot-btc:
+    <<: *bot-defaults
+    container_name: agent-trading-btc
+    env_file:
+      - .env.btc
+    volumes:
+      - ./data/btc:/app/data
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+      TZ: "UTC"
+      # Marcadores que el cliente puede usar para diferenciar logs de los 4 bots
+      BOT_SYMBOL_TAG: "BTC"
+
+  bot-sol:
+    <<: *bot-defaults
+    container_name: agent-trading-sol
+    env_file:
+      - .env.sol
+    volumes:
+      - ./data/sol:/app/data
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+      TZ: "UTC"
+      BOT_SYMBOL_TAG: "SOL"
+
+  bot-avax:
+    <<: *bot-defaults
+    container_name: agent-trading-avax
+    env_file:
+      - .env.avax
+    volumes:
+      - ./data/avax:/app/data
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+      TZ: "UTC"
+      BOT_SYMBOL_TAG: "AVAX"
+
+  bot-link:
+    <<: *bot-defaults
+    container_name: agent-trading-link
+    env_file:
+      - .env.link
+    volumes:
+      - ./data/link/:/app/data
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: "utf-8"
+      TZ: "UTC"
+      BOT_SYMBOL_TAG: "LINK"
+
+  # Un solo autoheal para los 4 — vigila el label autoheal=true en todos.
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: agent-trading-autoheal-multi
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: "30"
+      AUTOHEAL_START_PERIOD: "120"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro

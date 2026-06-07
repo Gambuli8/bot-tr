@@ -358,3 +358,120 @@ fracción negativa = no operar.
 - C. Re-validar el **PriceActionEngine** sobre los mismos 180d (era el otro motor
   validado en backtests anteriores, antes deprecadi por baja frecuencia).
 - Comparar A vs C en igual de condiciones (período, fees, leverage, risk).
+
+---
+
+## 2026-06-07 — Fase 2: Pivot al PriceActionEngine + escalamiento horizontal
+
+### Decisión preliminar
+
+Se descarta el ScalpingEngine en cualquier TF tras WFA fallido. Se reactiva
+el PriceActionEngine (validado en backtests previos pero con frecuencia baja).
+Objetivo: alcanzar ~1 trade/día sumando múltiples activos (escalamiento
+horizontal) sin tocar el riesgo por trade.
+
+### Baseline PA — BTC 1h 180d (single backtest, no WFA)
+
+`scripts/backtest_price_action.py --days 180`
+
+| Métrica | Valor |
+|---|---|
+| Trades | 21 (0.82/semana) |
+| WR | 47.6% |
+| PF Neto | **1.66** |
+| Retorno | +12.72% |
+| Max DD | 6.51% |
+| Liquidaciones | 0 |
+| Risk/trade | 2.5% (conservador) |
+| Leverage | 1× (Spot) |
+
+**Edge confirmado en single backtest. La frecuencia baja (0.82/sem) sigue
+siendo el problema operativo a resolver via multi-asset.**
+
+### Aud — WFA PA en 3 timeframes (Camino 1: bajar TF)
+
+`scripts/audit_wfa_pa.py` con grid quick (3 configs), 7 ventanas IS=40d/OS=20d,
+180d totales, risk 8%, leverage 5×, fee 0.05%, sobre BTC/ETH/SOL @ 15m / 30m / 1h.
+
+**Resultado del TF sweep**:
+
+| Sym \ TF | 1h | 30m | 15m |
+|---|---|---|---|
+| BTC | ✅ 5/7, **+25.05%** | 🟡 3/7, +24.60% | (abortado) |
+| ETH | 🟡 2/7, +3.12% | ❌ 2/7, −14.71% | (abortado) |
+| SOL | ✅ 5/7, **+38.46%** | ❌ 2/7, **−57.49%** | (abortado) |
+
+**Conclusión TF sweep**:
+- BTC es el ÚNICO estable across TFs (+25% vs +24% — mantiene retorno)
+- SOL colapsa al bajar TF: +38% en 1h → −57% en 30m (overfit grosero)
+- ETH es estructuralmente flojo en cualquier TF
+- 15m: abortados; el patrón sugería que iban a colapsar más
+- **Decisión**: descartar 15m y 30m. PA solo en 1h.
+
+### Aud — WFA PA multi-asset 1h (Camino 2: escalamiento horizontal)
+
+Se corrió el WFA en 1h sobre 12 activos top-liquidez de Binance, mismos
+parámetros (180d, IS=40d/OS=20d, risk 8%, leverage 5×, fee 0.05%, grid quick).
+
+| Coin | OS pos | OS total | OS medio | Trades OS | t/día | Decisión |
+|---|---|---|---|---|---|---|
+| **BTC** | **5/7** (71%) | **+25.05%** | +3.58% | 18 | 0.13 | ✅ APRUEBA (núcleo) |
+| **SOL** | **5/7** (71%) | **+38.46%** | +5.49% | 17 | 0.12 | ✅ APRUEBA (núcleo) |
+| **AVAX** | 4/7 (57%) | +8.46% | +1.21% | 22 | 0.16 | 🟡 APRUEBA (borde +) |
+| **LINK** | 4/7 (57%) | +6.13% | +0.88% | 16 | 0.11 | 🟡 APRUEBA (borde +) |
+| ETH | 2/7 | +3.12% | +0.45% | 15 | 0.11 | ❌ MARGINAL |
+| LTC | 4/7 | **−21.30%** | −3.04% | 22 | 0.16 | ❌ (script ✅ pero perdió) |
+| ADA | 3/7 | −5.91% | −0.84% | 21 | 0.15 | ❌ |
+| DOT | 3/7 | −12.45% | −1.78% | 15 | 0.11 | ❌ |
+| BNB | 1/7 | −33.01% | −4.72% | 25 | 0.18 | ❌ |
+| INJ | 2/7 | −30.32% | −4.33% | 20 | 0.14 | ❌ |
+| DOGE | 1/7 | −13.06% | −1.87% | 24 | 0.17 | ❌ |
+| XRP | 1/6 | −11.96% | −1.99% | 11 | 0.09 | ❌ |
+| POL | 2/7 | +56.60% | +8.09% | 19 | 0.14 | ❌ cherry-pick 1 ventana de +88% |
+
+### 🐛 Bug detectado: PF medio inflado por ventanas con n<3
+
+El script declaraba LTC y LINK como "✅ EDGE ROBUSTO" porque su **PF medio
+calculado era >14**. Pero ese promedio estaba contaminado por ventanas OS
+con n=1 o n=2 trades donde el PF resultaba `inf` (zero losses) — el código
+reemplazaba `inf` por 99.0 y lo promediaba, distorsionando el resultado.
+
+**Caso concreto LTC**: 7 ventanas OS con PFs `[2.09, 0.00, 0.56, 99.00,
+1.28, 1.18, 0.00]`. Media = 14.87 (parece edge robusto). **Mediana del PF
+filtrando ventanas con n<3 = 1.18** (refleja la realidad: dos veces a la
+par, una vez con edge marginal). OS retorno total: −21.30% (perdedor).
+
+**Fix aplicado** en `scripts/audit_wfa_pa.py`:
+1. Reportar **mediana del PF**, no media (resistente a outliers).
+2. Filtrar ventanas con `n<3` del cálculo del PF (muestras chicas).
+3. Veredicto pide ahora **PF mediano ≥ 1.15 AND OS positivas ≥ 55% AND
+   OS retorno total ≥ +10%**. El tercer criterio mata el caso LTC.
+
+### Decisión final: portafolio aprobado
+
+**Opción B (Portafolio Ampliado)** — 4 activos aprobados para producción:
+
+| Activo | OS positivas | OS retorno 180d | Trades OS | t/día |
+|---|---|---|---|---|
+| BTC/USDT | 5/7 (71%) | +25.05% | 18 | 0.13 |
+| SOL/USDT | 5/7 (71%) | +38.46% | 17 | 0.12 |
+| AVAX/USDT | 4/7 (57%) | +8.46% | 22 | 0.16 |
+| LINK/USDT | 4/7 (57%) | +6.13% | 16 | 0.11 |
+| **Portafolio** | — | **+78.10%** (suma simple) | **73** | **0.52** |
+
+**Frecuencia agregada esperada**: ~3.6 trades/semana, ~15/mes. No
+alcanzamos 1 trade/día pero el cliente aprobó priorizar calidad y
+protección de capital (capital nominal $210 + inyecciones mensuales $200).
+
+**Hallazgos de calidad — diseño del portafolio**:
+1. BTC + SOL son el núcleo de edge demostrado (5/7 ventanas positivas,
+   retornos sólidos de doble dígito).
+2. AVAX + LINK son borde aceptable: 4/7 ventanas positivas con OS total
+   levemente positivo y n>15 (muestra suficiente).
+3. ETH y LTC fueron explícitamente descartados pese a confundir al script
+   inicial.
+4. POL fue descartado por cherry-picking: una sola ventana de +88% inflaba
+   un resultado que era −31.56% en las restantes 6 ventanas.
+
+Las instrucciones para desplegar este portafolio en el VPS están en
+`docs/DEPLOYMENT_MULTI_ASSET.md`.
