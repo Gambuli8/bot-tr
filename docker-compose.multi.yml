@@ -27,10 +27,14 @@ x-bot-defaults: &bot-defaults
   deploy:
     resources:
       limits:
-        memory: 384M
+        # 390 MB era lo que pedía el proceso al arrancar (pandas + ccxt + ta +
+        # cache OHLCV 1h+4h). Con 384M caía en OOM kill repetidamente. 512M
+        # da margen para picos. Con 4 bots → 4 × 512M = 2GB peak (requiere
+        # VPS de 2GB RAM mínimo, recomendado 4GB).
+        memory: 512M
         cpus: "0.40"
       reservations:
-        memory: 96M
+        memory: 128M
   logging:
     driver: "json-file"
     options:
