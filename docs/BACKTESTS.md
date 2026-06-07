@@ -218,3 +218,143 @@ Agregamos `commission_pct_per_side=0.001` (Binance Spot taker sin BNB) al simula
 - TP escalado: revertido (`TP_SCALING_ENABLED=false`)
 - Config activa del bot: ADX≥20 + Kelly + MTF
 - Expectativa realista comunicada al usuario: ~+5% mensual neto.
+
+---
+
+## 2026-06-07 — Fase 1 Roadmap: Auditoría Estadística del ScalpingEngine
+
+Antes de migrar el ScalpingEngine a Binance real (testnet=false), corrimos
+las primeras auditorías cuantitativas del roadmap. **Hallazgo crítico**: el
+motor no tiene edge en el agregado, pero hay edge LATENTE en sub-regímenes.
+
+### Aud #1 — Monte Carlo / Bootstrap del orden de trades
+
+`scripts/audit_montecarlo.py` — 1000 permutaciones del orden de PnLs, 60d
+BTC/USDT 5m, risk 8%, leverage 10×, fees maker 0.02% / taker 0.05%.
+
+| Métrica | Valor |
+|---|---|
+| Trades reales | 64 (luego 62 con datos actualizados) |
+| WR real | 50.0–51.6% |
+| Retorno real | **−2.36%** (corrida MC) / +0.96% (corrida posterior) |
+| Max DD real observado | 12.89% |
+| P(retorno < 0) | **100%** (suma de PnLs es invariante bajo shuffle) |
+| P(max_dd > 12.89%) | 75.9% — el orden real fue afortunado |
+| Distribución de DD (mediana / P95) | 15.07% / 21.91% |
+
+**Veredicto**: ❌ edge no robusto. El PnL agregado es ~0 con std grande;
+cualquier orden razonable produce retornos negativos o nulos. Esperanza
+matemática del motor en su configuración actual ≈ 0.
+
+### Aud E — Disección por sub-regímenes
+
+`scripts/audit_trade_breakdown.py` — separa los 62 trades por hora UTC, día
+de la semana, lado, régimen de ATR%, BB width al entrar, intensidad del
+volume spike y duración. Significancia con t-stat aproximado (n≥10, |t|>1.5).
+
+**Buckets con edge significativo:**
+
+| Bucket | n | WR | avg PnL | t-stat |
+|---|---|---|---|---|
+| ATR% Q2 (0.15–0.18%) | 16 | 75.0% | **+$1.46** | +1.97 ✅ |
+| BB width Q2 (0.0049–0.0066) | 16 | 68.8% | **+$1.22** | +1.52 ✅ |
+| Hora 00–06 UTC (Asia) | 18 | 66.7% | +$1.32 | +1.38 🟡 |
+| Volume spike Q1 (≤2.38×) | 16 | 62.5% | +$1.41 | +1.28 🟡 |
+
+**Buckets perdedores (el ladrón del PnL):**
+
+| Bucket | n | WR | avg PnL | total |
+|---|---|---|---|---|
+| Hora 06–12 UTC (EU AM) | 12 | 33.3% | −$1.55 | **−$18.55** |
+| BB width Q3 (zona media) | 15 | 33.3% | −$1.53 | −$22.87 |
+| Domingo | 8 | 37.5% | −$1.56 | −$12.50 |
+| Viernes | 8 | 37.5% | −$0.80 | −$6.38 |
+
+**Lectura**:
+- El edge vive en **volatilidad media** (ATR ~0.15–0.18%, BB width ~0.005–0.007).
+  Volatilidad muy baja → fees comen el TP. Volatilidad muy alta → SL random
+  te liquida más rápido que el TP llega.
+- **EU AM (06–12 UTC) destruye el bot** — hipótesis: HFT EU activo + news
+  flow europeo.
+- Asia (00–06 UTC) es la sesión rentable: cripto fluye más limpio.
+- Spikes de volumen MUY grandes (>4×) son explosiones de noise que revierten.
+
+**Caveat metodológico**: 28 buckets × α=0.05 esperaría ~1.4 ✅ por puro ruido;
+tenemos 2. No es prueba, pero los hallazgos son **coherentes temáticamente**.
+La prueba real es WFA.
+
+### Aud F — Filtros incrementales del breakdown
+
+`scripts/audit_filters.py` — toma los buckets perdedores y los aplica como
+filtros pre-trade, midiendo el efecto incremental sobre el agregado del
+backtest 60d.
+
+| Filtro | n | WR | avg PnL | total | ret 60d | DD | PF |
+|---|---|---|---|---|---|---|---|
+| Sin filtro (baseline) | 62 | 51.6% | +$0.03 | +$2.01 | +0.96% | 12.89% | 1.02 |
+| **A: −EU AM (06-12 UTC)** | **50** | **56.0%** | **+$0.41** | **+$20.56** | **+9.79%** | **11.35%** | **1.23** ✅ |
+| B: A + ATR%∈[0.13, 0.20] | 30 | 56.7% | +$0.21 | +$6.34 | +3.02% | 6.84% | 1.15 |
+| C: B + vol_ratio≤4× | 22 | 50.0% | −$0.22 | −$4.92 | −2.34% | 6.99% | 0.86 |
+| D: C + −Dom/Vie | 17 | 47.1% | −$0.39 | −$6.59 | −3.14% | 8.19% | 0.78 |
+
+**Hallazgo principal**: el filtro A (excluir señales en hora 06-12 UTC)
+**multiplica el retorno por 10× con DD apenas mejor**. Los filtros B/C/D
+**empeoran** progresivamente — son overfit del mismo dataset que los derivó.
+Conclusión: **un solo filtro de horario es el ganador. Keep it simple.**
+
+**Mecanismo razonable**: la sesión EU AM (Londres open) en BTC 5m está
+dominada por algos de HFT + news flow europeo que matan las señales de
+breakout BB con whipsaws. La sesión Asia (00-06 UTC) y las sesiones
+calmas (12-24 UTC) tienen flow más limpio para una estrategia de
+volatility expansion.
+
+**Optimización del engine durante esta auditoría**: `core/scalping_engine.py`
+ahora cachea BB+ATR por `id(df)`. El `analyze()` pasa de O(n²) a O(n) en
+backtests largos. Crítico para que el WFA (#4) sea viable.
+
+### Aud #4 — Walk-Forward Analysis (180d BTC/USDT 5m, filtro A activo)
+
+`scripts/audit_wfa.py --days 180 --is-days 40 --os-days 20 --step-days 20 --grid quick`
+
+Grid de 3 configs (squeeze_pct, vol_spike, tp_atr_mult, cooldown), 7 ventanas
+rolling IS/OS. En cada ventana se elige la mejor config IS por PF y se mide
+su performance en el OS siguiente (no overlap).
+
+| IS→OS (OS range) | Best cfg IS | IS ret | **OS ret** | OS PF | OS n |
+|---|---|---|---|---|---|
+| 01-18 → 02-07 | sq=15/vs=2.5/tp=2.0/cd=5 | −14.69% | **+13.70%** | 1.77 | 18 |
+| 02-07 → 02-27 | sq=15/vs=2.5/tp=2.0/cd=5 | +13.66% | −7.63% | 0.74 | 25 |
+| 02-27 → 03-19 | sq=15/vs=2.5/tp=2.0/cd=5 | +5.03% | −13.34% | 0.61 | 23 |
+| 03-19 → 04-08 | sq=15/vs=2.5/tp=2.0/cd=5 | −21.44% | −17.90% | 0.35 | 20 |
+| 04-08 → 04-28 | sq=25/vs=1.5/tp=1.5/cd=3 | −47.31% | −1.57% | 0.96 | 39 |
+| 04-28 → 05-18 | sq=25/vs=1.5/tp=1.5/cd=3 | −23.18% | −0.73% | 0.94 | 14 |
+| 05-18 → 06-07 | sq=20/vs=2.0/tp=1.5/cd=3 | +0.05% | **+9.74%** | 1.54 | 20 |
+
+**Resumen agregado**:
+- Ventanas OS > 0: **2/7 (29%)**
+- OS retorno total: **−17.74%**
+- OS retorno medio: −2.53% por ventana
+- OS retorno peor: −17.90% — OS retorno mejor: +13.70%
+
+**Veredicto**: ❌ **EDGE NO SOBREVIVE WFA**. El +9.79% del audit F era
+cherry-picking temporal (corresponde sólo a la ventana 05-18→06-07). La
+config "ganadora IS" cambia entre ventanas — no hay parámetros estables.
+La correlación IS↔OS es ~ruido (ventana 1 inversa: IS −15% / OS +14%).
+
+**Lectura honesta**: el ScalpingEngine BB-squeeze en BTC/USDT 5m **no tiene
+edge robusto** con fees reales (maker 0.02% + taker 0.05%), risk 8%,
+leverage 10×. El filtro de horario era ruido reciente, no señal estructural.
+
+### Decisión final de la Fase 1
+
+**NO migrar a producción real con ScalpingEngine BTC 5m.** El roadmap
+detectó el problema antes de poner capital real ($210). Auditorías #2
+(slippage / Post-Only) y #3 (Kelly) **canceladas** — son polish sobre un
+motor sin esperanza matemática positiva. Kelly sobre EV negativo da
+fracción negativa = no operar.
+
+**Pivot propuesto (Fase 2)**:
+- A. Re-correr el WFA con scalping en **TF 15m** (menos noise, menos fees por capital).
+- C. Re-validar el **PriceActionEngine** sobre los mismos 180d (era el otro motor
+  validado en backtests anteriores, antes deprecadi por baja frecuencia).
+- Comparar A vs C en igual de condiciones (período, fees, leverage, risk).

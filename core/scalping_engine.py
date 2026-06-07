@@ -69,6 +69,22 @@ def _atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
     ).average_true_range()
 
 
+def _parse_hours(spec: str) -> set[int]:
+    """Acepta '6-11' o '6,7,8,9,10,11' o '' (vacío = no skip)."""
+    spec = (spec or "").strip()
+    if not spec:
+        return set()
+    out: set[int] = set()
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if "-" in chunk:
+            a, b = chunk.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        elif chunk:
+            out.add(int(chunk))
+    return {h for h in out if 0 <= h <= 23}
+
+
 # ─────────────────────────────────────────
 #  Engine
 # ─────────────────────────────────────────
@@ -103,10 +119,42 @@ class ScalpingEngine:
         self.sl_min_pct: float = getattr(settings, "scalp_sl_min_pct", 0.001)
         self.sl_max_pct: float = getattr(settings, "scalp_sl_max_pct", 0.02)
         self.cooldown_bars: int = getattr(settings, "scalp_cooldown_bars", 3)
+        # Skip hours UTC (formato: "6-11" o "6,7,8,9,10,11"). Validado en
+        # aud F: cortar 06-12 UTC multiplica el retorno 10× en backtest 60d.
+        self.skip_hours: set[int] = _parse_hours(
+            getattr(settings, "scalp_skip_hours_utc", "")
+        )
         self._last_close_idx: int = -10**9
+        # Cache de indicadores: evita recalcular BB y ATR sobre el subset en
+        # cada vela. Se invalida cuando cambia el df (id() distinto).
+        self._cache_df_id: int = -1
+        self._cache_upper: Optional[pd.Series] = None
+        self._cache_middle: Optional[pd.Series] = None
+        self._cache_lower: Optional[pd.Series] = None
+        self._cache_bbw: Optional[pd.Series] = None
+        self._cache_atr: Optional[pd.Series] = None
+        self._cache_vol_ma: Optional[pd.Series] = None
         logger.info(
             "ScalpingEngine inicializado (BB squeeze + expansion + volume spike, TF base)"
         )
+
+    def _ensure_cache(self, df: pd.DataFrame) -> None:
+        """Pre-calcula BB y ATR sobre el df completo si no están en cache."""
+        if id(df) == self._cache_df_id and self._cache_upper is not None:
+            return
+        bb = ta.volatility.BollingerBands(close=df["close"],
+                                           window=self.bb_window,
+                                           window_dev=self.bb_dev)
+        self._cache_upper = bb.bollinger_hband()
+        self._cache_middle = bb.bollinger_mavg()
+        self._cache_lower = bb.bollinger_lband()
+        self._cache_bbw = (self._cache_upper - self._cache_lower) / self._cache_middle
+        self._cache_atr = ta.volatility.AverageTrueRange(
+            high=df["high"], low=df["low"], close=df["close"],
+            window=self.atr_window,
+        ).average_true_range()
+        self._cache_vol_ma = df["volume"].rolling(self.bb_window).mean().shift(1)
+        self._cache_df_id = id(df)
 
     @property
     def is_safe_mode(self) -> bool:
@@ -130,51 +178,56 @@ class ScalpingEngine:
         if (current_idx - self._last_close_idx) < self.cooldown_bars:
             return self._wait(f"cooldown ({self.cooldown_bars} velas)")
 
+        # Skip de horario (filtro validado en aud F: cortar 06-12 UTC mejora 10×)
+        if self.skip_hours:
+            hour_utc = df.index[current_idx].hour
+            if hour_utc in self.skip_hours:
+                return self._wait(f"hora {hour_utc:02d}h UTC en skip_hours")
+
         # Datos suficientes
         warm = max(self.squeeze_lookback, self.bb_window + 5, self.atr_window + 5)
         if current_idx < warm:
             return self._wait("warm-up incompleto")
 
-        # Subset hasta la vela actual (inclusive)
-        sub = df.iloc[: current_idx + 1]
-        if len(sub) < warm:
-            return self._wait("data insuficiente")
-
-        # BB components
-        upper, middle, lower = _bb_components(sub, self.bb_window, self.bb_dev)
-        bbw = (upper - lower) / middle
+        # Pre-cálculo cacheado de indicadores (evita O(n²) en backtests largos).
+        self._ensure_cache(df)
+        upper = self._cache_upper
+        middle = self._cache_middle
+        lower = self._cache_lower
+        bbw = self._cache_bbw
+        atr_series = self._cache_atr
+        vol_ma_series = self._cache_vol_ma
 
         # Squeeze: BB width actual debajo del percentil-N de las últimas squeeze_lookback velas
-        recent_widths = bbw.iloc[-self.squeeze_lookback:].dropna()
+        recent_widths = bbw.iloc[max(0, current_idx - self.squeeze_lookback + 1): current_idx + 1].dropna()
         if len(recent_widths) < self.squeeze_lookback // 2:
             return self._wait("widths insuficientes")
         squeeze_threshold = float(recent_widths.quantile(self.squeeze_percentile / 100.0))
 
-        # Volumen
-        vol_ma = sub["volume"].iloc[-(self.bb_window + 1):-1].mean()
+        # Volumen (MA shift(1) → excluye la vela actual del MA)
+        vol_ma = float(vol_ma_series.iloc[current_idx]) if pd.notna(vol_ma_series.iloc[current_idx]) else 0.0
         if vol_ma <= 0:
             return self._wait("volumen MA inválido")
 
         # ATR
-        atr_series = _atr(sub, self.atr_window)
-        atr_now = float(atr_series.iloc[-1]) if pd.notna(atr_series.iloc[-1]) else 0.0
+        atr_now = float(atr_series.iloc[current_idx]) if pd.notna(atr_series.iloc[current_idx]) else 0.0
         if atr_now <= 0:
             return self._wait("ATR no disponible")
 
-        last = sub.iloc[-1]
-        prev = sub.iloc[-2]
+        last = df.iloc[current_idx]
+        prev = df.iloc[current_idx - 1]
         close = float(last["close"])
         prev_close = float(prev["close"])
 
         # Buscar squeeze EN LAS VELAS PREVIAS (no en la vela de expansión).
-        # Si las últimas 10 velas estuvieron en squeeze, la 11° (actual) podría ser la expansión.
-        prev_bbw = bbw.iloc[-11:-1]
+        # Las 10 velas anteriores a la actual.
+        prev_bbw = bbw.iloc[max(0, current_idx - 10): current_idx]
         was_in_squeeze = bool((prev_bbw <= squeeze_threshold).any())
         if not was_in_squeeze:
             return self._wait(f"sin squeeze previo (umbral {squeeze_threshold:.4f})")
 
-        upper_now = float(upper.iloc[-1])
-        lower_now = float(lower.iloc[-1])
+        upper_now = float(upper.iloc[current_idx])
+        lower_now = float(lower.iloc[current_idx])
         vol_now = float(last["volume"])
         vol_ratio = vol_now / vol_ma
 
@@ -186,8 +239,8 @@ class ScalpingEngine:
 
         # Detectar BREAKOUT (close por encima/debajo de banda)
         # Requerimos que la vela actual ROMPA y que la anterior NO lo hubiera roto aún
-        breakout_up = close > upper_now and prev_close <= float(upper.iloc[-2])
-        breakout_down = close < lower_now and prev_close >= float(lower.iloc[-2])
+        breakout_up = close > upper_now and prev_close <= float(upper.iloc[current_idx - 1])
+        breakout_down = close < lower_now and prev_close >= float(lower.iloc[current_idx - 1])
 
         if breakout_up:
             sl_price = close - self.sl_atr_mult * atr_now

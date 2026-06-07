@@ -104,6 +104,11 @@ class Settings(BaseModel):
     scalp_sl_max_pct: float = 0.02
     scalp_cooldown_bars: int = 3         # anti-ruido tras cierre
     scalp_max_fee_to_gain: float = 0.20  # rechazar señal si fees > 20% de la ganancia bruta
+    # Filtro de horario: lista de horas UTC en las que NO operar. Default
+    # empty = todas las horas habilitadas. Ej: "6,7,8,9,10,11" descarta EU AM
+    # (validado en aud F: +10× retorno backtest 60d). Cargado vía env
+    # SCALP_SKIP_HOURS_UTC="6-11" o lista coma-separada.
+    scalp_skip_hours_utc: str = ""
 
     # ─── Mejoras de precisión (off por default; se activan con env vars) ───
     # Cooldown: N velas mínimas entre cerrar una posición y abrir otra.
@@ -171,4 +176,5 @@ def load_settings() -> Settings:
         engine=os.getenv("ENGINE", "scalping"),
         tp_scaling_enabled=os.getenv("TP_SCALING_ENABLED", "false").lower() == "true",
         dynamic_trailing_enabled=os.getenv("DYNAMIC_TRAILING", "false").lower() == "true",
+        scalp_skip_hours_utc=os.getenv("SCALP_SKIP_HOURS_UTC", ""),
     )
