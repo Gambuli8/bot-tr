@@ -240,18 +240,31 @@ agent-trading/
 │   │   ├── audit.jsonl
 │   │   ├── heartbeat
 │   │   └── bot.log
-└── docs/
-    ├── BACKTESTS.md                 (registro completo de todas las auditorías)
-    ├── DEPLOYMENT.md                (single-symbol legacy)
-    ├── DEPLOYMENT_MULTI_ASSET.md    (deploy 4 bots paso a paso)
-    └── HANDOFF.md                   (este doc)
+├── docs/
+│   ├── BACKTESTS.md                 (registro completo de todas las auditorías)
+│   ├── DEPLOYMENT.md                (single-symbol legacy)
+│   ├── DEPLOYMENT_MULTI_ASSET.md    (deploy 4 bots paso a paso)
+│   └── HANDOFF.md                   (este doc)
+└── tradingview/
+    ├── README.md                    (cómo cargar el script en TV)
+    └── pa_engine_strategy.pine      (port a Pine Script v5 del PriceActionEngine)
 ```
+
+**Carpeta `tradingview/`** (informativa, no operativa): port a Pine Script v5
+del `PriceActionEngine` para visualizar la estrategia en TradingView. Replica
+fielmente la lógica del motor Python (fractal n=3, estructura 4h con
+`request.security`, liquidity sweep, sizing por riesgo). Útil para sanity
+check visual o crear alertas (`alertcondition`) por sweep detectado, pero
+**NO** sustituye al WFA Python como validación estadística (datos/fills/fees
+distintos en TradingView, sin walk-forward). Ver `tradingview/README.md`.
 
 ---
 
 ## 7. Histórico de commits relevantes
 
 ```
+629335b tradingview: port a Pine Script del PriceActionEngine (1h+4h)
+a2c1c98 docs: handoff completo del proyecto para otro LLM colaborador
 7bf672e fix(telegram): usar symbol del settings en lugar de 'BTC' hardcoded
 4aacfa9 fix(docker-multi): subir mem limit de 384M a 512M para evitar OOM en arranque
 9d1cb70 audit(fase2): WFA multi-asset PA + portafolio aprobado BTC/SOL/AVAX/LINK
