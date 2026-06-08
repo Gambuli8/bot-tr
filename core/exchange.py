@@ -1,7 +1,15 @@
 """
 core/exchange.py
-Conexión a Binance (testnet o real) via ccxt.
+Conexión a Binance Futures USDT-M (testnet o real) via ccxt.
 Manejo de rate limiting, reintentos y validación de conexión.
+
+NOTAS DE MERCADO (cambio Fase 3, 2026-06-08):
+- Operamos en Futures USDT-M (perpetuos), NO Spot. La decisión de migrar fue
+  para tener leverage configurable (WFA aprobado a 7×).
+- defaultType = "future" en ccxt → endpoints /fapi/v1 y /fapi/v2.
+- Antes de operar se setea leverage e isolated margin via setLeverage() y
+  setMarginMode().
+- Testnet Futures vive en testnet.binancefuture.com (distinto de Spot testnet).
 """
 
 import time
@@ -48,40 +56,51 @@ class ExchangeClient:
 
     def __init__(self, settings: Settings):
         self.settings = settings
+        # Leverage y margin mode vienen del settings (default 7× isolated).
+        self.leverage: int = int(getattr(settings, "leverage", 7))
+        self.margin_mode: str = str(getattr(settings, "margin_mode", "isolated")).lower()
         self.exchange = self._init_exchange()
         # Cache MTF
         self._mtf_cache = None
         self._mtf_cache_at: float = 0.0
-        # En testnet, los datos OHLCV están sintéticos (precio cuasi-flat, ATR ínfimo).
-        # Para que el motor técnico tenga sobre qué decidir, leemos OHLCV de mainnet
-        # (read-only, sin credenciales). Las órdenes siguen yendo a self.exchange.
+        # Cache para no resetear leverage/margin en cada trade (solo cuando cambia el símbolo).
+        self._leverage_configured_for: Optional[str] = None
+        # En testnet Futures los datos OHLCV son cuasi-flat. Leemos del mainnet
+        # Futures (read-only, sin credenciales) para tener precios y velas reales.
         if settings.binance_testnet:
             self.data_exchange = ccxt.binance({
                 "enableRateLimit": True,
                 "options": {
-                    "defaultType": "spot",
+                    "defaultType": "future",
                     "adjustForTimeDifference": True,
                 },
             })
-            logger.info("📡 OHLCV se leerá de Binance MAINNET (read-only, datos reales)")
+            logger.info("📡 OHLCV se leerá de Binance Futures MAINNET (read-only, datos reales)")
         else:
             self.data_exchange = self.exchange
-        logger.info(f"ExchangeClient inicializado | testnet={settings.binance_testnet}")
+        logger.info(
+            f"ExchangeClient inicializado | mercado=Futures USDT-M | "
+            f"testnet={settings.binance_testnet} | leverage={self.leverage}× | "
+            f"margin={self.margin_mode}"
+        )
 
     def _init_exchange(self) -> ccxt.binance:
         exchange = ccxt.binance({
             "apiKey": self.settings.binance_api_key,
             "secret": self.settings.binance_api_secret,
-            "enableRateLimit": True,  # ccxt maneja rate limiting automáticamente
+            "enableRateLimit": True,
             "options": {
-                "defaultType": "spot",
+                # Futures USDT-M perpetuos (Binance llama "future" a este mercado en ccxt)
+                "defaultType": "future",
                 "adjustForTimeDifference": True,
             },
         })
 
         if self.settings.binance_testnet:
             exchange.set_sandbox_mode(True)
-            logger.info("🔧 Modo TESTNET activado — dinero ficticio (órdenes)")
+            logger.info(
+                "🔧 Modo TESTNET FUTURES activado — testnet.binancefuture.com (dinero ficticio)"
+            )
 
         # Pre-cargar markets para que amount_to_precision/price_to_precision
         # funcionen siempre, incluso antes de validate_connection.
@@ -92,25 +111,69 @@ class ExchangeClient:
 
         return exchange
 
+    def configure_leverage_and_margin(self, symbol: Optional[str] = None) -> None:
+        """
+        Aplica leverage e isolated-margin sobre el símbolo. Idempotente: se llama
+        antes de cada apertura pero solo dispara API call cuando cambia el símbolo
+        (el setting persiste en Binance Futures hasta que vos lo cambies).
+
+        Si setMarginMode falla con 'No need to change margin type' (Binance la
+        rechaza si ya está en ese modo), lo tratamos como éxito y seguimos.
+        """
+        sym = symbol or self.settings.symbol
+        if self._leverage_configured_for == sym:
+            return
+        try:
+            # Margin mode (isolated por trade, no contagia el resto del capital)
+            try:
+                self.exchange.set_margin_mode(self.margin_mode.upper(), sym)
+                logger.info(f"✅ Margin mode = {self.margin_mode.upper()} para {sym}")
+            except ccxt.ExchangeError as e:
+                msg = str(e).lower()
+                if "no need to change" in msg or "already" in msg:
+                    logger.debug(f"Margin mode ya estaba en {self.margin_mode.upper()} para {sym}")
+                else:
+                    logger.warning(f"set_margin_mode falló para {sym}: {e}")
+            # Leverage
+            self.exchange.set_leverage(self.leverage, sym)
+            logger.info(f"✅ Leverage = {self.leverage}× para {sym}")
+            self._leverage_configured_for = sym
+        except Exception as e:
+            logger.error(f"No pude configurar leverage/margin para {sym}: {e}")
+            raise
+
     @retry(max_attempts=3, base_delay=1.0)
     def validate_connection(self) -> bool:
         """
         Verifica que la conexión es válida antes de arrancar el bot.
         Lanza excepción si algo falla — el bot NO debe arrancar.
         """
-        # 1. Verificar credenciales y obtener balance
+        # 1. Verificar credenciales y obtener balance (en Futures, USDT = balance del wallet futures)
         balance = self.exchange.fetch_balance()
         usdt_balance = balance.get("USDT", {}).get("free", 0)
-        logger.info(f"✅ Conexión validada | Balance USDT: {usdt_balance:.2f}")
+        logger.info(f"✅ Conexión validada | Balance USDT (Futures wallet): {usdt_balance:.2f}")
 
-        # 2. Verificar que el par existe
+        # 2. Verificar que el par existe (en Futures es {symbol}:USDT perpetuo)
         markets = self.exchange.load_markets()
         symbol = self.settings.symbol
         if symbol not in markets:
-            raise ValueError(f"Par {symbol} no disponible en este exchange")
-        logger.info(f"✅ Par {symbol} disponible")
+            raise ValueError(
+                f"Par {symbol} no disponible en Binance Futures. "
+                f"¿Está el símbolo bien escrito? (ej: BTC/USDT, no BTCUSDT)"
+            )
+        market = markets[symbol]
+        # Sanity check: confirmar que es un perpetuo de Futures USDT-M
+        if not market.get("swap") and not market.get("linear"):
+            logger.warning(
+                f"⚠ {symbol} no parece ser un perpetuo USDT-M. "
+                f"type={market.get('type')} linear={market.get('linear')}"
+            )
+        logger.info(f"✅ Par {symbol} disponible (Futures perpetuo)")
 
-        # 3. Obtener precio actual como último check (de mainnet si estamos en testnet)
+        # 3. Configurar leverage e isolated margin para este símbolo (idempotente)
+        self.configure_leverage_and_margin(symbol)
+
+        # 4. Obtener precio actual como último check
         ticker = self.data_exchange.fetch_ticker(symbol)
         source = "mainnet" if self.settings.binance_testnet else "exchange"
         logger.info(f"✅ Precio actual {symbol}: ${ticker['last']:,.2f} ({source})")
@@ -261,6 +324,9 @@ class ExchangeClient:
         client_order_id: ID único para idempotencia
         """
         symbol = self.settings.symbol
+        # Asegurar leverage/margin configurados en el exchange antes de abrir
+        # (idempotente: solo dispara API call si el símbolo cambió)
+        self.configure_leverage_and_margin(symbol)
         price = self.get_price(symbol)
 
         if side == "buy":
@@ -291,8 +357,9 @@ class ExchangeClient:
             params=params,
         )
 
+        base = symbol.split("/")[0] if "/" in symbol else symbol
         logger.info(
-            f"📋 Orden ejecutada | {side.upper()} {amount_btc} BTC "
+            f"📋 Orden ejecutada | {side.upper()} {amount_btc} {base} "
             f"@ ~${price:,.2f} | ID: {client_order_id}"
         )
         return order
@@ -321,10 +388,9 @@ class ExchangeClient:
         client_order_id: str,
     ) -> dict:
         """
-        STOP_LOSS_MARKET: cuando el precio toca stop_price, se ejecuta a mercado.
-        Para cerrar un LONG: side='sell' (vendemos cuando baja a SL).
-        Para cerrar un SHORT (en Futures): side='buy'.
-        Esta orden vive en el exchange aunque el bot esté caído — protección real.
+        STOP_MARKET (Futures USDT-M): cuando el precio toca stop_price se ejecuta
+        a mercado. reduceOnly garantiza que solo cierra (nunca abre nueva).
+        Para cerrar LONG → side='sell'. Para cerrar SHORT → side='buy'.
         """
         symbol = self.settings.symbol
         amount_btc = self.exchange.amount_to_precision(symbol, amount_btc)
@@ -332,17 +398,20 @@ class ExchangeClient:
         params = {
             "stopPrice": float(stop_price),
             "newClientOrderId": client_order_id,
+            "reduceOnly": True,           # CRÍTICO en Futures: solo cierra, no abre
+            "workingType": "MARK_PRICE",  # trigger por mark price (evita liq por wick spot)
         }
         order = self.exchange.create_order(
             symbol=symbol,
-            type="STOP_LOSS",   # ccxt mapea a STOP_LOSS (market) en Binance Spot
+            type="STOP_MARKET",   # tipo de orden de Futures USDT-M
             side=side,
             amount=float(amount_btc),
             params=params,
         )
+        base = symbol.split("/")[0] if "/" in symbol else symbol
         logger.info(
-            f"🛑 SL colocado en exchange | trigger ${float(stop_price):,.2f} | "
-            f"{side.upper()} {amount_btc} BTC | ID: {client_order_id}"
+            f"🛑 SL colocado en Futures | trigger ${float(stop_price):,.2f} | "
+            f"{side.upper()} {amount_btc} {base} | reduceOnly | ID: {client_order_id}"
         )
         return order
 
@@ -355,8 +424,9 @@ class ExchangeClient:
         client_order_id: str,
     ) -> dict:
         """
-        TAKE_PROFIT_LIMIT: limit order que se ejecuta al alcanzar el precio objetivo.
-        Para cerrar un LONG: side='sell' (vendemos al precio target).
+        TP en Futures: orden LIMIT con reduceOnly=true. Cuando el precio alcanza
+        el limit, se ejecuta como maker (fee bajo). reduceOnly garantiza que solo
+        cierra la posición, nunca abre una nueva.
         """
         symbol = self.settings.symbol
         amount_btc = self.exchange.amount_to_precision(symbol, amount_btc)
@@ -364,6 +434,7 @@ class ExchangeClient:
         params = {
             "timeInForce": "GTC",
             "newClientOrderId": client_order_id,
+            "reduceOnly": True,   # CRÍTICO en Futures
         }
         order = self.exchange.create_order(
             symbol=symbol,
@@ -373,8 +444,9 @@ class ExchangeClient:
             price=float(limit_price),
             params=params,
         )
+        base = symbol.split("/")[0] if "/" in symbol else symbol
         logger.info(
-            f"🎯 TP colocado en exchange | limit ${float(limit_price):,.2f} | "
-            f"{side.upper()} {amount_btc} BTC | ID: {client_order_id}"
+            f"🎯 TP colocado en Futures | limit ${float(limit_price):,.2f} | "
+            f"{side.upper()} {amount_btc} {base} | reduceOnly | ID: {client_order_id}"
         )
         return order

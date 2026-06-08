@@ -1,10 +1,11 @@
 # docker-compose.multi.yml
-# 4 bots en paralelo, uno por símbolo del portafolio aprobado en Fase 2
-# (BTC, SOL, AVAX, LINK) — todos con PriceActionEngine en 1h.
+# 3 bots en paralelo (Fase 3, desde 2026-06-08):
+# BTC + SOL + AVAX — todos con PriceActionEngine 1h, Futures USDT-M, leverage 7×.
+# LINK descartado tras WFA en Fase 3 (no pasaba el threshold +10% OS con 7×).
 #
-# Cada bot usa su propio .env (.env.btc, .env.sol, .env.avax, .env.link),
-# su propio directorio data/<sym>/ y su propio nombre de container, pero
-# comparten la imagen y la API key de Binance.
+# Cada bot usa su propio .env (.env.btc, .env.sol, .env.avax), su propio
+# directorio data/<sym>/ y su propio nombre de container, pero comparten la
+# imagen y la API key de Binance Futures.
 #
 # Setup detallado: docs/DEPLOYMENT_MULTI_ASSET.md
 #
@@ -82,20 +83,11 @@ services:
       TZ: "UTC"
       BOT_SYMBOL_TAG: "AVAX"
 
-  bot-link:
-    <<: *bot-defaults
-    container_name: agent-trading-link
-    env_file:
-      - .env.link
-    volumes:
-      - ./data/link/:/app/data
-    environment:
-      PYTHONUNBUFFERED: "1"
-      PYTHONIOENCODING: "utf-8"
-      TZ: "UTC"
-      BOT_SYMBOL_TAG: "LINK"
+  # LINK descartado en Fase 3 (WFA con leverage 7× → ❌ 3/7 OS positivas,
+  # OS total +6.37%, PF mediano 0.97). Si querés re-evaluarlo, mirá los logs
+  # del WFA en docs/BACKTESTS.md sección Fase 3.
 
-  # Un solo autoheal para los 4 — vigila el label autoheal=true en todos.
+  # Un solo autoheal para los 3 — vigila el label autoheal=true en todos.
   autoheal:
     image: willfarrell/autoheal:latest
     container_name: agent-trading-autoheal-multi

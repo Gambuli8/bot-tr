@@ -24,29 +24,32 @@ misma API key de Binance y reporta al mismo chat de Telegram.
 
 ---
 
-## 1. Cómo está corriendo HOY (deploy real)
+## 1. Cómo está corriendo HOY (deploy real, Fase 3)
 
 VPS Contabo Ubuntu 24.04 (7.8 GB RAM, 4 vCPU), `docker compose` orquesta
-**4 bots + 1 autoheal sidecar**:
+**3 bots + 1 autoheal sidecar** (LINK descartado en Fase 3 por WFA):
 
 | Container | Símbolo | Capital nominal | Engine | TF base | TF estructura |
 |---|---|---|---|---|---|
-| `agent-trading-btc` | BTC/USDT | $52.5 | PriceActionEngine | 1h | 4h |
-| `agent-trading-sol` | SOL/USDT | $52.5 | PriceActionEngine | 1h | 4h |
-| `agent-trading-avax` | AVAX/USDT | $52.5 | PriceActionEngine | 1h | 4h |
-| `agent-trading-link` | LINK/USDT | $52.5 | PriceActionEngine | 1h | 4h |
+| `agent-trading-btc` | BTC/USDT | $70 | PriceActionEngine | 1h | 4h |
+| `agent-trading-sol` | SOL/USDT | $70 | PriceActionEngine | 1h | 4h |
+| `agent-trading-avax` | AVAX/USDT | $70 | PriceActionEngine | 1h | 4h |
 | `agent-trading-autoheal-multi` | — | — | willfarrell/autoheal | — | — |
 
-Configuración por bot (`MAX_RISK_PER_TRADE=0.08`, `MAX_CONCURRENT_TRADES=1`,
-`TESTING_LOOP_SECONDS=120`, `TRADING_TIMEFRAME=1h`, `ENGINE=price_action`,
-`BINANCE_TESTNET=true`). Cada bot tiene su `.env.<sym>` y su `data/<sym>/`.
+Configuración por bot (Fase 3): `MAX_RISK_PER_TRADE=0.05`,
+`MAX_CONCURRENT_TRADES=1`, `TESTING_LOOP_SECONDS=120`, `TRADING_TIMEFRAME=1h`,
+`ENGINE=price_action`, `BINANCE_TESTNET=true` (durante validación),
+`LEVERAGE=7`, `MARGIN_MODE=isolated`.
 
-**Risk math (clave para entender el sizing):**
-- 4 bots × $52.5 cada uno = $210 capital nominal total (= el del playbook).
-- 8% de risk por bot = $4.20 risk/trade.
-- Peor caso 4 trades simultáneos: 4 × $4.20 = $16.80 = **8% del total**.
-- Si se subiera `INITIAL_CAPITAL` a $210 por bot, peor caso = 32% del total
-  → rompería el playbook.
+**Mercado**: Binance **Futures USDT-M** (perpetuos, NO Spot). Migración hecha
+el 2026-06-08 (ver `docs/BACKTESTS.md` sección Fase 3).
+
+**Risk math (Fase 3):**
+- 3 bots × $70 = $210 capital nominal total (= el del playbook).
+- 5% de risk por bot = **$3.50 risk/trade**.
+- Peor caso 3 trades simultáneos: 3 × $3.50 = **$10.50 = 5% del total**.
+- Notional por posición: $3.50 / SL%, capeado por $70 × 7 = $490.
+- Caída del precio que liquida (a leverage 7× isolated): ~13%.
 
 Despliegue documentado paso a paso en `docs/DEPLOYMENT_MULTI_ASSET.md` y
 `docker-compose.multi.yml`. Despliegue single-symbol viejo (deprecated)
@@ -318,7 +321,52 @@ a6b5c3a fix(docker): incluir logs/logger.py en el repo y separar bot.log a data/
 
 ---
 
-## 9b. 🚨 DISCREPANCIA CRÍTICA DETECTADA — LEVERAGE
+## 9b. ✅ Resuelta: discrepancia de leverage → migración a Futures USDT-M 7×
+
+> Actualizado 2026-06-08: el cliente eligió **Opción B (Futures 7×)** tras ver
+> los datos del WFA. Refactor completado, deploy en testnet Futures pendiente.
+
+### Lo que cambió
+
+| Antes (Fase 2) | Ahora (Fase 3, desde 2026-06-08) |
+|---|---|
+| Spot 1× | **Futures USDT-M 7×** |
+| 4 bots: BTC + SOL + AVAX + LINK | **3 bots: BTC + SOL + AVAX** (LINK descartado por WFA) |
+| Capital $52.5 × 4 = $210 | **$70 × 3 = $210** |
+| Risk 8% por trade | **Risk 5% por trade** (margen vs liquidación) |
+| `defaultType: spot` | `defaultType: future` |
+| SL: `STOP_LOSS` | `STOP_MARKET` + `reduceOnly` |
+| TP: `LIMIT` Spot | `LIMIT` + `reduceOnly` |
+| testnet.binance.vision | **testnet.binancefuture.com** |
+| Keys de Spot | **Keys nuevas con "Enable Futures Trading"** |
+
+### WFA que justificó la decisión
+
+Comparativo 5× vs 7× sobre 180d, mismos pares (BTC, SOL, AVAX, LINK):
+
+| Coin | 7× OS total | 7× OS pos | 7× PF mediano | Decisión |
+|---|---|---|---|---|
+| BTC | +18.73% | 5/7 | 1.18 | ✅ APRUEBA |
+| SOL | +11.95% | 4/7 | 1.68 | ✅ APRUEBA |
+| AVAX | +14.15% | 5/7 | 1.56 | ✅ APRUEBA |
+| LINK | +6.37% | 3/7 | 0.97 | ❌ DESCARTA |
+
+10× se descartó cualitativamente (caída ~9% liquida → AVAX/SOL pueden mover
+9-15% en 1 vela 1h → liquidación probable en 6 meses).
+
+Detalle completo en `docs/BACKTESTS.md` sección "2026-06-08 — Fase 3".
+
+### Estado al 2026-06-08
+
+- Refactor de código completado (commit `XXX`).
+- Pendiente: deploy en VPS con `BINANCE_TESTNET=true` apuntando a
+  `testnet.binancefuture.com` para iniciar la validación de 7 días.
+- Pendiente: el cliente tiene que generar nuevas API keys de Futures
+  (las Spot no funcionan).
+
+---
+
+## 9b-archivo. 🚨 Discrepancia original (resuelta, para contexto)
 
 **Problema**: hay un mismatch entre el leverage usado en backtests/auditorías
 vs el del bot productivo. Detectado el 2026-06-08 corriendo el Pine en TV.

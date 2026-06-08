@@ -104,6 +104,16 @@ class Settings(BaseModel):
     scalp_sl_max_pct: float = 0.02
     scalp_cooldown_bars: int = 3         # anti-ruido tras cierre
     scalp_max_fee_to_gain: float = 0.20  # rechazar señal si fees > 20% de la ganancia bruta
+
+    # ─── Binance Futures USDT-M (Fase 3, 2026-06-08) ───
+    # Leverage para todas las posiciones del bot. Aprobado por WFA con valor 7×
+    # (BTC/SOL/AVAX todos ✅ con PF mediano 1.18-1.68 y OS retorno +12-19% en 180d).
+    # Cambiar requiere re-validación por WFA.
+    leverage: int = 7
+    # Margin mode: 'isolated' aisla el capital de cada trade (si liquidan, no
+    # se llevan el resto del wallet). 'cross' usa todo el wallet como margen
+    # (más capital efectivo pero contagio total).
+    margin_mode: str = "isolated"
     # Filtro de horario: lista de horas UTC en las que NO operar. Default
     # empty = todas las horas habilitadas. Ej: "6,7,8,9,10,11" descarta EU AM
     # (validado en aud F: +10× retorno backtest 60d). Cargado vía env
@@ -177,4 +187,6 @@ def load_settings() -> Settings:
         tp_scaling_enabled=os.getenv("TP_SCALING_ENABLED", "false").lower() == "true",
         dynamic_trailing_enabled=os.getenv("DYNAMIC_TRAILING", "false").lower() == "true",
         scalp_skip_hours_utc=os.getenv("SCALP_SKIP_HOURS_UTC", ""),
+        leverage=int(os.getenv("LEVERAGE", "7")),
+        margin_mode=os.getenv("MARGIN_MODE", "isolated").lower(),
     )

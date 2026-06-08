@@ -475,3 +475,98 @@ protección de capital (capital nominal $210 + inyecciones mensuales $200).
 
 Las instrucciones para desplegar este portafolio en el VPS están en
 `docs/DEPLOYMENT_MULTI_ASSET.md`.
+
+---
+
+## 2026-06-08 — Fase 3: Pivot a Binance Futures USDT-M con leverage 7×
+
+### Motivación
+
+Durante la validación en Spot 1× (Fase 2) detectamos al correr el Pine en
+TradingView que TANTO el WFA Python COMO el Pine usaban **leverage 5×** —
+pero el bot real en VPS estaba en **Spot 1×** (`defaultType: spot` en
+`core/exchange.py`). Implicaba que los retornos esperados en producción
+serían ~1/5 de los del WFA (BTC: +5% en 180d vs el +25% del WFA).
+
+El cliente decidió migrar a **Futures USDT-M con leverage 7×** para alinear
+operación con el WFA, aceptando los riesgos (liquidación, funding rates).
+
+### Aud — WFA comparativo de leverage (5× vs 7×) sobre los 4 pares Fase 2
+
+Re-corrido del `scripts/audit_wfa_pa.py` con los mismos pares aprobados en
+Fase 2 (BTC, SOL, AVAX, LINK), 180d, 7 ventanas IS=40d/OS=20d, risk 8%,
+fees 0.05%. Una corrida por cada par × leverage.
+
+| Coin | 5× OS pos / OS total / PF med / veredicto | 7× OS pos / OS total / PF med / veredicto |
+|---|---|---|
+| **BTC** | 5/7 / **+15.16%** / 1.22 / ✅ | 5/7 / **+18.73%** / 1.18 / ✅ |
+| **SOL** | 4/7 / +6.41% / 1.11 / 🟡 | 4/7 / **+11.95%** / 1.68 / ✅ |
+| **AVAX** | 5/7 / +4.56% / 1.28 / 🟡 | 5/7 / **+14.15%** / 1.56 / ✅ |
+| **LINK** | 3/7 / +9.51% / 0.93 / ❌ | 3/7 / +6.37% / 0.97 / ❌ |
+
+**Observaciones**:
+- BTC ya pasaba con 5×, pero 7× sube +3.5pp el retorno OS.
+- **SOL y AVAX no pasan con 5×** (PF medio OK pero OS total < +10% threshold).
+  Con 7× la amplificación del edge los lleva al ✅: +12% y +14% respectivamente.
+- **LINK no pasa con ningún leverage** y se descarta del portafolio.
+  El edge se diluyó completamente: PF mediano <1 indica que en términos de
+  retornos por trade, las pérdidas pesan más que las ganancias.
+- Frecuencia agregada no cambia con leverage (es 0.39 trades/día con los 3
+  que sí pasan, contra 0.52 si se hubieran mantenido los 4).
+- Nota metodológica: estos números difieren levemente del WFA Fase 2 porque
+  Binance entregó 1 día extra de data — los OS más recientes cambiaron.
+
+### 10× evaluado y descartado cualitativamente
+
+Antes de confirmar 7×, se consideró probar 10×. Sin correr el WFA se
+descartó porque:
+- 10× liquida con caída ~9% del precio.
+- AVAX y SOL pueden moverse 9-15% en 1 vela de 1h en períodos de stress.
+- Probabilidad de al menos 1 liquidación en 6 meses es alta para alts.
+- El sim del WFA no modela perfectamente la liquidación a leverage alto,
+  por lo que el resultado del backtest sería optimista.
+
+### Decisión final Fase 3
+
+**Portafolio aprobado para producción real**: BTC + SOL + AVAX en
+**Futures USDT-M, leverage 7×, isolated margin, risk 5% por trade**.
+
+| Activo | OS retorno 180d (7×) | OS positivas | PF mediano | Trades OS | t/día |
+|---|---|---|---|---|---|
+| BTC/USDT | +18.73% | 5/7 (71%) | 1.18 | 18 | 0.13 |
+| SOL/USDT | +11.95% | 4/7 (57%) | 1.68 | 17 | 0.12 |
+| AVAX/USDT | +14.15% | 5/7 (71%) | 1.56 | 20 | 0.14 |
+| **Portafolio** | **+44.83%** | — | — | **55** | **~0.39** |
+
+**Cambios operativos vs Fase 2**:
+- De 4 bots → 3 bots (sin LINK).
+- Capital nominal por bot: $52.5 → **$70** ($210 / 3).
+- Risk per trade: 8% → **5%** (margen vs liquidación con leverage 7×).
+- Mercado: Spot → Futures USDT-M.
+- Margin mode: N/A → **isolated** (sin contagio entre trades).
+- Stop loss exchange order: `STOP_LOSS` → `STOP_MARKET` con `reduceOnly`.
+- Take profit exchange order: `LIMIT` (Spot) → `LIMIT` + `reduceOnly`.
+- API keys: hay que generar **nuevas keys de Futures Trading**, las de Spot
+  no sirven.
+- Testnet URL: `testnet.binance.vision` → **`testnet.binancefuture.com`**.
+
+### Refactor de código (commit XXX)
+
+- `core/exchange.py`: `defaultType: future`, agregado `configure_leverage_and_margin()`
+  (idempotente, llamado antes de cada `place_market_order`), `STOP_MARKET` +
+  `reduceOnly` para SL, `LIMIT` + `reduceOnly` para TP, log con `base_asset`
+  derivado del símbolo (no más "BTC" hardcoded en place_market_order).
+- `config/settings.py`: agregado `leverage: int = 7` y `margin_mode: str = "isolated"`.
+- `.env.example`: nueva sección Futures + comentarios actualizados.
+- `docker-compose.multi.yml`: removido `bot-link`.
+- `docs/DEPLOYMENT_MULTI_ASSET.md`: instrucciones completamente actualizadas
+  para testnet Futures + generación de keys Futures.
+
+### Próximos pasos
+
+1. **Validación 7 días en testnet Futures** (testnet.binancefuture.com).
+2. Si pasa los criterios → cambiar `BINANCE_TESTNET=false` con keys de
+   Futures Mainnet.
+3. **Pendiente para próxima iteración**: reconciliación robusta de
+   `fetch_positions` (hoy reconcilia solo vía órdenes — funciona pero
+   no detecta liquidaciones inmediatamente).
