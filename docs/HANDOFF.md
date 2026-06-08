@@ -318,6 +318,66 @@ a6b5c3a fix(docker): incluir logs/logger.py en el repo y separar bot.log a data/
 
 ---
 
+## 9b. 🚨 DISCREPANCIA CRÍTICA DETECTADA — LEVERAGE
+
+**Problema**: hay un mismatch entre el leverage usado en backtests/auditorías
+vs el del bot productivo. Detectado el 2026-06-08 corriendo el Pine en TV.
+
+| Componente | Leverage | Dónde se ve |
+|---|---|---|
+| `scripts/audit_wfa_pa.py` (auditoría que aprobó el portafolio) | **5×** (default del script) | Todos los WFA en `docs/BACKTESTS.md` sección Fase 2 |
+| `tradingview/pa_engine_strategy.pine` (Pine Script) | **5×** (input default) | Strategy Tester muestra +189% acumulado |
+| `core/exchange.py` (bot real en VPS) | **1×** (Spot, hardcoded `defaultType: spot`) | Lo que está corriendo hoy en testnet |
+| `scripts/backtest_price_action.py` (single backtest) | **1×** (default `--leverage 1.0`) | El baseline 180d que dio PF 1.66 |
+
+### Implicaciones
+
+Los retornos esperados en producción van a ser **aproximadamente 1/5** de lo
+que mostraron el WFA y el Pine (que usaron 5×). Aproximación rough:
+
+| Activo | WFA con 5× | Real esperado 1× (180d) |
+|---|---|---|
+| BTC | +25.05% | ~+5% |
+| SOL | +38.46% | ~+7-8% |
+| AVAX | +8.46% | ~+1.5-2% |
+| LINK | +6.13% | ~+1-1.5% |
+| **Portafolio** | **+78%** | **~+15% en 180d (~+2.5%/mes)** |
+
+Pero el resultado **es plata REAL sin riesgo de liquidación ni funding rates**.
+
+### Opciones de resolución (decisión del cliente, no automatizable)
+
+**A. Mantener Spot 1× (status quo)**:
+- Pro: simple, sin riesgo de liquidación, sin funding fees
+- Contra: retornos ~5× menores que el WFA. ~$210 → ~$241 al año
+- El single backtest del baseline (Fase 1 doc) usó leverage=1× y dio PF 1.66
+  con +12.72% en 180d en BTC — eso es lo más realista para producción
+
+**B. Migrar a Binance Futures USDT-M con leverage 5×**:
+- Pro: matchea el WFA, retornos ~+15-25%/mes esperados
+- Contra: requiere cambiar `defaultType: futures`, validar todo el flujo de
+  órdenes (los endpoints son distintos: `/fapi/`), gestionar `setLeverage`
+  antes de cada trade, riesgo de liquidación, fees de funding
+- ⚠ El `.env.example` ya menciona "Binance Futures USDT-M (NO uses keys de
+  Spot)" pero el código está en Spot. Inconsistencia histórica.
+- Refactor estimado: 4-8 horas + 1 ronda de testing en testnet futures
+
+**C. Re-correr el WFA con leverage=1×**:
+- Pro: confirma cuál es el edge realista en Spot
+- Contra: probable que algunos pares marginales (AVAX, LINK) que pasaron el
+  filtro con 5× **no lo pasen con 1×** (porque el PF sigue siendo el mismo
+  pero el retorno absoluto cae bajo el threshold de +10% del WFA)
+- Re-evaluar si el portafolio sigue siendo BTC+SOL+AVAX+LINK o se reduce
+
+### Pendiente
+
+**El cliente tiene que decidir A/B/C antes de cambiar `BINANCE_TESTNET=false`.**
+Sin esa decisión, el bot va a operar 1× Spot con retornos modestos. El cliente
+ya conoce esta discrepancia (informado el 2026-06-08); espera input para
+decidir camino.
+
+---
+
 ## 10. Comandos operativos de cabecera
 
 **En el VPS (`~/agent-trading`):**
@@ -364,7 +424,34 @@ python scripts/audit_wfa_pa.py --symbol BTC/USDT --timeframe 1h --days 180 --ris
 
 ---
 
-## 11. Si Gemini quiere ayudar, lo que necesita saber para no romper nada
+## 11. Si Gemini quiere ayudar — temas abiertos donde se pide opinión
+
+**Tema #1 — Discrepancia de leverage (sección 9b)**: ¿qué camino recomendás
+entre A (mantener Spot 1×), B (migrar a Futures USDT-M 5×) y C (re-correr
+WFA con 1× para reevaluar el portafolio)? Considerar:
+- Capital nominal real: $210 + $200/mes (no apto para grandes drawdowns)
+- Cliente argentino, plata real, ya está testeando con $52.5×4 en testnet
+- WFA pasó las 4 monedas con 5× — con 1× algunos podrían no llegar a +10% OS
+- Bot en Spot ya está corriendo estable (RestartCount=0 desde 2026-06-07)
+
+**Tema #2 — Validación pre-producción**: el cliente está en los 7 días de
+testnet (hasta 2026-06-14). Para considerar exitosa la validación, se pide:
+- RestartCount=0 en los 4 bots
+- ≥1 trade cerrado por cada bot
+- Trades muestran TP/SL en precios razonables
+- Sin warnings en `data/<sym>/audit.jsonl`
+
+¿Sumarías algún criterio extra de validación que se nos esté pasando?
+
+**Tema #3 — Frecuencia esperada (~0.52 trades/día agregada)**: el WFA
+predijo ~15 trades/mes total. Con leverage 1× ese número de trades sigue
+siendo válido (no cambia la lógica del engine, solo el sizing). ¿Algún
+ajuste de parámetros del PA que recomendarías para subir frecuencia sin
+romper el edge (sabiendo que en Fase 1 se descartó el ScalpingEngine)?
+
+---
+
+## 12. Si Gemini quiere ayudar, lo que necesita saber para no romper nada
 
 1. **Cualquier modificación al engine** (`price_action_engine.py`) debe re-validarse con WFA antes de mergear. El criterio del WFA es: **PF mediano ≥ 1.15 sobre ventanas con n≥3, OS positivas ≥ 55%, OS retorno total ≥ +10%**.
 
@@ -383,7 +470,7 @@ python scripts/audit_wfa_pa.py --symbol BTC/USDT --timeframe 1h --days 180 --ris
 
 ---
 
-## 12. Cuál es el estado financiero esperado del portafolio
+## 13. Cuál es el estado financiero esperado del portafolio
 
 Sobre 180 días de WFA (Fase 2), suma simple no compuesta:
 
