@@ -1,0 +1,128 @@
+// © agent-trading — Port a Pine del PriceActionEngine (core/price_action_engine.py)
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+//  PA Engine — Liquidity Sweep (1h trigger + 4h structure)
+//
+//  Réplica fiel del motor que opera el bot en producción:
+//    - Estructura macro en 4h (BULL = HH+HL, BEAR = LH+LL, RANGE = resto).
+//    - Sólo opera A FAVOR de la estructura 4h.
+//    - Gatillo en 1h: liquidity sweep (barre un swing previo y cierra del otro lado).
+//    - Confirmación de volumen: vela del sweep > volMult × MA(volumen, 20).
+//    - SL = mecha del sweep ± atrSlMult × ATR(14).  TP = entry ± tpRR × riesgo.
+//    - Sizing por riesgo (riskPct del equity), capeado por leverage.
+//
+//  ⚠️ APLICAR SOBRE EL GRÁFICO DE 1h (el timeframe del chart = TF del gatillo).
+//  ⚠️ El Strategy Tester de TV NO equivale al WFA en Python (otros datos/fills/
+//     fees). Usalo para VER la lógica, no como verdad estadística.
+// ─────────────────────────────────────────────────────────────────────────────
+
+strategy("PA Engine — Liquidity Sweep (1h+4h)", overlay=true,
+     initial_capital=1000,
+     pyramiding=0,
+     process_orders_on_close=true,
+     calc_on_every_tick=false,
+     commission_type=strategy.commission.percent,
+     commission_value=0.05)
+
+// ───────── Inputs (espejo de config/settings.py · .env) ─────────
+nFractal  = input.int(3,     "Fractal N (Williams)", minval=1,      group="Estrategia")
+htf       = input.timeframe("240", "TF de estructura macro",        group="Estrategia")
+volMult   = input.float(1.5, "Volumen mínimo (× MA)", step=0.1,     group="Estrategia")  // pa_vol_mult
+volWindow = input.int(20,    "Ventana MA de volumen",               group="Estrategia")
+atrWindow = input.int(14,    "ATR window",                          group="Estrategia")
+atrSlMult = input.float(1.5, "SL = sweep ± N×ATR", step=0.1,        group="Estrategia")  // pa_atr_sl_mult
+tpRR      = input.float(2.5, "TP = R:R 1:N", step=0.1,              group="Estrategia")  // pa_tp_rr
+slMinPct  = input.float(0.003, "SL mínimo (% del entry)", step=0.001, group="Filtros")  // pa_sl_min_pct
+slMaxPct  = input.float(0.05,  "SL máximo (% del entry)", step=0.001, group="Filtros")  // pa_sl_max_pct
+riskPct   = input.float(8.0, "Riesgo por trade (% equity)", step=0.5, group="Riesgo")    // MAX_RISK_PER_TRADE
+leverage  = input.float(5.0, "Leverage (cap de notional)", step=1,  group="Riesgo")
+
+// ───────── Estructura macro (4h) — vía request.security, sin repaint ─────────
+// Devuelve 1=BULL, -1=BEAR, 0=RANGE, replicando determine_structure():
+// compara los últimos 2 swing highs y los últimos 2 swing lows confirmados.
+f_structure() =>
+    ph = ta.pivothigh(high, nFractal, nFractal)
+    pl = ta.pivotlow(low,  nFractal, nFractal)
+    var float h1 = na, var float h0 = na
+    var float l1 = na, var float l0 = na
+    if not na(ph)
+        h0 := h1
+        h1 := ph
+    if not na(pl)
+        l0 := l1
+        l1 := pl
+    int s = 0
+    if not na(h0) and not na(l0)
+        if h1 > h0 and l1 > l0
+            s := 1
+        else if h1 < h0 and l1 < l0
+            s := -1
+    s
+
+structHtf = request.security(syminfo.tickerid, htf, f_structure(), lookahead=barmerge.lookahead_off)
+isBull = structHtf == 1
+isBear = structHtf == -1
+
+// ───────── Swings 1h: último swing low/high confirmado (find_swings) ─────────
+ph1 = ta.pivothigh(high, nFractal, nFractal)
+pl1 = ta.pivotlow(low,  nFractal, nFractal)
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+if not na(ph1)
+    lastSwingHigh := ph1
+if not na(pl1)
+    lastSwingLow := pl1
+
+// ───────── Confirmación de volumen (excluye la vela actual del MA) ─────────
+// Python: volume[-(20+1):-1].mean()  ⇔  ta.sma(volume,20)[1]
+volMa    = ta.sma(volume, volWindow)[1]
+volRatio = volMa > 0 ? volume / volMa : 0.0
+volOk    = volRatio >= volMult
+
+// ───────── ATR 1h (Wilder, igual que ta.AverageTrueRange) ─────────
+atr = ta.atr(atrWindow)
+
+// ───────── Detección de liquidity sweep (a favor de la estructura macro) ─────────
+longSweep  = isBull and not na(lastSwingLow)  and low  < lastSwingLow  and close > lastSwingLow  and volOk
+shortSweep = isBear and not na(lastSwingHigh) and high > lastSwingHigh and close < lastSwingHigh and volOk
+
+// ───────── Entry / SL / TP ─────────
+entry = close
+
+longSl    = low - atrSlMult * atr            // sweep_extreme = low de la vela
+longRisk  = entry - longSl
+longTp    = entry + tpRR * longRisk
+longSlPct = math.abs(entry - longSl) / entry
+longValid = longSweep and atr > 0 and longRisk > 0 and longSlPct >= slMinPct and longSlPct <= slMaxPct
+
+shortSl    = high + atrSlMult * atr           // sweep_extreme = high de la vela
+shortRisk  = shortSl - entry
+shortTp    = entry - tpRR * shortRisk
+shortSlPct = math.abs(entry - shortSl) / entry
+shortValid = shortSweep and atr > 0 and shortRisk > 0 and shortSlPct >= slMinPct and shortSlPct <= slMaxPct
+
+// ───────── Sizing por riesgo (igual que Sim._position_size: risk% capeado por leverage) ─────────
+f_qty(riskPerUnit) =>
+    raw      = riskPerUnit > 0 ? (strategy.equity * riskPct / 100.0) / riskPerUnit : 0.0
+    capUnits = entry > 0 ? strategy.equity * leverage / entry : 0.0
+    math.min(raw, capUnits)
+
+// ───────── Órdenes (1 posición a la vez, como el bot) ─────────
+if longValid and strategy.position_size == 0
+    strategy.entry("LONG", strategy.long, qty=f_qty(longRisk))
+    strategy.exit("LONG exit", from_entry="LONG", stop=longSl, limit=longTp)
+
+if shortValid and strategy.position_size == 0
+    strategy.entry("SHORT", strategy.short, qty=f_qty(shortRisk))
+    strategy.exit("SHORT exit", from_entry="SHORT", stop=shortSl, limit=shortTp)
+
+// ───────── Visualización ─────────
+bgcolor(isBull ? color.new(color.green, 92) : isBear ? color.new(color.red, 92) : na, title="Estructura 4h")
+plotshape(longValid,  title="LONG sweep",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.green,0), size=size.small)
+plotshape(shortValid, title="SHORT sweep", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,0),   size=size.small)
+plot(lastSwingLow,  "Swing low 1h",  color=color.new(color.green, 50), style=plot.style_circles)
+plot(lastSwingHigh, "Swing high 1h", color=color.new(color.red, 50),   style=plot.style_circles)
+
+// ───────── Alertas (opcional — para futura automatización por webhook) ─────────
+alertcondition(longValid,  "PA LONG sweep",  "PA Engine: LONG sweep en {{ticker}} @ {{close}}")
+alertcondition(shortValid, "PA SHORT sweep", "PA Engine: SHORT sweep en {{ticker}} @ {{close}}")
