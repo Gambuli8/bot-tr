@@ -142,6 +142,48 @@ class ExchangeClient:
             logger.error(f"No pude configurar leverage/margin para {sym}: {e}")
             raise
 
+    def ensure_one_way_mode(self) -> None:
+        """
+        Garantiza que la cuenta Futures esté en modo One-way (no Hedge).
+
+        CRÍTICO con plata real: el bot manda SL/TP con `reduceOnly` y SIN
+        `positionSide`. Eso SOLO es válido en One-way mode. En Hedge mode Binance
+        rechaza las reduceOnly → un entry podría abrir SIN stop (posición desnuda).
+        Por eso, si no podemos garantizar One-way, ABORTAMOS el arranque.
+
+        El modo es a nivel CUENTA (los bots comparten API key → el primero lo
+        setea, el resto recibe -4059 'No need to change' y lo tratamos como éxito).
+        """
+        try:
+            self.exchange.set_position_mode(False)  # False = one-way (hedge off)
+            logger.info("✅ Position mode = One-way (hedge desactivado)")
+        except ccxt.ExchangeError as e:
+            msg = str(e).lower()
+            if "no need to change" in msg or "-4059" in msg or "already" in msg:
+                logger.info("✅ Position mode ya estaba en One-way")
+            else:
+                # No se pudo cambiar (ej: Hedge con posiciones/órdenes abiertas).
+                raise RuntimeError(
+                    f"No se pudo poner la cuenta Futures en One-way mode: {e}. "
+                    "El bot usa órdenes reduceOnly sin positionSide, que en Hedge "
+                    "mode fallan y dejarían posiciones SIN stop-loss. Cambiá a "
+                    "One-Way en Binance (Futures → Preferencias → Modo de posición) "
+                    "y reiniciá. Si hay posiciones/órdenes abiertas, cerralas primero."
+                ) from e
+
+        # Verificación dura: confirmar que el modo realmente quedó en One-way.
+        try:
+            mode = self.exchange.fetch_position_mode()
+            if mode.get("hedged") is True:
+                raise RuntimeError(
+                    "La cuenta Futures sigue en HEDGE mode tras el intento de "
+                    "cambio. Pasala a One-Way en Binance y reiniciá — el bot NO "
+                    "opera en Hedge porque dejaría posiciones sin stop-loss."
+                )
+            logger.info("✅ Verificado: cuenta en One-way mode")
+        except ccxt.NotSupported:
+            logger.debug("fetch_position_mode no soportado; confío en set_position_mode")
+
     @retry(max_attempts=3, base_delay=1.0)
     def validate_connection(self) -> bool:
         """
@@ -161,7 +203,10 @@ class ExchangeClient:
                 f"Par {symbol} no disponible en Binance Futures. "
                 f"¿Está el símbolo bien escrito? (ej: BTC/USDT, no BTCUSDT)"
             )
-        market = markets[symbol]
+        # Resolver vía market(): con defaultType=future, ccxt mapea "BTC/USDT" al
+        # perpetuo "BTC/USDT:USDT". Leer markets[symbol] directo devolvería el
+        # market SPOT y dispararía un warning falso.
+        market = self.exchange.market(symbol)
         # Sanity check: confirmar que es un perpetuo de Futures USDT-M
         if not market.get("swap") and not market.get("linear"):
             logger.warning(
@@ -170,10 +215,13 @@ class ExchangeClient:
             )
         logger.info(f"✅ Par {symbol} disponible (Futures perpetuo)")
 
-        # 3. Configurar leverage e isolated margin para este símbolo (idempotente)
+        # 3. Garantizar One-way mode ANTES de operar (seguridad de las reduceOnly)
+        self.ensure_one_way_mode()
+
+        # 4. Configurar leverage e isolated margin para este símbolo (idempotente)
         self.configure_leverage_and_margin(symbol)
 
-        # 4. Obtener precio actual como último check
+        # 5. Obtener precio actual como último check
         ticker = self.data_exchange.fetch_ticker(symbol)
         source = "mainnet" if self.settings.binance_testnet else "exchange"
         logger.info(f"✅ Precio actual {symbol}: ${ticker['last']:,.2f} ({source})")
