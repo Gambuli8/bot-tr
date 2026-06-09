@@ -36,10 +36,15 @@ VPS Contabo Ubuntu 24.04 (7.8 GB RAM, 4 vCPU), `docker compose` orquesta
 | `agent-trading-avax` | AVAX/USDT | $70 | PriceActionEngine | 1h | 4h |
 | `agent-trading-autoheal-multi` | — | — | willfarrell/autoheal | — | — |
 
-Configuración por bot (Fase 3): `MAX_RISK_PER_TRADE=0.05`,
-`MAX_CONCURRENT_TRADES=1`, `TESTING_LOOP_SECONDS=120`, `TRADING_TIMEFRAME=1h`,
-`ENGINE=price_action`, `BINANCE_TESTNET=true` (durante validación),
+Configuración por bot (Fase 3, validación con capital mínimo):
+`MAX_RISK_PER_TRADE=0.05`, `MAX_CONCURRENT_TRADES=1`, `TESTING_LOOP_SECONDS=120`,
+`TRADING_TIMEFRAME=1h`, `ENGINE=price_action`, `BINANCE_TESTNET=false`,
+`INITIAL_CAPITAL=15` (por bot, total $45 USDT en Futures Wallet),
 `LEVERAGE=7`, `MARGIN_MODE=isolated`.
+
+**Modo actual: mainnet real con capital mínimo de validación** ($45 total).
+Si los 7 días de validación pasan limpios → subir `INITIAL_CAPITAL` a $70/bot
+y agregar $165 más al wallet → $210 total operativo.
 
 **Mercado**: Binance **Futures USDT-M** (perpetuos, NO Spot). Migración hecha
 el 2026-06-08 (ver `docs/BACKTESTS.md` sección Fase 3).
@@ -318,6 +323,99 @@ a6b5c3a fix(docker): incluir logs/logger.py en el repo y separar bot.log a data/
 - Comandos Telegram con sufijo del símbolo (`/status:btc`) para no recibir 4 respuestas.
 - Dashboard agregado (`data/portfolio.json`) que junte equity de los 4 bots.
 - Métricas Prometheus / exporter para mejor observabilidad.
+
+---
+
+## 9c. 🚨 Hallazgos del deploy real (2026-06-08/09 — Fase 3)
+
+Después de migrar a Futures aparecieron varios temas no obvios que conviene
+tener documentados para que el próximo colaborador no choque con lo mismo:
+
+### Hallazgo 1: Binance deprecó el testnet de Futures (USDT-M)
+
+`testnet.binancefuture.com` ya **NO funciona** con ccxt. El error que tira:
+> "binance testnet/sandbox mode is not supported for futures anymore, please
+> check the deprecation announcement and consider using the demo trading instead."
+
+Implicación: `BINANCE_TESTNET=true` con `defaultType: "future"` **NO sirve más**
+para validación previa. Las opciones son:
+
+- **A. Mainnet directo con capital mínimo** (la que tomamos): $45 USDT total ($15/bot),
+  risk $0.75/trade, máximo daño realista en 7 días ~$10-15.
+- **B. Demo Trading** (https://demo-fapi.binance.com): existe API pero hay un
+  bug abierto en ccxt (Issue #26487) donde algunas llamadas privadas se
+  rutean al endpoint live spot dando "Invalid Api-Key". No recomendado.
+- **C. Refactor a paper-trade local**: 3-4h de código, 0 plata real. Pendiente
+  si en el futuro queremos validar refactors grandes sin tocar mainnet.
+
+### Hallazgo 2: API key Binance debe crearse DESPUÉS de activar Futures
+
+Si la cuenta de Binance se activó para Futures **después** de crear la API key,
+el toggle "Enable Futures" queda **deshabilitado** en esa key (tooltip:
+"The Futures API cannot be used if the API key was created before the Futures
+account was opened"). Síntoma operativo:
+- `fetch_balance` funciona (read-only) → el balance USDT del Futures wallet
+  aparece correctamente.
+- `setLeverage` / `setMarginMode` / `createOrder` fallan con error -2015
+  ("Invalid API-key, IP, or permissions for action").
+
+**Fix**: borrar la API key vieja, **activar Futures Wallet primero**, después
+crear key nueva. Esta vez el toggle "Enable Futures" se puede activar.
+
+### Hallazgo 3: Keys con Futures exigen IP restriction
+
+Binance no permite usar `defaultType: "future"` con una API key en
+"Unrestricted access". Es **obligatorio** marcar "Restrict access to trusted
+IPs only" y agregar la IP del VPS:
+
+```bash
+ssh ubuntu@<VPS>
+curl ifconfig.me
+```
+
+### Hallazgo 4: `state.json` viejo persiste el capital nominal
+
+El `OrderManager` lee `data/<sym>/state.json` al startup y usa el `capital`
+que está ahí. **`INITIAL_CAPITAL` en `.env` solo se aplica si NO existe
+state.json**. Síntoma: cambiás `INITIAL_CAPITAL=70` → `INITIAL_CAPITAL=15`
+en el `.env`, restartás el bot, y `/status` sigue mostrando $70.
+
+**Fix cada vez que cambia el capital nominal**:
+```bash
+docker compose -f docker-compose.multi.yml down
+rm -f data/<sym>/state.json data/<sym>/controller_state.json
+docker compose -f docker-compose.multi.yml up -d
+```
+
+### Hallazgo 5: 3 bots comparten el wallet real de Futures
+
+Cada bot tiene su `INITIAL_CAPITAL` lógico (ej. $15) pero ven el **mismo
+balance real** del Futures wallet (ej. $50 compartido). Implicaciones:
+
+- El sizing del bot usa `self.capital` (lógico de `state.json`), no el balance
+  real → cada bot opera como si tuviera SOLO los $15 lógicos. Eso es correcto.
+- **PERO** si los 3 bots abren posición simultáneamente, los 3 márgenes
+  consumen del mismo wallet de $50 → puede que el 3er trade sea rechazado por
+  margen insuficiente. Sin pérdida, solo "insufficient margin error".
+- Con PA dispara ~1 setup cada 5-10 días por bot → probabilidad baja de 3
+  trades simultáneos en una semana.
+- **Pendiente para futuro**: refactor para que cada bot reserve un margen
+  proporcional (ej. via `setIsolatedMarginAccount` con asignación distinta
+  por símbolo), o que lea su capital del exchange en vez del state local.
+
+### Hallazgo 6: Solo 1 bot responde a `/status` en Telegram
+
+Los 3 bots comparten `TELEGRAM_CHAT_ID`. Cuando el cliente manda `/status`,
+**solo el bot más rápido responde** (el `TelegramListener` de cada uno toma
+el mensaje pero solo el primero gana la carrera). El cliente ve 1 sola
+respuesta de los 3 bots.
+
+**Workaround actual**: aceptar que `/status` te trae el estado de UN bot
+random. Para ver los otros, usar comandos en el VPS.
+
+**Pendiente para futuro**: agregar sufijo del símbolo a comandos
+(`/status:btc`, `/status:sol`, `/status:avax`) o cambiar el `TELEGRAM_CHAT_ID`
+de cada bot a chats distintos (más limpio pero molesto de monitorear).
 
 ---
 
