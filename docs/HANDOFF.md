@@ -1,4 +1,4 @@
-# HANDOFF — Estado del proyecto de trading bot al 2026-06-07
+# HANDOFF — Estado del proyecto de trading bot al 2026-06-09
 
 > Este documento es un brief técnico-operativo completo para que **otro LLM
 > colaborador** (Gemini u otro) se sume al proyecto con el mismo contexto
@@ -204,6 +204,8 @@ cliente priorizó calidad sobre frecuencia.
 | OOM kill silencioso (ExitCode=0) | Loop infinito de "¡Arranqué!" cada 30s en Telegram | Subir mem limit del container 384M → 512M | `4aacfa9` |
 | "BTC" hardcoded en Telegram | Los 4 bots reportaban "BTC $X" en panorama y arranque | `TelegramNotifier.base_asset = settings.symbol.split("/")[0]` | `7bf672e` |
 | Container reinicia con ExitCode=0 (no es crash) | Reinicia loop pese a unless-stopped | `restart: unless-stopped` reinicia INCLUSO con exit 0 (regla del flag) | Comprendido, no fixeable sin cambiar la política |
+| Cuenta Futures podía estar en Hedge mode (latente) | reduceOnly sin positionSide falla en Hedge → entry abriría SIN stop (posición desnuda) | `ensure_one_way_mode()` al startup: fuerza One-way + verifica con `fetch_position_mode`; ABORTA el arranque si queda en Hedge | `a298a48` (#3) |
+| Warning falso "no parece perpetuo" | `validate_connection` leía `markets[symbol]` (= market SPOT) | Usar `self.exchange.market(symbol)` (mapea al perpetuo `:USDT`) | `a298a48` (#3) |
 
 ---
 
@@ -271,6 +273,9 @@ distintos en TradingView, sin walk-forward). Ver `tradingview/README.md`.
 ## 7. Histórico de commits relevantes
 
 ```
+a298a48 futures: guard de One-way mode al startup + fix warning cosmético (#3)
+046ab6e docs: hallazgos del deploy real Fase 3 + cheatsheet móvil
+580e093 fase3: migración a Binance Futures USDT-M con leverage 7×
 629335b tradingview: port a Pine Script del PriceActionEngine (1h+4h)
 a2c1c98 docs: handoff completo del proyecto para otro LLM colaborador
 7bf672e fix(telegram): usar symbol del settings en lugar de 'BTC' hardcoded
@@ -454,13 +459,17 @@ Comparativo 5× vs 7× sobre 180d, mismos pares (BTC, SOL, AVAX, LINK):
 
 Detalle completo en `docs/BACKTESTS.md` sección "2026-06-08 — Fase 3".
 
-### Estado al 2026-06-08
+### Estado al 2026-06-09
 
-- Refactor de código completado (commit `XXX`).
-- Pendiente: deploy en VPS con `BINANCE_TESTNET=true` apuntando a
-  `testnet.binancefuture.com` para iniciar la validación de 7 días.
-- Pendiente: el cliente tiene que generar nuevas API keys de Futures
-  (las Spot no funcionan).
+- Refactor de código completado (commit `580e093`).
+- Binance **deprecó el testnet de Futures** (ver Hallazgo 1, §9c) → se pasó
+  directo a **mainnet REAL con capital mínimo de validación (~$50 USDT)**.
+- **Guard de One-way mode** agregado (commit `a298a48`, #3): el bot fuerza y
+  verifica One-way al arrancar (`ensure_one_way_mode`) y **ABORTA si la cuenta
+  está en Hedge** — porque las SL/TP usan `reduceOnly` sin `positionSide` y en
+  Hedge no protegerían (un entry abriría sin stop). Requisito operativo firme:
+  la cuenta Futures DEBE estar en One-way.
+- Fix cosmético del warning falso "no parece perpetuo" en `validate_connection`.
 
 ---
 
@@ -613,6 +622,8 @@ romper el edge (sabiendo que en Fase 1 se descartó el ScalpingEngine)?
 6. **Los logs de Telegram aún pueden tener bugs cosméticos** (mensajes de buy/sell, prices en otras funciones). El fix `7bf672e` cubrió los 4 más visibles pero conviene grep `"BTC"` en `notifications/` antes de tocar.
 
 7. **Si proponés un fix de algo no obvio, primero pedile al cliente que confirme el síntoma**. El cliente quiere honestidad intelectual, no soluciones a problemas inventados.
+
+8. **La cuenta Futures DEBE estar en One-way mode** (no Hedge). El bot lo fuerza y verifica al arrancar (`ensure_one_way_mode` en `core/exchange.py`) y ABORTA si está en Hedge. Las órdenes SL/TP usan `reduceOnly` SIN `positionSide`, que en Hedge no protegen. No agregar `positionSide` ni soporte Hedge sin rehacer toda la lógica de cierre + re-testear.
 
 ---
 
