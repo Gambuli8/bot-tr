@@ -34,8 +34,8 @@ atrSlMult = input.float(1.5, "SL = sweep ± N×ATR", step=0.1,        group="Est
 tpRR      = input.float(2.5, "TP = R:R 1:N", step=0.1,              group="Estrategia")  // pa_tp_rr
 slMinPct  = input.float(0.003, "SL mínimo (% del entry)", step=0.001, group="Filtros")  // pa_sl_min_pct
 slMaxPct  = input.float(0.05,  "SL máximo (% del entry)", step=0.001, group="Filtros")  // pa_sl_max_pct
-riskPct   = input.float(8.0, "Riesgo por trade (% equity)", step=0.5, group="Riesgo")    // MAX_RISK_PER_TRADE
-leverage  = input.float(5.0, "Leverage (cap de notional)", step=1,  group="Riesgo")
+riskPct   = input.float(5.0, "Riesgo por trade (% equity)", step=0.5, group="Riesgo")    // MAX_RISK_PER_TRADE (Fase 3)
+leverage  = input.float(7.0, "Leverage (cap de notional)", step=1,  group="Riesgo")     // LEVERAGE (Fase 3)
 
 // ───────── Estructura macro (4h) — vía request.security, sin repaint ─────────
 // Devuelve 1=BULL, -1=BEAR, 0=RANGE, replicando determine_structure():
