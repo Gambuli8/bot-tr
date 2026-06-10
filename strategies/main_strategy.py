@@ -14,6 +14,7 @@ from core.indicators import IndicatorEngine
 from core.claude_agent import ClaudeAgent
 from core.technical_engine import TechnicalEngine
 from core.scalping_engine import ScalpingEngine
+from core.pullback_scalp_engine import PullbackScalpEngine
 from core.price_action_engine import PriceActionEngine
 from execution.order_manager import OrderManager
 from notifications.telegram import TelegramNotifier
@@ -35,6 +36,9 @@ class MainStrategy:
         if engine_name == "scalping":
             self.agent = ScalpingEngine(settings)
             logger.info("⚡ Motor: SCALPING (BB squeeze + expansion, TF 5m)")
+        elif engine_name == "pullback":
+            self.agent = PullbackScalpEngine(settings)
+            logger.info("🎯 Motor: PULLBACK SCALP (trend-pullback maker-first, TF 5m)")
         elif engine_name == "price_action":
             self.agent = PriceActionEngine(settings)
             logger.info("📊 Motor: PRICE ACTION (1h trigger + 4h structure)")
@@ -327,8 +331,8 @@ class MainStrategy:
     def _call_engine(self, df, snapshot, trade_history, mtf):
         """Dispatcher por tipo de engine. Cada uno tiene su firma."""
         name = (self.engine_name or "").lower()
-        if name == "scalping":
-            # ScalpingEngine necesita df completo + índice de la última vela
+        if name in ("scalping", "pullback"):
+            # Ambos motores 5m: df completo + índice de la última vela cerrada.
             return self.agent.analyze(df, len(df) - 1)
         if name == "price_action":
             # PriceActionEngine necesita df_1h y df_4h. Si TF base = 1h, lo usamos

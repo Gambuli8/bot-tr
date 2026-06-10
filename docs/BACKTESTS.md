@@ -570,3 +570,62 @@ descartó porque:
 3. **Pendiente para próxima iteración**: reconciliación robusta de
    `fetch_positions` (hoy reconcilia solo vía órdenes — funciona pero
    no detecta liquidaciones inmediatamente).
+
+---
+
+## 2026-06-10 — Nuevo motor: PullbackScalpEngine (trend-pullback, fee-gated)
+
+### Motivación
+
+El cliente pidió un bot de scalping intradía "que no falle y que las comisiones
+no coman el profit". El `ScalpingEngine` v1 (BB-squeeze breakout) ya había sido
+descartado en Fase 1 por WFA (2/7 OS positivas, −17.74% OS, EV ≈ 0 con fees).
+
+En vez de re-tunear el mismo motor sin edge, se diseñó uno **estructuralmente
+distinto** que ataca cada falla documentada en la auditoría de v1:
+
+| Falla documentada de v1 (BB-squeeze) | Cómo lo ataca el pullback engine |
+|---|---|
+| Breakout sin edge direccional (~50% WR) | Sólo opera A FAVOR de tendencia (EMA fast/slow + ADX≥18) |
+| Breakout obliga a entrar taker (perseguir precio) | Entra en el pullback → fill Limit Post-Only = **maker** |
+| Vol muy baja (BTC ATR~0.15%) → fees comen TP | Gate de EV neto + piso TP≥6× fee + banda de ATR% |
+| EU AM (06-12 UTC) whipsaw | `skip_hours_utc` (mismo filtro de sesión) |
+| Spikes vol >4× revierten | Guard: rechaza vela de reclaim si vol > 4× MA |
+
+### Decisión de instrumento
+
+**BTC es de los peores activos para scalpear**: ATR% intradía bajo (~0.15%) →
+el fee fijo (% del notional) pesa demasiado. La comisión round-trip maker es
+~0.04%, así que un TP de 0.26% deja el fee en ~15% del bruto (límite del gate).
+Recomendación: **validar en SOL/USDT** (ATR% típicamente 2-3× BTC). Verificación
+numérica del gate de fee (mismos fees maker 0.02% / taker 0.05%, WR conservador
+55%):
+
+| Setup | ATR% | TP bruto | Gate |
+|---|---|---|---|
+| BTC-like | 0.15% | 0.26% | ❌ REJECT (fee = 15% del bruto) |
+| SOL-like | 0.45% | 0.79% | ✅ OK (EV neto +0.158%/trade, fee 5% del bruto) |
+| Vol baja | — | 0.10% | ❌ REJECT (fee = 40% del bruto) |
+
+→ El motor **rechaza por diseño** el setup que mató a v1, y sólo dispara cuando
+el movimiento supera holgadamente la comisión.
+
+### Estado: ⚠️ NO VALIDADO
+
+Implementado: `core/pullback_scalp_engine.py`, settings `pbs_*`, wiring opt-in
+en `main_strategy` (`ENGINE=pullback`, default sin cambiar), backtest
+`scripts/backtest_pullback.py`. El backtest real NO se pudo correr en el entorno
+de desarrollo (sin acceso de red a Binance/Kraken/Bybit/OKX). **Pasos obligatorios
+antes de cualquier dinero real, en el VPS:**
+
+```bash
+# 1) Backtest single-period en SOL (y AVAX)
+python scripts/backtest_pullback.py --symbol SOL/USDT --days 90
+python scripts/backtest_pullback.py --symbol AVAX/USDT --days 90
+
+# 2) Si PF neto > 1.3 y DD sano → WFA (adaptar audit_wfa.py al engine pullback)
+# 3) Sólo si pasa WFA (≥5/7 OS positivas) → paper en testnet → real
+```
+
+Mientras no pase WFA, este motor queda **al mismo nivel que v1: hipótesis, no
+producto**. La disciplina que mató a v1 antes de poner capital se mantiene.

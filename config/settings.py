@@ -105,6 +105,35 @@ class Settings(BaseModel):
     scalp_cooldown_bars: int = 3         # anti-ruido tras cierre
     scalp_max_fee_to_gain: float = 0.20  # rechazar señal si fees > 20% de la ganancia bruta
 
+    # ─── Pullback Scalp Engine (trend-pullback, maker-first, fee-gated, TF 5m) ───
+    # Reemplazo del ScalpingEngine v1 (BB-squeeze, descartado por WFA). Opera
+    # SÓLO a favor de tendencia, entra en el pullback (fill maker) y filtra por
+    # EV neto post-fee. NO VALIDADO: correr scripts/backtest_pullback.py + WFA
+    # antes de cualquier deploy real. Recomendado validar en SOL/USDT (más ATR%).
+    pbs_ema_fast: int = 21               # EMA imán del pullback
+    pbs_ema_slow: int = 200              # EMA filtro de tendencia macro (5m)
+    pbs_adx_window: int = 14
+    pbs_adx_min: float = 18.0            # ADX mínimo: exige tendencia real
+    pbs_rsi_window: int = 14
+    pbs_rsi_pullback_long: float = 45.0  # RSI debe caer ≤ esto en el pullback (long)
+    pbs_rsi_pullback_short: float = 55.0
+    pbs_pullback_lookback: int = 6       # velas donde buscamos el pullback
+    pbs_touch_atr_tol: float = 0.5       # tolerancia del "toque" a la EMA (× ATR%)
+    pbs_atr_window: int = 14
+    pbs_atr_min_pct: float = 0.0012      # piso de volatilidad (debajo, fees comen TP)
+    pbs_atr_max_pct: float = 0.0060      # techo de volatilidad (arriba, SL random)
+    pbs_vol_window: int = 20
+    pbs_vol_spike_max: float = 4.0       # rechazar reclaim si vol > N× (ruido)
+    pbs_sl_atr_mult: float = 1.1         # SL = entry ∓ N × ATR
+    pbs_tp_rr: float = 1.6               # TP = N × riesgo
+    pbs_sl_min_pct: float = 0.0015
+    pbs_sl_max_pct: float = 0.02
+    pbs_cooldown_bars: int = 3
+    pbs_max_fee_to_gain: float = 0.15    # fee round-trip ≤ 15% del bruto esperado
+    pbs_fee_floor_mult: float = 6.0      # TP bruto ≥ 6× fee round-trip
+    pbs_assumed_winrate: float = 0.55    # WR conservador para el gate de EV
+    pbs_min_net_ev_pct: float = 0.0      # EV neto post-fee debe ser > 0
+
     # ─── Binance Futures USDT-M (Fase 3, 2026-06-08) ───
     # Leverage para todas las posiciones del bot. Aprobado por WFA con valor 7×
     # (BTC/SOL/AVAX todos ✅ con PF mediano 1.18-1.68 y OS retorno +12-19% en 180d).
@@ -135,7 +164,8 @@ class Settings(BaseModel):
     active_hours_utc: str = ""
     # Cantidad máxima de posiciones abiertas en simultáneo.
     max_concurrent_trades: int = 2
-    # Motor activo: "scalping" (5m BB squeeze) | "price_action" (1h sweeps) | "technical" | "claude"
+    # Motor activo: "pullback" (5m trend-pullback, fee-gated) | "scalping" (5m BB
+    # squeeze, descartado por WFA) | "price_action" (1h sweeps) | "technical" | "claude"
     engine: str = "scalping"
     # Kelly fraccionado: tamaño dinámico de posición según edge reciente.
     use_kelly_sizing: bool = False
