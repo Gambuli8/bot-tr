@@ -722,3 +722,36 @@ Antes de construir infraestructura forex hay que encontrar una estrategia que
 sobreviva regímenes choppy, o aceptar que forex (al menos con este motor) no es
 el camino. Pendiente de decisión del usuario: profundizar AUDUSD, probar otra
 familia de estrategias, o frenar el proyecto forex.
+
+---
+
+## 2026-06-11 — Estrategia "pullback EMA50 + Fib 0.618" de Alex Ruiz (TradingLab) → ❌
+
+> El usuario pidió testear si la estrategia del curso de Alex Ruiz es positiva.
+> Se mecanizaron sus reglas públicas y se corrieron con el mismo estándar.
+> Script: `scripts/backtest_ruiz.py`.
+
+### Reglas mecanizadas (fieles a la descripción del curso)
+- Tendencia 4H: precio vs EMA50(4H) + pendiente.
+- Zona 1H: última pierna swing (fractal), retroceso de Fibonacci ~0.618
+  (banda 0.50-0.705), confluencia opcional con EMA50(1H).
+- Gatillo 5m: cruce de EMA9(5m) a favor de la tendencia dentro de la zona.
+- Stop: nivel 0.75 de Fib (lo documentado) — también probado stop estructural.
+- TP: R:R fijo (1.6 documentado; también 1.0 y 2.0).
+
+### Resultado (EURUSD 2019 — un año FAVORABLE para nuestros otros motores)
+Versión fiel (stop 0.75 Fib, RR 1.6): **SIN costos −38% (PF 0.65, WR 36%)**;
+con costos −76%. El curso reporta WR 56%: obtuvimos **36%**.
+
+Se exploraron 10 variantes (stop Fib vs estructural, RR 1.0/1.6/2.0, filtro de
+confluencia EMA, zona más estrecha). La MEJOR fue swing-stop RR1.6:
+**sin costos +6.2% (PF 1.07)** — apenas sobre breakeven en bruto — y **con costos
+−10% (PF 0.89)**. Ninguna variante sobrevive costos.
+
+### Veredicto: ❌ sin edge mecánico.
+- WR real 36% vs 56% prometido: la diferencia es **discrecionalidad** (selección
+  de setups limpios, evitar noticias, contexto) — no se puede mecanizar.
+- Aun en un año favorable y tras explorar el espacio de parámetros, el mejor caso
+  bruto es PF 1.07 → lo come el spread+comisión. No se justifica correr OOS.
+- **Lección (3ra vez):** un scalp discrecional de 56% WR operado por un humano
+  hábil **no es** un bot rentable. El edge vive en el trader, no en las reglas.
