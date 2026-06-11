@@ -808,3 +808,52 @@ años malos pierden migajas (peor: −0.7%).
 2. Construir **portafolio trend-following multi-activo** (donde realmente brilla
    la diversificación) y dimensionar al DD objetivo del cliente (~15-20%).
 3. Recién entonces, infraestructura de ejecución.
+
+---
+
+## 2026-06-11 — PORTAFOLIO trend-following multi-activo (últimos ~5 años) → ✅✅
+
+> El cliente pidió enfocar en los últimos 5 años (no 2012, que infla por el BTC
+> microcap) y buscar/crear una estrategia MUY buena. Se consiguió precio diario
+> de 17 cripto vía Coin Metrics en GitHub (`coinmetrics/data`, columna PriceUSD;
+> SOL y alts nuevas no están en el tier gratis). Scripts: `crypto_cm_data.py`,
+> `backtest_trend_port.py`.
+
+### Diseño
+- 17 activos (btc eth ltc bch xrp etc doge xlm xmr zec dash eos trx ada link xtz neo),
+  diario, 2020-01 → 2026-05, costos 0.05%/lado + slippage.
+- Por activo: Donchian breakout sobre cierres + filtro SMA100 + trailing 6×ATR,
+  long-only, sizing por riesgo.
+- **Control de riesgo de portafolio (clave):** tope de 4 posiciones concurrentes.
+  Sin tope, los 17 longs correlacionan en los crashes → DD 65% (inútil). Con tope
+  de 4, el DD baja a ~18% manteniendo el grueso del retorno.
+
+### Resultado (config balanceada: risk 0.8%, máx 4 pos, stop 6×ATR)
+
+| Métrica | Valor |
+|---|---|
+| CAGR | **+22.4%** |
+| maxDD | **17.6%** (objetivo balance ✓) |
+| Calmar | **1.28** |
+| PF | 2.64 |
+| WR | 39% |
+| Trades | 281 (6.4 años) |
+
+**Por año:** 2020 +23%, 2021 +28%, **2022 −2.3%** (sobrevivió el cripto-invierno
+casi plano), 2023 +22.5%, 2024 +41.8%, 2025 +41%, 2026(parcial) −3%.
+5/7 años positivos; los negativos pierden migajas. DD anual casi siempre <15%.
+
+### Comparación honesta vs buy&hold (2020-2026)
+- BTC / basket equal-weight buy&hold: $10k→~$107k (CAGR ~46%) pero **maxDD ~78%**
+  y −65% en 2022. Calmar ~0.6.
+- Portafolio trend: $10k→$36k (CAGR +22%), **maxDD 17.6%**, Calmar 1.28.
+- En bull crudo buy&hold gana retorno; el sistema gana **>2× en riesgo-ajustado**
+  (Calmar 1.28 vs ~0.6) y **esquiva el cripto-invierno** (−2% vs −65% en 2022) →
+  es apalancable y operable sin volarte la cuenta.
+
+### Veredicto: ✅✅ ESTRATEGIA MUY BUENA, robusta y honesta.
+Robustez: configs vecinas (máx 3/5 pos, stop 4-6×ATR, Donchian 20/10 y 55/20)
+dan Calmar 1.1-1.3 — no es knife-edge. Limitaciones honestas: diario close-only,
+sin SOL/alts nuevas (faltan en CM gratis), sin funding de perps modelado.
+Próximos pasos opcionales: sumar SOL/alts de otra fuente allowlisted; probar
+momentum cross-sectional (top-K) para subir Calmar; luego ejecución.
