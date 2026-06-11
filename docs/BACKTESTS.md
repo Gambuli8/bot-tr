@@ -854,6 +854,28 @@ casi plano), 2023 +22.5%, 2024 +41.8%, 2025 +41%, 2026(parcial) −3%.
 ### Veredicto: ✅✅ ESTRATEGIA MUY BUENA, robusta y honesta.
 Robustez: configs vecinas (máx 3/5 pos, stop 4-6×ATR, Donchian 20/10 y 55/20)
 dan Calmar 1.1-1.3 — no es knife-edge. Limitaciones honestas: diario close-only,
-sin SOL/alts nuevas (faltan en CM gratis), sin funding de perps modelado.
-Próximos pasos opcionales: sumar SOL/alts de otra fuente allowlisted; probar
-momentum cross-sectional (top-K) para subir Calmar; luego ejecución.
+sin funding de perps modelado.
+
+### Update — sumar SOL (OHLC real 2021-2024, repo NI3singh en GitHub)
+Se agregó SOL al basket (18 activos). SOL fue trender fuerte 2021-2024 → mejora
+clara:
+
+| | 17 activos | **18 (con SOL)** |
+|---|---|---|
+| CAGR | +22.4% | **+26.8%** |
+| maxDD | 17.6% | 17.6% |
+| Calmar | 1.28 | **1.53** |
+| PF | 2.64 | **2.90** |
+
+Por año (18): 2020 +23%, 2021 +35%, **2022 −2.3%**, 2023 +46%, 2024 +39%,
+2025 +41%, 2026(parc) −3%. Confirma que sumar trenders fuertes sube el Calmar.
+Limitación: el dataset de SOL termina 2024-09 (de 2024-09 en adelante corre con
+17). AVAX/DOT/MATIC/BNB no están disponibles consistentes/actuales en fuentes
+GitHub allowlisted (Binance/CDD/CoinGecko bloqueados).
+Fix de robustez en el motor: cierre forzado de posiciones cuando los datos de un
+activo terminan (evita NaN en el mark-to-market).
+
+### Próximos pasos opcionales
+- Momentum cross-sectional (top-K) para subir Calmar.
+- Más alts nuevas si aparece fuente allowlisted consistente.
+- Infraestructura de ejecución del portafolio.

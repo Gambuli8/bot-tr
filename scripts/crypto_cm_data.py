@@ -21,9 +21,33 @@ CACHE = Path("/tmp/cryptocache/cm")
 CACHE.mkdir(parents=True, exist_ok=True)
 BASE = "https://raw.githubusercontent.com/coinmetrics/data/master/csv/"
 
+# Activos que NO están en el tier gratis de Coin Metrics (SOL y alts nuevas):
+# se traen de datasets OHLC en GitHub (allowlisted). Se usa la columna Close.
+ALT_SOURCES = {
+    "sol": ("https://raw.githubusercontent.com/NI3singh/Solana-Data-Analysis/"
+            "main/Solana_Price_data.csv", "time", "Close"),
+}
+
+
+def _load_alt(asset, start):
+    url, tcol, pcol = ALT_SOURCES[asset]
+    csv = CACHE / f"alt_{asset}.csv"
+    if not csv.exists():
+        print(f"[cm] bajando alt {asset} ...", flush=True)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        csv.write_bytes(urllib.request.urlopen(req, timeout=60).read())
+    df = pd.read_csv(csv)
+    df[tcol] = pd.to_datetime(df[tcol])
+    s = df.set_index(tcol)[pcol].dropna()
+    s = s[s.index >= pd.Timestamp(start)]
+    s.name = asset
+    return s
+
 
 def load_close(asset: str, start="2020-01-01", use_cache=True) -> pd.Series:
     a = asset.lower()
+    if a in ALT_SOURCES:
+        return _load_alt(a, start)
     csv = CACHE / f"{a}.csv"
     if not (use_cache and csv.exists()):
         url = BASE + f"{a}.csv"

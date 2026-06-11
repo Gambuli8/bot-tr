@@ -60,8 +60,16 @@ def run_portfolio(prices: pd.DataFrame, *, n=20, exit_n=10, trend_len=100,
         # marcar a mercado
         unreal = 0.0
         gross = 0.0
-        for a, p in pos.items():
+        for a, p in list(pos.items()):
             px = prices[a].iloc[di]
+            if np.isnan(px):
+                # datos del activo terminaron: cerrar al último precio conocido
+                exit_px = p["mark"]
+                pnl = p["units"] * (exit_px - p["entry"]) * p["side"] \
+                    - fee_side * p["units"] * (p["entry"] + exit_px)
+                cash += pnl; trades.append((pnl, pnl > 0)); del pos[a]
+                continue
+            p["mark"] = px
             unreal += p["units"] * p["side"] * (px - p["entry"])
             gross += p["units"] * px
         equity = cash + unreal
@@ -112,7 +120,8 @@ def run_portfolio(prices: pd.DataFrame, *, n=20, exit_n=10, trend_len=100,
                         cap_notional = max_notional_mult / max(len(assets), 1) * equity
                         if units * entry > cap_notional:
                             units = cap_notional / entry
-                        pos[a] = dict(units=units, side=side, entry=entry, stop=stop)
+                        pos[a] = dict(units=units, side=side, entry=entry,
+                                      stop=stop, mark=entry)
 
     # cerrar lo abierto al final
     for a, p in list(pos.items()):
