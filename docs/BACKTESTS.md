@@ -570,3 +570,155 @@ descartó porque:
 3. **Pendiente para próxima iteración**: reconciliación robusta de
    `fetch_positions` (hoy reconcilia solo vía órdenes — funciona pero
    no detecta liquidaciones inmediatamente).
+
+---
+
+## 2026-06-10 — FOREX TAREA 1: portar el PriceActionEngine a EUR/USD
+
+> Proyecto SEPARADO del bot de cripto. Objetivo: validar antes de construir
+> infraestructura. Hipótesis: el motor de liquidity sweep A FAVOR de la
+> estructura HTF (validado en cripto por WFA) también tendría edge en forex
+> porque opera CON la tendencia — al revés del fade del rango asiático
+> (descartado: PF neto 0.86 en 2019, 0.53 en 2022).
+
+### Setup
+
+- **Datos**: ticks reales de Dukascopy vía GitHub (FX-Data/FX-Data-EURUSD-DS,
+  branches `EURUSD-2019` full year y `EURUSD-2022` ene-jul). Agregados a velas
+  5m sobre MID, con spread real medio por vela. Loader: `scripts/fx_data.py`.
+- **Motor**: `core/price_action_engine_fx.py` — port standalone del de cripto
+  (NO modifica `core/price_action_engine.py`). Misma lógica de fractal Williams
+  + estructura HH/HL + sweep a favor; cambia: pip_size, bounds de SL en PIPS,
+  ATR a mano (la lib `ta` no compila), "volumen" = tick-count por vela.
+- **Costos retail** (`scripts/backtest_pa_forex.py`): spread efectivo =
+  max(spread_real, 0.8 pip) + comisión 0.6 pip RT + swap 0.3 pip/noche.
+- TF gatillo 1h, contexto 4h. Riesgo 1%/trade. Config default = la de cripto
+  (vm1.5 / atr1.5 / rr2.5 / fractal3).
+
+### Backtest plano (single) — config default cripto
+
+| Año | n | WR | PF bruto | **PF neto** | Retorno neto | Max DD | trades/mes |
+|---|---|---|---|---|---|---|---|
+| 2019 (lateral) | 50 | 42% | 1.74 | **1.54** | **+19.97%** | 9.5% | 4.1 |
+| 2022 (tendencial, ene-jul) | 20 | 50% | 2.44 | **2.25** | **+14.44%** | 3.2% | 3.2 |
+
+✅ **A diferencia del fade asiático, AMBOS años son netos positivos.** El motor
+opera a favor de la tendencia → 2022 (bear fuerte de EUR/USD) es su MEJOR año,
+exactamente donde el fade se hundía. Los costos se llevan ~5pp en 2019 y ~1pp
+en 2022, pero no destruyen el edge (pocos trades, SL grandes vs el fade que
+sobre-operaba con SL diminuto).
+
+### Walk-Forward con grid optimization (rolling IS=90d/OS=45d, 2019)
+
+`scripts/wfa_pa_forex.py --mode rolling` — grid de 4 configs, mejor IS por PF neto:
+
+- OS positivas: **4/6 (67%)**  •  OS retorno total: **−1.96%**  •  PF neto mediano 1.22
+- ❌ **NO PASA**. La config "selectiva" (vm2.0/rr3.0) gana IS con PF inflado en
+  muestras chicas (n=5-8) y se degrada en OS (ventana 1: IS PF 4.11 → OS PF 0.17).
+
+### Holdout (tunea 2019 → testea 2022 OOS puro)
+
+`--mode holdout` — grid elige por PF neto sobre 2019 completo, config bloqueada al test:
+
+- Grid eligió la agresiva vm1.2/rr2.0 (train 2019: **+47.27%** PFnet 1.95 WR 54%).
+- OOS 2022: **−4.15%**, PFnet 0.85, WR colapsa a 32%.
+- ❌ **La optimización de parámetros sobre-ajusta y no generaliza.**
+
+### Walk-forward con CONFIG FIJA (sin optimizar) — el test que desambigua
+
+Misma config default cripto, aplicada a ventanas contiguas de 45d:
+
+| Año | Ventanas OS positivas | Suma retornos |
+|---|---|---|
+| 2019 | **6/8** | +21.77% |
+| 2022 | **3/4** | +4.35% |
+| **Total** | **9/12 (75%)** | ambos años positivos |
+
+### Veredicto honesto
+
+🟡 **PROMETEDOR pero NO VALIDADO todavía. NO desplegar capital aún.**
+
+- **Lo bueno**: con la config heredada de cripto (CERO ajuste a forex), el edge
+  es positivo en 9/12 sub-períodos, en año lateral Y tendencial, neto de costos.
+  Esto es genuino — es lo contrario del ScalpingEngine (sin edge ni en bruto) y
+  del fade asiático (muere con costos). El edge crudo existe.
+- **Lo malo / por qué NO valida aún**:
+  1. **No sobrevive optimización de parámetros** (rolling WFA −1.96%, holdout
+     −4.15%). Hay que LOCKEAR los params default, nunca optimizar por ventana.
+  2. **Solo 2 años de datos** (uno parcial). Faltan 2020 (COVID), 2021, 2023,
+     2024 como OOS verdadero. No se puede declarar "WFA-validado" con esto —
+     el portafolio de cripto pasó con 180d × múltiples activos.
+  3. n bajo por ventana (4-9 trades) → PF por ventana ruidoso.
+
+### Próximos pasos para validar (antes de construir el bot)
+
+- [ ] Bajar y testear 2020, 2021, 2023, 2024 con la config FIJA (OOS real).
+- [ ] Probar otros pares (GBP/USD, USD/JPY — repos hermanos FX-Data-*-DS).
+- [ ] Si 4+ años son consistentemente positivos con params fijos → recién ahí
+      armar el bot forex dedicado (broker forex, sizing en lots/pips, swap,
+      sesiones first-class), reusando ~80% del bot de cripto.
+
+---
+
+## 2026-06-10 — FOREX: validación amplia multi-par / multi-año → ❌ RECHAZADO
+
+> Ampliación de la TAREA 1 ante el pedido de "mejor profit posible / mejores
+> pares". Se descargaron 7 majors × años disponibles de Dukascopy (vía GitHub)
+> y se corrió el motor con CONFIG FIJA (sin optimizar), costos reales, midiendo
+> consistencia por año y por ventanas walk-forward de 45d.
+> Scripts: `scripts/sweep_pairs_forex.py`, `scripts/fetch_clean.py`.
+
+### EURUSD a través de 7 años (2016-2022), 1h/4h, config fija, costos reales
+
+| Año | Retorno | PFnet | DD | Régimen |
+|---|---|---|---|---|
+| 2016 | +5.09% | 1.18 | 5.2% | mixto |
+| 2017 | **−14.34%** | 0.60 | 19.2% | grind alcista baja-vol |
+| 2018 | −2.30% | 0.91 | 8.0% | choppy |
+| 2019 | +19.97% | 1.54 | 9.5% | lateral |
+| 2020 | +25.46% | 1.76 | 7.1% | COVID / tendencial |
+| 2021 | **−14.20%** | 0.64 | 17.5% | choppy baja-vol |
+| 2022 (parcial) | +14.44% | 2.25 | 3.2% | tendencial bear |
+
+**4/7 años positivos, suma ~+34% en ~6.5 años (~+5%/año) con swings de −14% a
++25%.** El "edge" que vimos en la TAREA 1 (2019+2022) era **suerte de régimen**:
+al sumar 2017, 2018 y 2021 aparecen tres años claramente perdedores.
+
+### Ranking 7 majors — años comunes 2016-2018 (2018 parcial en no-EURUSD)
+
+| Par | ret medio/año | años+ | WF 45d + | PF med | DD máx |
+|---|---|---|---|---|---|
+| AUDUSD | +6.42% | 2/3 | 10/19 (53%) | 1.38 | 9.9% |
+| NZDUSD | −1.91% | 2/3 | 10/19 (53%) | 1.20 | 19.8% |
+| GBPUSD | +0.32% | 2/3 | 8/19 (42%) | 1.16 | 13.5% |
+| USDCAD | −2.43% | 1/3 | 7/19 (37%) | 0.87 | 9.5% |
+| EURUSD | −3.85% | 1/3 | 8/24 (33%) | 0.91 | 19.2% |
+| USDCHF | **−12.10%** | 0/3 | 4/19 (21%) | 0.72 | 21.4% |
+| USDJPY | — | — | — | — | (bug pip JPY: 0 trades, no resuelto) |
+
+### Veredicto: ❌ NO HAY EDGE ROBUSTO. NO construir el bot forex.
+
+- En 2016-2018, **solo AUDUSD es convincentemente positivo**; EURUSD net negativo,
+  USDCHF desastroso. El resto, marginal/plano.
+- El motor funciona en regímenes **tendenciales/limpios** (2019/2020/2022 EURUSD,
+  2017 AUD) y **pierde en regímenes choppy/baja-vol** (2016-2018 y 2021 EURUSD,
+  USDCHF). WR típico 20-35% con RR 2.5 (breakeven ~28.6%) → muchos años bajo
+  breakeven incluso en BRUTO. No es problema de costos: es calidad de señal.
+- El portafolio NO rescata: casi todos los pares comparten la misma debilidad
+  (solo AUD se despega, y 3 años con 2018 parcial es muestra insuficiente).
+- **Mismo patrón que el ScalpingEngine**: lindo en backtests elegidos, falla en
+  OOS amplio. Honramos la metodología y lo rechazamos.
+
+### Único hilo con vida (débil): AUDUSD
+
+AUDUSD es el menos malo (+6.4%/año, PF 1.38, DD máx 9.9%, 53% ventanas WF+).
+NO alcanza para producción con 3 años (uno parcial), pero sería el candidato si
+se quisiera profundizar (más años 2007-2015, otra lógica de entrada).
+
+### Conclusión estratégica
+
+El liquidity-sweep-a-favor-de-tendencia **no es un edge all-weather en forex**.
+Antes de construir infraestructura forex hay que encontrar una estrategia que
+sobreviva regímenes choppy, o aceptar que forex (al menos con este motor) no es
+el camino. Pendiente de decisión del usuario: profundizar AUDUSD, probar otra
+familia de estrategias, o frenar el proyecto forex.
