@@ -755,3 +755,56 @@ confluencia EMA, zona más estrecha). La MEJOR fue swing-stop RR1.6:
   bruto es PF 1.07 → lo come el spread+comisión. No se justifica correr OOS.
 - **Lección (3ra vez):** un scalp discrecional de 56% WR operado por un humano
   hábil **no es** un bot rentable. El edge vive en el trader, no en las reglas.
+
+---
+
+## 2026-06-11 — TREND-FOLLOWING en cripto (Donchian breakout) → ✅ EDGE ROBUSTO
+
+> Tras 3 estrategias de scalp/sweep sin edge robusto, se pivotea a la hipótesis
+> correcta: el dinero está en CAPTURAR las tendencias fuertes de cripto, no en
+> scalpear. Se consiguió histórico BTC/USD 1-min 2012-2025 (Bitstamp vía GitHub,
+> `ff137/bitstamp-btcusd-minute-data`; Binance está bloqueado por el allowlist).
+> Scripts: `scripts/crypto_data.py`, `scripts/backtest_trend.py`.
+
+### Reglas (pocas y fijas, sin optimizar por período)
+- Entrada: ruptura de canal Donchian de N velas (+ filtro SMA de tendencia).
+- Salida: canal opuesto de M velas O trailing stop k×ATR (lo que toque primero).
+- Sizing por riesgo (perder el stop = risk% capital). Costos 0.05%/lado + slip.
+
+### BTC diario, 12.7 años, costos reales — robustez (risk 1%)
+
+| Config | ret total | CAGR | PF | maxDD |
+|---|---|---|---|---|
+| Donchian 10/5 | +73% | +4.4% | 1.74 | 6.0% |
+| Donchian 20/10 | +86% | +5.0% | 2.12 | 4.4% |
+| Donchian 30/15 | +74% | +4.4% | 2.00 | 7.1% |
+| Donchian 55/20 (Turtle) | +71% | +4.3% | 2.35 | 5.2% |
+| **20/10 LONG-ONLY** | **+91%** | +5.2% | **2.87** | 4.0% |
+| 55/20 long-only | +75% | +4.5% | 3.30 | 2.9% |
+
+**TODAS las variantes positivas** → no es knife-edge. Long-only > long+short
+(los shorts pelean la tendencia alcista estructural). 10/13 años positivos; los
+años malos pierden migajas (peor: −0.7%).
+
+### Escalado de riesgo (long-only 20/10 stop 3×ATR)
+
+| risk/trade | CAGR | maxDD |
+|---|---|---|
+| 1% | +5.2% | 4.0% |
+| 3% | +15.5% | 11.6% |
+| **5%** | **+25.7%** | **18.7%** ← objetivo "Balance" |
+| 7% | +35.7% | 25.3% |
+
+### Comparación honesta vs buy&hold
+- Buy&hold BTC 2012-2025: CAGR **+115%** pero **maxDD 84%** ($10k→$211M).
+- Trend-following (risk 5%): CAGR +26%, maxDD 19% ($10k→$184k).
+- En BTC pelado (hiper-bull 20.000x) buy&hold gana en bruto; nada le gana a
+  aguantar eso. El valor del sistema: **DD operable (19% vs 84%) → apalancable**,
+  y un **método robusto que generaliza** a activos que NO hacen 20.000x (SOL,
+  ETH, alts, otros mercados) donde buy&hold fracasa.
+
+### Veredicto: ✅ primer edge robusto del repo. Próximo paso:
+1. Conseguir histórico SOL/ETH (y quizá índices) en fuente allowlisted.
+2. Construir **portafolio trend-following multi-activo** (donde realmente brilla
+   la diversificación) y dimensionar al DD objetivo del cliente (~15-20%).
+3. Recién entonces, infraestructura de ejecución.
