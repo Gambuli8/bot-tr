@@ -90,6 +90,10 @@ class Settings(BaseModel):
     pa_tp_rr: float = 2.5              # TP en múltiplo del riesgo
     pa_sl_min_pct: float = 0.003       # SL mínimo en % del entry (filtro ruido)
     pa_sl_max_pct: float = 0.05        # SL máximo en % del entry (filtro extremos)
+    # Gatillo del PA engine: "sweep" (liquidity sweep + volumen, default y validado)
+    # | "choch" (Change of Character: quiebre de estructura menor estilo webinar).
+    pa_trigger_mode: str = "sweep"
+    pa_choch_require_vol: bool = False  # si choch: exigir también volumen > pa_vol_mult
 
     # ─── Scalping Engine (BB squeeze + expansion, TF 5m) ───
     scalp_bb_window: int = 20
@@ -189,4 +193,6 @@ def load_settings() -> Settings:
         scalp_skip_hours_utc=os.getenv("SCALP_SKIP_HOURS_UTC", ""),
         leverage=int(os.getenv("LEVERAGE", "7")),
         margin_mode=os.getenv("MARGIN_MODE", "isolated").lower(),
+        pa_trigger_mode=os.getenv("PA_TRIGGER_MODE", "sweep").lower(),
+        pa_choch_require_vol=os.getenv("PA_CHOCH_REQUIRE_VOL", "false").lower() == "true",
     )

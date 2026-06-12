@@ -174,6 +174,32 @@ El bot NO manda diagnóstico por cada ciclo. Recibís push solo cuando:
 ./venv/Scripts/python.exe -m pytest tests/ -v
 ```
 
+## Price Action Engine — gatillos (sweep vs CHoCH)
+
+El `PriceActionEngine` (TF 1h + estructura 4h) soporta dos gatillos, seleccionables
+con `PA_TRIGGER_MODE` (o `--trigger` en el backtest):
+
+| Gatillo | Idea | SL basado en |
+|---|---|---|
+| `sweep` (default) | Liquidity sweep: barre un swing previo (caza stops) y la vela cierra del lado correcto, con volumen > 1.5× MA(20). | Mecha del sweep ± ATR×1.5 |
+| `choch` | **Change of Character**: durante un pullback se forma un Lower High (LONG) / Higher Low (SHORT); el quiebre por cierre de ese nivel confirma reanudación a favor del 4h. Estilo "webinar filtrado" (Alex Ruiz / TradingLab). | Low/high protector de la corrección ± ATR×1.5 |
+
+Ambos comparten estructura macro (4h), sizing de SL/TP por ATR, bounds de SL y R:R.
+`choch` admite además `PA_CHOCH_REQUIRE_VOL=true` para exigir volumen en la vela del quiebre.
+
+**Estado:** `sweep` es el validado. `choch` está implementado y testeado a nivel unitario
+(`tests/test_choch.py`), pero **falta validarlo en backtest comparativo** antes de prod:
+
+```bash
+# Comparar ambos gatillos sobre 30 días (1h trigger + 4h structure)
+python scripts/backtest_price_action.py --days 30 --trigger sweep
+python scripts/backtest_price_action.py --days 30 --trigger choch
+python scripts/backtest_price_action.py --days 30 --trigger choch --choch-vol
+```
+
+Regla de oro (igual que el resto): sólo activar `PA_TRIGGER_MODE=choch` en prod si
+mejora PF/DD vs `sweep`. Anotar el resultado en BACKTESTS.md.
+
 ## Pendientes / próximos pasos
 
 Prioridad estimada por impacto/esfuerzo:

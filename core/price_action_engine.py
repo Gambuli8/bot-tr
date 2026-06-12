@@ -196,6 +196,108 @@ def detect_liquidity_sweep(
 
 
 # ─────────────────────────────────────────
+#  CHoCH (Change of Character) detector
+# ─────────────────────────────────────────
+
+@dataclass
+class ChochSignal:
+    """
+    Gatillo estilo "webinar filtrado": en vez de cazar liquidez, esperamos un
+    quiebre de estructura menor *a favor* de la macro (4h).
+
+    LONG (4h BULL): durante un pullback el precio forma un Lower High. El CHoCH
+    alcista ocurre cuando una vela CIERRA por encima de ese último Lower High,
+    rompiendo la estructura correctiva bajista → reanudación alcista.
+    SHORT (4h BEAR): simétrico, ruptura por debajo del último Higher Low.
+    """
+    direction: Direction
+    broken_level: float        # el swing roto (el CHoCH propiamente dicho)
+    protective_level: float    # swing low (LONG) / high (SHORT) de la corrección → base del SL
+    candle_close: float
+    candle_volume_ratio: float
+
+
+def detect_choch(
+    df_1h_so_far: pd.DataFrame,
+    swings_1h: list[Swing],
+    structure_4h: Structure,
+    vol_mult: float = 1.5,
+    vol_window: int = 20,
+    require_vol: bool = False,
+) -> Optional[ChochSignal]:
+    """
+    Examina la ÚLTIMA vela cerrada. Sólo dispara a favor de la estructura macro.
+    La señal es "fresca": exige que la vela ANTERIOR todavía no hubiera roto el
+    nivel (evita re-disparar en cada vela posterior a la ruptura).
+
+    LONG (BULL):
+        - Último swing high = Lower High respecto del swing high previo (corrección).
+        - Existe un swing low de la corrección posterior a ese swing high previo.
+        - La vela actual cierra por encima del Lower High; la anterior no.
+        - Volumen ≥ vol_mult × MA(volumen) sólo si require_vol.
+    SHORT (BEAR): simétrico (Higher Low roto por abajo).
+    """
+    if structure_4h not in ("BULL", "BEAR"):
+        return None
+    if len(df_1h_so_far) < vol_window + 5:
+        return None
+
+    last = df_1h_so_far.iloc[-1]
+    prev = df_1h_so_far.iloc[-2]
+    last_ts = df_1h_so_far.index[-1]
+
+    vol_ma = df_1h_so_far["volume"].iloc[-(vol_window + 1):-1].mean()
+    if vol_ma <= 0:
+        return None
+    vol_ratio = float(last["volume"]) / float(vol_ma)
+    if require_vol and vol_ratio < vol_mult:
+        return None
+
+    highs = [s for s in swings_1h if s.kind == "high" and s.ts < last_ts]
+    lows = [s for s in swings_1h if s.kind == "low" and s.ts < last_ts]
+    if len(highs) < 2 or len(lows) < 2:
+        return None
+
+    if structure_4h == "BULL":
+        last_sh, prev_sh = highs[-1], highs[-2]
+        last_sl = lows[-1]
+        # Corrección: último swing high es un Lower High
+        if not (last_sh.price < prev_sh.price):
+            return None
+        # El low protector debe ser el piso de la corrección (posterior al high previo)
+        if last_sl.ts < prev_sh.ts:
+            return None
+        # Ruptura fresca por cierre
+        if float(last["close"]) > last_sh.price and float(prev["close"]) <= last_sh.price:
+            return ChochSignal(
+                direction="LONG",
+                broken_level=last_sh.price,
+                protective_level=last_sl.price,
+                candle_close=float(last["close"]),
+                candle_volume_ratio=vol_ratio,
+            )
+        return None
+
+    # BEAR
+    last_sl, prev_sl = lows[-1], lows[-2]
+    last_sh = highs[-1]
+    # Corrección alcista: último swing low es un Higher Low
+    if not (last_sl.price > prev_sl.price):
+        return None
+    if last_sh.ts < prev_sl.ts:
+        return None
+    if float(last["close"]) < last_sl.price and float(prev["close"]) >= last_sl.price:
+        return ChochSignal(
+            direction="SHORT",
+            broken_level=last_sl.price,
+            protective_level=last_sh.price,
+            candle_close=float(last["close"]),
+            candle_volume_ratio=vol_ratio,
+        )
+    return None
+
+
+# ─────────────────────────────────────────
 #  ATR helper (1h)
 # ─────────────────────────────────────────
 
@@ -235,7 +337,14 @@ class PriceActionEngine:
         self.tp_rr: float = getattr(settings, "pa_tp_rr", 2.5)
         self.sl_min_pct: float = getattr(settings, "pa_sl_min_pct", 0.003)
         self.sl_max_pct: float = getattr(settings, "pa_sl_max_pct", 0.05)
-        logger.info("PriceActionEngine inicializado (1h trigger + 4h structure)")
+        # Gatillo: "sweep" (liquidity sweep + volumen, default) | "choch" (quiebre
+        # de estructura menor estilo webinar filtrado). choch_require_vol exige
+        # además confirmación de volumen en la vela del quiebre.
+        self.trigger_mode: str = getattr(settings, "pa_trigger_mode", "sweep")
+        self.choch_require_vol: bool = getattr(settings, "pa_choch_require_vol", False)
+        logger.info(
+            f"PriceActionEngine inicializado (1h trigger={self.trigger_mode} + 4h structure)"
+        )
 
     @property
     def is_safe_mode(self) -> bool:
@@ -267,28 +376,52 @@ class PriceActionEngine:
         if len(swings_1h) < 2:
             return self._wait("pocos swings en 1h")
 
-        # 3) Detección de liquidity sweep en la última vela cerrada de 1h
-        sweep = detect_liquidity_sweep(
-            df_1h, swings_1h, structure_4h, vol_mult=self.vol_mult,
-        )
-        if sweep is None:
-            return self._wait(f"sin sweep (estructura 4h: {structure_4h})")
+        # 3) Detección del gatillo en la última vela cerrada de 1h
+        #    Cada gatillo expone: direction, sl_basis (nivel desde el que offseteamos
+        #    el SL con ATR), vol_ratio y un texto descriptivo.
+        if self.trigger_mode == "choch":
+            choch = detect_choch(
+                df_1h, swings_1h, structure_4h,
+                vol_mult=self.vol_mult, require_vol=self.choch_require_vol,
+            )
+            if choch is None:
+                return self._wait(f"sin CHoCH (estructura 4h: {structure_4h})")
+            direction = choch.direction
+            sl_basis = choch.protective_level
+            vol_ratio = choch.candle_volume_ratio
+            trigger_txt = (
+                f"CHoCH en {direction} | "
+                f"rompe ${choch.broken_level:,.2f} → close ${choch.candle_close:,.2f}"
+            )
+        else:
+            sweep = detect_liquidity_sweep(
+                df_1h, swings_1h, structure_4h, vol_mult=self.vol_mult,
+            )
+            if sweep is None:
+                return self._wait(f"sin sweep (estructura 4h: {structure_4h})")
+            direction = sweep.direction
+            sl_basis = sweep.sweep_extreme
+            vol_ratio = sweep.candle_volume_ratio
+            trigger_txt = (
+                f"Liquidity sweep en {direction} | "
+                f"swept ${sweep.swept_level:,.2f} → close ${sweep.candle_close:,.2f}"
+            )
 
-        # 4) Sizing del SL/TP con ATR de 1h
+        # 4) Sizing del SL/TP con ATR de 1h (común a ambos gatillos)
         atr_1h = compute_atr(df_1h, window=14)
         if atr_1h <= 0:
             return self._wait("ATR no disponible")
 
         entry = float(df_1h.iloc[-1]["close"])
 
-        if sweep.direction == "LONG":
-            sl_price = sweep.sweep_extreme - self.atr_sl_mult * atr_1h
+        if direction == "LONG":
+            sl_price = sl_basis - self.atr_sl_mult * atr_1h
             risk = entry - sl_price
             if risk <= 0:
                 return self._wait("riesgo no positivo (ATR muy chico)")
             tp_price = entry + self.tp_rr * risk
         else:  # SHORT
-            sl_price = sweep.sweep_extreme + self.atr_sl_mult * atr_1h
+            sl_price = sl_basis + self.atr_sl_mult * atr_1h
             risk = sl_price - entry
             if risk <= 0:
                 return self._wait("riesgo no positivo (ATR muy chico)")
@@ -299,27 +432,24 @@ class PriceActionEngine:
         if sl_pct < self.sl_min_pct:
             return self._wait(f"SL muy apretado ({sl_pct:.2%}) — riesgo de ruido")
         if sl_pct > self.sl_max_pct:
-            return self._wait(f"SL excesivo ({sl_pct:.2%}) — sweep demasiado profundo")
+            return self._wait(f"SL excesivo ({sl_pct:.2%}) — gatillo demasiado profundo")
 
         tp_pct = abs(tp_price - entry) / entry
 
         razon = (
-            f"Liquidity sweep en {sweep.direction} | "
-            f"4h={structure_4h} | "
-            f"swept ${sweep.swept_level:,.2f} → close ${sweep.candle_close:,.2f} | "
-            f"vol {sweep.candle_volume_ratio:.2f}x | "
-            f"R:R 1:{self.tp_rr:.1f}"
+            f"{trigger_txt} | 4h={structure_4h} | "
+            f"vol {vol_ratio:.2f}x | R:R 1:{self.tp_rr:.1f}"
         )
 
-        accion = "COMPRAR" if sweep.direction == "LONG" else "VENDER"
+        accion = "COMPRAR" if direction == "LONG" else "VENDER"
         # Confianza: arrancamos en 0.7, sumamos por volumen excesivo
-        confianza = min(0.95, 0.7 + 0.1 * (sweep.candle_volume_ratio - self.vol_mult))
+        confianza = min(0.95, 0.7 + 0.1 * (vol_ratio - self.vol_mult))
 
-        logger.info(f"🎯 PA Engine → {accion} {sweep.direction} | {razon}")
+        logger.info(f"🎯 PA Engine → {accion} {direction} | {razon}")
 
         return PriceActionDecision(
             accion=accion,
-            direction=sweep.direction,
+            direction=direction,
             confianza=round(confianza, 3),
             razon=razon,
             entry_price=round(entry, 2),
@@ -327,7 +457,7 @@ class PriceActionEngine:
             take_profit_price=round(tp_price, 2),
             stop_loss_pct=round(sl_pct, 4),
             take_profit_pct=round(tp_pct, 4),
-            advertencias=["Motor Price Action — TF 1h, contexto 4h"],
+            advertencias=[f"Motor Price Action — TF 1h, contexto 4h, gatillo={self.trigger_mode}"],
         )
 
     def _wait(self, motivo: str) -> PriceActionDecision:

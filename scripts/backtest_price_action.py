@@ -304,6 +304,10 @@ def main():
     p.add_argument("--leverage", type=float, default=1.0, help="Apalancamiento (1=Spot, 5=Futures 5x)")
     p.add_argument("--commission", type=float, default=None, help="Override commission_pct_per_side (ej. 0.0004 = Futures taker)")
     p.add_argument("--reserve-pct", type=float, default=None, help="Override trade_reserve_pct")
+    p.add_argument("--trigger", type=str, default=None, choices=["sweep", "choch"],
+                   help="Gatillo del PA engine: sweep (default) | choch (webinar filtrado)")
+    p.add_argument("--choch-vol", action="store_true",
+                   help="Si --trigger choch: exigir confirmación de volumen en el quiebre")
     args = p.parse_args()
 
     s = load_settings()
@@ -324,6 +328,10 @@ def main():
         s.commission_pct_per_side = args.commission
     if args.reserve_pct is not None:
         s.trade_reserve_pct = args.reserve_pct
+    if args.trigger is not None:
+        setattr(s, "pa_trigger_mode", args.trigger)
+    if args.choch_vol:
+        setattr(s, "pa_choch_require_vol", True)
 
     print(f"Bajando {args.days} días de {s.symbol} (1h y 4h)...")
     df_1h = fetch_history(s.symbol, "1h", args.days + 5)
@@ -332,7 +340,8 @@ def main():
 
     engine = PriceActionEngine(s)
     sim = Sim(s, leverage=args.leverage)
-    print(f"  risk_pct={s.max_risk_per_trade:.2%}  leverage={args.leverage}x  "
+    print(f"  trigger={getattr(s, 'pa_trigger_mode', 'sweep')}  "
+          f"risk_pct={s.max_risk_per_trade:.2%}  leverage={args.leverage}x  "
           f"fee={s.commission_pct_per_side:.4%}  reserve={s.trade_reserve_pct:.0%}")
 
     # Iterar cada vela 1h. Por vela:
