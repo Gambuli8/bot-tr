@@ -172,8 +172,9 @@ class ExchangeClient:
                 ) from e
 
         # Verificación dura: confirmar que el modo realmente quedó en One-way.
+        # Binance Futures en ccxt exige symbol (o params={'subType': 'linear'}) en fetch_position_mode.
         try:
-            mode = self.exchange.fetch_position_mode()
+            mode = self.exchange.fetch_position_mode(symbol=self.settings.symbol)
             if mode.get("hedged") is True:
                 raise RuntimeError(
                     "La cuenta Futures sigue en HEDGE mode tras el intento de "
