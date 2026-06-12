@@ -36,6 +36,20 @@ class Settings(BaseModel):
     min_claude_confidence: float = 0.55
     trade_reserve_pct: float = 0.30
 
+    # ─── Kill-switch de drawdown desde el pico (tapa lo que el diario no cubre) ───
+    # Drawdown contra el capital_peak histórico (NO se resetea cada día) → frena
+    # la sangría lenta de varios días. Al disparar, HALT que NO auto-resetea:
+    # requiere reset manual (revisión humana). 0 = desactivado.
+    max_drawdown_from_peak: float = 0.18
+    # Drawdown a nivel PORTAFOLIO (suma de los 3 bots) → frena el crash
+    # correlacionado. Requiere shared_state_dir (volumen compartido). 0 = off.
+    portfolio_drawdown_limit: float = 0.15
+    # Directorio compartido entre contenedores para coordinar el portafolio.
+    # Vacío = guard de portafolio desactivado (cada bot protege sólo lo suyo).
+    shared_state_dir: str = ""
+    # Tag del bot (BTC/SOL/AVAX) para identificar su equity en el dir compartido.
+    bot_tag: str = ""
+
     # MODO TESTING (sin Claude, reglas técnicas duras, más agresivo)
     testing_mode: bool = False
     testing_loop_seconds: int = 60          # ciclo cada 1 minuto en testing
@@ -219,4 +233,8 @@ def load_settings() -> Settings:
         scalp_skip_hours_utc=os.getenv("SCALP_SKIP_HOURS_UTC", ""),
         leverage=int(os.getenv("LEVERAGE", "7")),
         margin_mode=os.getenv("MARGIN_MODE", "isolated").lower(),
+        max_drawdown_from_peak=float(os.getenv("MAX_DRAWDOWN_FROM_PEAK", "0.18")),
+        portfolio_drawdown_limit=float(os.getenv("PORTFOLIO_DRAWDOWN_LIMIT", "0.15")),
+        shared_state_dir=os.getenv("SHARED_STATE_DIR", ""),
+        bot_tag=os.getenv("BOT_SYMBOL_TAG", ""),
     )

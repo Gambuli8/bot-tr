@@ -116,7 +116,19 @@ class MainStrategy:
             # Se hace acá para que aplique incluso en sleep profundo.
             self._maybe_reconcile()
 
-            # 0. ¿Pedido de cierre manual via Telegram?
+            # 0a. ¿Pedido de reset del kill-switch de drawdown via Telegram?
+            if self.controller is not None and self.controller.consume_reset_halt():
+                was = self.order_manager.reset_halt()
+                msg = ("✅ Kill-switch de drawdown reseteado. Pico re-anclado, "
+                       "el bot vuelve a operar." if was
+                       else "El bot no estaba en HALT (nada que resetear).")
+                logger.warning(msg)
+                try:
+                    self.telegram.notify_warning(msg)
+                except Exception:
+                    pass
+
+            # 0b. ¿Pedido de cierre manual via Telegram?
             if self.controller is not None and self.controller.consume_force_close():
                 if self.order_manager.state.open_position is not None:
                     df = self.exchange.get_ohlcv()

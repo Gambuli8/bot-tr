@@ -275,6 +275,7 @@ class TelegramListener:
             "/resume": self._cmd_resume,
             "/close": self._cmd_close,
             "/close_confirm": self._cmd_close_confirm,
+            "/unhalt": self._cmd_unhalt,
             "/stop": self._cmd_stop,
             "/stop_confirm": self._cmd_stop_confirm,
             "/schedule": self._cmd_schedule,
@@ -353,6 +354,8 @@ class TelegramListener:
             "/schedule [HH-HH] — horario activo en UTC (ej: 12-2 = 12 UTC a 2 UTC)\n\n"
             "<b>Cerrar manualmente</b>\n"
             "/close → /close_confirm (válido 30s)\n\n"
+            "<b>Kill-switch de drawdown</b>\n"
+            "/unhalt — reactiva el bot si se frenó por drawdown acumulado\n\n"
             "<b>Apagar el proceso</b>\n"
             "/stop → /stop_confirm (válido 30s)"
         )
@@ -368,7 +371,10 @@ class TelegramListener:
         ret = stats["total_return_pct"]
 
         # Estado en una línea
-        if is_paused:
+        if stats.get("halted"):
+            estado = ("⛔ <b>FRENADO por drawdown acumulado</b> — "
+                      f"<i>{stats.get('halt_reason', '')}</i>\nUsá /unhalt para reactivar")
+        elif is_paused:
             estado = "⏸ <b>Pausado</b> — no abro operaciones nuevas"
         elif stats["is_stopped"]:
             estado = "🛑 <b>Frenado por caída del día</b> — vuelve mañana"
@@ -605,6 +611,19 @@ class TelegramListener:
                 notifier.notify_resumed()
             except Exception as e:
                 logger.warning(f"notify_resumed falló: {e}")
+
+    def _cmd_unhalt(self, args: list[str], chat_id: str) -> None:
+        om = self.controller.order_manager
+        if om is None or not getattr(om.state, "halted", False):
+            self._send("El bot no está en HALT por drawdown.", chat_id=chat_id)
+            return
+        self._send(
+            f"⛔ HALT activo: <i>{om.state.halt_reason}</i>\n"
+            "Reseteando el kill-switch y re-anclando el pico...",
+            chat_id=chat_id,
+        )
+        self.controller.request_reset_halt()
+        self._audit("/unhalt", args, chat_id, "ok")
 
     def _cmd_close(self, args: list[str], chat_id: str) -> None:
         om = self.controller.order_manager

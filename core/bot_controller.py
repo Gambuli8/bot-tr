@@ -25,6 +25,7 @@ class BotController:
         self._lock = threading.Lock()
         self._is_paused: bool = False
         self._force_close_position: bool = False
+        self._reset_halt: bool = False
         self._pending_confirmations: dict[str, float] = {}
         self._active_hours_utc: str = ""  # override en runtime via /schedule
 
@@ -148,6 +149,20 @@ class BotController:
     def force_close_position(self) -> bool:
         with self._lock:
             return self._force_close_position
+
+    # ───────── reset del kill-switch de drawdown (HALT) ─────────
+
+    def request_reset_halt(self) -> None:
+        with self._lock:
+            self._reset_halt = True
+
+    def consume_reset_halt(self) -> bool:
+        """Devuelve True una sola vez si se pidió reset del HALT, y resetea el flag."""
+        with self._lock:
+            if getattr(self, "_reset_halt", False):
+                self._reset_halt = False
+                return True
+            return False
 
     # ───────── confirmaciones con timeout ─────────
 

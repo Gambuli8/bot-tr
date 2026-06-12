@@ -50,12 +50,15 @@ services:
       - .env.btc
     volumes:
       - ./data/btc:/app/data
+      # Dir compartido entre los 3 bots → kill-switch de drawdown de portafolio.
+      - ./data/_shared:/app/shared
     environment:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
       TZ: "UTC"
       # Marcadores que el cliente puede usar para diferenciar logs de los 4 bots
       BOT_SYMBOL_TAG: "BTC"
+      SHARED_STATE_DIR: "/app/shared"
 
   bot-sol:
     <<: *bot-defaults
@@ -64,11 +67,13 @@ services:
       - .env.sol
     volumes:
       - ./data/sol:/app/data
+      - ./data/_shared:/app/shared
     environment:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
       TZ: "UTC"
       BOT_SYMBOL_TAG: "SOL"
+      SHARED_STATE_DIR: "/app/shared"
 
   bot-avax:
     <<: *bot-defaults
@@ -77,11 +82,13 @@ services:
       - .env.avax
     volumes:
       - ./data/avax:/app/data
+      - ./data/_shared:/app/shared
     environment:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
       TZ: "UTC"
       BOT_SYMBOL_TAG: "AVAX"
+      SHARED_STATE_DIR: "/app/shared"
 
   # LINK descartado en Fase 3 (WFA con leverage 7× → ❌ 3/7 OS positivas,
   # OS total +6.37%, PF mediano 0.97). Si querés re-evaluarlo, mirá los logs

@@ -20,6 +20,7 @@ from logs.logger import logger
 from config.settings import Settings
 from core.indicators import MarketSnapshot
 from core.claude_agent import TradeDecision
+from core.risk_guard import PortfolioGuard, breach_reason
 
 
 STATE_FILE = Path(__file__).parent.parent / "data" / "state.json"
@@ -75,6 +76,12 @@ class BotState:
     consecutive_failures: int = 0
     is_stopped: bool = False
     last_close_at: float = 0.0     # epoch del último cierre (para cooldown)
+    # Kill-switch de drawdown desde el pico / portafolio. A diferencia de
+    # is_stopped (diario, auto-resetea), halted NO se resetea solo: requiere
+    # reset_halt() manual tras revisión.
+    halted: bool = False
+    halt_reason: str = ""
+    halt_at: float = 0.0
 
     def __post_init__(self):
         # Migración silenciosa: si veníamos del schema viejo (open_position single)
@@ -91,9 +98,15 @@ class OrderManager:
         STATE_FILE.parent.mkdir(exist_ok=True)
         JOURNAL_FILE.parent.mkdir(exist_ok=True)
         self.state = self._load_state()
+        # Guard de portafolio (coordina los 3 bots vía dir compartido). Si
+        # shared_state_dir está vacío, queda deshabilitado (cada bot protege lo suyo).
+        self.portfolio_guard = PortfolioGuard(
+            getattr(settings, "shared_state_dir", "") or ""
+        )
         logger.info(
             f"OrderManager inicializado | Capital: ${self.state.capital:,.2f} | "
             f"Posición abierta: {'SÍ' if self.state.open_position else 'NO'}"
+            + (" | ⛔ HALTED por drawdown" if self.state.halted else "")
         )
 
     # ─────────────────────────────────────────
@@ -111,6 +124,9 @@ class OrderManager:
         self, decision: TradeDecision, snapshot: MarketSnapshot
     ) -> bool:
         """Decide si abrir una nueva posición (LONG o SHORT)."""
+        if self.state.halted:
+            logger.warning(f"⛔ Bot HALTED por drawdown: {self.state.halt_reason}")
+            return False
         if self.state.is_stopped:
             logger.warning("🛑 Bot detenido por drawdown diario")
             return False
@@ -566,6 +582,7 @@ class OrderManager:
         )
         self.state.last_close_at = time.time()
         self._check_daily_drawdown()
+        self._check_drawdown_guards()
         self._save_state()
 
         win = pnl_usdt > 0
@@ -654,6 +671,65 @@ class OrderManager:
             logger.critical(
                 f"🚨 DAILY DRAWDOWN: {daily_dd:.1%}. Bot detenido hasta mañana."
             )
+
+    def _check_drawdown_guards(self) -> None:
+        """
+        Kill-switch desde el pico (per-bot) + portafolio. A diferencia del
+        diario, un HALT acá NO se auto-resetea: requiere reset_halt() manual.
+        Se llama tras cada cierre (capital realizado ya actualizado).
+        """
+        if self.state.halted:
+            return  # ya frenado; no re-evaluar hasta reset manual
+
+        equity = self.state.capital
+        peak = self.state.capital_peak
+
+        # 1) Per-bot: drawdown desde el pico histórico (tapa la sangría lenta).
+        reason = breach_reason(
+            equity, peak,
+            getattr(self.settings, "max_drawdown_from_peak", 0.0) or 0.0,
+            scope="PER-BOT",
+        )
+
+        # 2) Portafolio: publicar mi equity y leer el combinado de los 3 bots.
+        try:
+            tag = getattr(self.settings, "bot_tag", "") or "bot"
+            self.portfolio_guard.publish_equity(tag, equity, peak)
+            snap = self.portfolio_guard.snapshot()
+            if reason is None and snap is not None:
+                reason = breach_reason(
+                    snap.combined_equity, snap.combined_peak,
+                    getattr(self.settings, "portfolio_drawdown_limit", 0.0) or 0.0,
+                    scope=f"PORTAFOLIO ({snap.contributors} bots)",
+                )
+        except Exception as e:  # el guard nunca debe tumbar el bot
+            logger.warning(f"PortfolioGuard error (ignorado): {e}")
+
+        if reason is not None:
+            self.state.halted = True
+            self.state.halt_reason = reason
+            self.state.halt_at = time.time()
+            logger.critical(
+                f"⛔ KILL-SWITCH DE DRAWDOWN: {reason}. Bot HALTED — "
+                f"requiere reset manual tras revisión."
+            )
+
+    def reset_halt(self) -> bool:
+        """Levanta el HALT del kill-switch (revisión humana). Re-ancla el pico
+        al capital actual para no re-disparar de inmediato. Devuelve si estaba
+        halted."""
+        was = self.state.halted
+        if was:
+            self.state.halted = False
+            self.state.halt_reason = ""
+            self.state.halt_at = 0.0
+            self.state.capital_peak = self.state.capital
+            self._save_state()
+            logger.warning(
+                f"✅ HALT reseteado manualmente | pico re-anclado a "
+                f"${self.state.capital:,.2f}"
+            )
+        return was
 
     def _get_open_position(self) -> Optional[Position]:
         if self.state.open_position is None:
@@ -940,6 +1016,8 @@ class OrderManager:
             "win_rate_pct": round(win_rate, 1),
             "max_drawdown_pct": round(max_drawdown, 3),
             "is_stopped": self.state.is_stopped,
+            "halted": self.state.halted,
+            "halt_reason": self.state.halt_reason,
             "open_position": self.state.open_position is not None,
         }
 
