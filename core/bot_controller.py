@@ -25,6 +25,7 @@ class BotController:
         self._lock = threading.Lock()
         self._is_paused: bool = False
         self._force_close_position: bool = False
+        self._reconcile_requested: bool = False
         self._pending_confirmations: dict[str, float] = {}
         self._active_hours_utc: str = ""  # override en runtime via /schedule
 
@@ -78,6 +79,30 @@ class BotController:
             self._force_close_position = True
         # Despertamos el main loop si está esperando entre ciclos.
         self._wake_event.set()
+
+    # ───────── reconcile inmediato (user-stream watcher) ─────────
+
+    def request_reconcile(self) -> None:
+        """
+        Pide un reconcile inmediato y despierta el main loop.
+
+        Lo usa el UserStreamWatcher (WebSocket) cuando detecta que un SL/TP se
+        ejecutó en el exchange: en vez de esperar el throttle de 5 min, forzamos
+        que el próximo run_once reconcilie ya. El cierre local + la notificación
+        de Telegram salen por el camino normal de run_once (should_close_any →
+        _exchange_closed_us), que corre en el main thread → sin races.
+        """
+        with self._lock:
+            self._reconcile_requested = True
+        self._wake_event.set()
+
+    def consume_reconcile(self) -> bool:
+        """Devuelve True una sola vez si se pidió reconcile, y resetea el flag."""
+        with self._lock:
+            if self._reconcile_requested:
+                self._reconcile_requested = False
+                return True
+            return False
 
     # ───────── sincronización con el main loop ─────────
 

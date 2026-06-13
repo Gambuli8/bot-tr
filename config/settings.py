@@ -114,6 +114,15 @@ class Settings(BaseModel):
     # se llevan el resto del wallet). 'cross' usa todo el wallet como margen
     # (más capital efectivo pero contagio total).
     margin_mode: str = "isolated"
+    # User Data Stream (WebSocket): detecta fills de SL/TP en tiempo real y
+    # dispara un reconcile inmediato (en vez de esperar el throttle de 5 min).
+    # Puro enhancement, opt-in. Si está off, el bot funciona igual que siempre.
+    user_stream_enabled: bool = False
+    # Listener de comandos Telegram (getUpdates). Telegram permite UN solo poller
+    # por bot token. En deploy multi-bot que comparte token, SOLO uno debe tenerlo
+    # en true (los demás en false) para evitar el 409 Conflict constante. Las
+    # notificaciones salientes siguen funcionando en todos los bots igual.
+    telegram_listener_enabled: bool = True
     # Filtro de horario: lista de horas UTC en las que NO operar. Default
     # empty = todas las horas habilitadas. Ej: "6,7,8,9,10,11" descarta EU AM
     # (validado en aud F: +10× retorno backtest 60d). Cargado vía env
@@ -189,4 +198,6 @@ def load_settings() -> Settings:
         scalp_skip_hours_utc=os.getenv("SCALP_SKIP_HOURS_UTC", ""),
         leverage=int(os.getenv("LEVERAGE", "7")),
         margin_mode=os.getenv("MARGIN_MODE", "isolated").lower(),
+        user_stream_enabled=os.getenv("USER_STREAM_ENABLED", "false").lower() == "true",
+        telegram_listener_enabled=os.getenv("TELEGRAM_LISTENER_ENABLED", "true").lower() == "true",
     )

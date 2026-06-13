@@ -20,32 +20,23 @@ from execution.order_manager import OrderManager, BotState
 
 @pytest.fixture
 def mock_settings():
-    """Settings con valores de test (sin API keys reales)."""
-    s = MagicMock(spec=Settings)
-    s.binance_api_key = "test_key"
-    s.binance_api_secret = "test_secret"
-    s.binance_testnet = True
-    s.anthropic_api_key = "test_anthropic"
-    s.telegram_bot_token = "test_telegram"
-    s.telegram_chat_id = "12345"
-    s.symbol = "BTC/USDT"
-    s.timeframe = "15m"
-    s.initial_capital = 1000.0
-    s.max_risk_per_trade = 0.02
-    s.daily_drawdown_limit = 0.10
+    """
+    Settings REAL (no MagicMock) con secretos dummy. Usar el objeto real en
+    lugar de MagicMock(spec=Settings) evita el bug de "campo pydantic faltante"
+    cada vez que se agrega un setting nuevo que algún engine consume
+    (donchian_period, adx_period, cooldown_bars, etc.). Todos los defaults
+    quedan presentes automáticamente.
+    """
+    s = Settings(
+        binance_api_key="test_key",
+        binance_api_secret="test_secret",
+        anthropic_api_key="test_anthropic",
+        telegram_bot_token="test_telegram",
+        telegram_chat_id="12345",
+    )
+    # Overrides puntuales que algunos tests asumen.
     s.min_claude_confidence = 0.70
-    s.trade_reserve_pct = 0.30
-    s.rsi_period = 14
-    s.rsi_oversold = 35.0
-    s.rsi_overbought = 65.0
-    s.ema_fast = 50
-    s.ema_slow = 200
-    s.macd_fast = 12
-    s.macd_slow = 26
-    s.macd_signal = 9
-    s.atr_period = 14
     s.atr_sl_multiplier = 1.5
-    s.min_risk_reward = 2.0
     s.warmup_candles = 200
     return s
 

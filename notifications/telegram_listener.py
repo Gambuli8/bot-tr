@@ -42,15 +42,35 @@ READONLY_COMMANDS = {
 def _parse_id_list(raw) -> set[str]:
     """
     Defensivo: acepta str con CSV, list/tuple/set de ids, o None.
-    Devuelve siempre set[str] sin entradas vacías.
+    Devuelve siempre set[str] de IDs válidos (enteros).
+
+    Endurecido (2026-06-13): los chat IDs de Telegram son enteros (negativos en
+    grupos). Descartamos cualquier token que no sea entero. Esto neutraliza el
+    caso real visto en producción donde el .env tenía un comentario inline
+    (`TELEGRAM_ADMIN_CHAT_IDS=   # CSV opcional...`) que python-dotenv dejaba
+    entrar como valor y terminaba en la whitelist como un "id" basura.
     """
     if raw is None:
         return set()
     if isinstance(raw, (list, tuple, set)):
-        return {str(x).strip() for x in raw if str(x).strip()}
-    if not isinstance(raw, str):
-        raw = str(raw)
-    return {s.strip() for s in raw.split(",") if s.strip()}
+        items = [str(x) for x in raw]
+    else:
+        if not isinstance(raw, str):
+            raw = str(raw)
+        items = raw.split(",")
+
+    out: set[str] = set()
+    for item in items:
+        # Cortar comentario inline y espacios.
+        token = item.split("#", 1)[0].strip()
+        if not token:
+            continue
+        try:
+            int(token)  # Telegram chat IDs son enteros (pueden ser negativos)
+        except ValueError:
+            continue
+        out.add(token)
+    return out
 
 
 class TelegramListener:

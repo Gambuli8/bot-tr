@@ -110,7 +110,14 @@ class MainStrategy:
 
             # Reconciliación periódica con el exchange (cada 5 min).
             # Se hace acá para que aplique incluso en sleep profundo.
-            self._maybe_reconcile()
+            # Si el UserStreamWatcher detectó un fill por WebSocket, pidió
+            # reconcile inmediato → forzamos saltando el throttle.
+            forced_reconcile = (
+                self.controller is not None and self.controller.consume_reconcile()
+            )
+            if forced_reconcile:
+                logger.info("⚡ Reconcile forzado por evento de WebSocket (fill detectado)")
+            self._maybe_reconcile(force=forced_reconcile)
 
             # 0. ¿Pedido de cierre manual via Telegram?
             if self.controller is not None and self.controller.consume_force_close():
@@ -390,12 +397,16 @@ class MainStrategy:
                 lines.append(f"  • {i[:120]}")
         return "\n".join(lines)
 
-    def _maybe_reconcile(self) -> None:
-        """Llama a reconciliación con el exchange cada N segundos."""
+    def _maybe_reconcile(self, force: bool = False) -> None:
+        """
+        Llama a reconciliación con el exchange cada N segundos.
+        force=True salta el throttle (lo usa el reconcile pedido por el
+        UserStreamWatcher ante un fill detectado por WebSocket).
+        """
         if self.order_manager.exchange is None:
             return
         now = time.time()
-        if (now - self._last_reconcile_at) < self._reconcile_interval_seconds:
+        if not force and (now - self._last_reconcile_at) < self._reconcile_interval_seconds:
             return
         try:
             rec = self.order_manager.reconcile_with_exchange()

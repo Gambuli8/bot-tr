@@ -34,8 +34,12 @@ class FakeEx:
 
 def _client(fake) -> ExchangeClient:
     # Bypass __init__ (que abriría conexión real) e inyectamos el fake.
+    # ensure_one_way_mode lee self.settings.symbol (desde commit a437a05), así
+    # que también inyectamos un settings mínimo con el símbolo.
+    from types import SimpleNamespace
     c = ExchangeClient.__new__(ExchangeClient)
     c.exchange = fake
+    c.settings = SimpleNamespace(symbol="BTC/USDT")
     return c
 
 
