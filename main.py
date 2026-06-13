@@ -104,9 +104,35 @@ def main():
         nf.notify_critical(f"❌ Bot no arranca — strategy: {e}")
         sys.exit(1)
 
-    # 7. Arrancar listener de comandos por Telegram antes del loop principal
-    listener = TelegramListener(settings, controller)
-    listener.start()
+    # 7. Arrancar listener de comandos por Telegram antes del loop principal.
+    # En deploy multi-bot que comparte bot token, SOLO uno debe correr el listener
+    # (Telegram permite un getUpdates por token; si no, 409 Conflict constante).
+    # Gateado por TELEGRAM_LISTENER_ENABLED (default true → comportamiento de siempre).
+    if getattr(settings, "telegram_listener_enabled", True):
+        listener = TelegramListener(settings, controller)
+        listener.start()
+    else:
+        logger.info(
+            "TelegramListener OFF (TELEGRAM_LISTENER_ENABLED=false) — "
+            "este bot no escucha comandos para evitar conflicto 409 multi-bot. "
+            "Las notificaciones salientes siguen activas."
+        )
+
+    # 7.5 (opcional) User Data Stream por WebSocket: detecta fills de SL/TP en
+    # tiempo real y pide reconcile inmediato. Opt-in vía USER_STREAM_ENABLED.
+    # Fail-safe: si falla, el reconcile periódico de 5 min sigue como red.
+    if getattr(settings, "user_stream_enabled", False):
+        try:
+            from core.user_stream import UserStreamWatcher
+            user_stream = UserStreamWatcher(settings, controller)
+            user_stream.start()
+        except Exception as e:
+            logger.warning(
+                f"No pude arrancar UserStreamWatcher ({e}). Sigo sin él; "
+                f"el reconcile periódico cubre la consistencia de estado."
+            )
+    else:
+        logger.info("UserStreamWatcher OFF (USER_STREAM_ENABLED!=true)")
 
     # Timeframe a segundos
     tf_map = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600}
