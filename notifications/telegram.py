@@ -137,6 +137,14 @@ class TelegramNotifier:
         )
         self._send(text)
 
+    def notify_risk_alert(self, message, severity: str = "warning"):
+        head = (
+            "🚨 <b>ALERTA DE RIESGO</b>" if severity == "critical"
+            else "⚠️ <b>Atención — riesgo</b>"
+        )
+        text = f"{head}\n\n{message}\n\n🕐 {datetime.utcnow().strftime('%H:%M')} UTC"
+        self._send(text)
+
     def notify_warning(self, message):
         text = f"⚠️ <b>Atención</b>\n\n{message}\n\n⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
         self._send(text)

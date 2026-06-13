@@ -71,6 +71,9 @@ class MainStrategy:
         self._last_panorama_at: float = 0.0
         self._panorama_interval_seconds: int = 30 * 60
 
+        # Alertas de riesgo: set de keys actualmente activas (dedup por cruce).
+        self._risk_fired: set[str] = set()
+
         # Schedule: tracking del último estado para detectar transiciones.
         # Si el controller no tiene schedule seteado, fallback al settings.
         if self.controller is not None and not self.controller.get_active_hours():
@@ -160,6 +163,14 @@ class MainStrategy:
 
             df = self.exchange.get_ohlcv()
             snapshot = self.indicator_engine.calculate(df)
+
+            # Alertas de riesgo proactivas (cercanía a liquidación / drawdown).
+            # Nunca debe tumbar el ciclo.
+            try:
+                self._check_risk_alerts(snapshot.price)
+            except Exception as e:
+                logger.warning(f"Chequeo de alertas de riesgo falló: {e}")
+
             trade_history = self._load_recent_trades()
             # MTF context (cacheado 5 min en el exchange)
             mtf = None
@@ -396,6 +407,48 @@ class MainStrategy:
             for i in rec["issues"][:5]:
                 lines.append(f"  • {i[:120]}")
         return "\n".join(lines)
+
+    def _check_risk_alerts(self, price: float) -> None:
+        """
+        Evalúa riesgos (cercanía a liquidación, drawdown diario) y manda push
+        SOLO cuando una alerta se activa por primera vez (cruce de umbral).
+        Mientras la condición sigue activa no re-manda; si se resuelve y vuelve
+        a cruzar, alerta de nuevo.
+        """
+        if not getattr(self.settings, "risk_alerts_enabled", True):
+            return
+        from core.risk_monitor import evaluate
+
+        st = self.order_manager.state
+        positions = st.open_positions or (
+            [st.open_position] if st.open_position else []
+        )
+        daily_dd = (
+            (st.daily_capital_start - st.capital) / st.daily_capital_start
+            if st.daily_capital_start > 0 else 0.0
+        )
+
+        alerts = evaluate(
+            positions=positions,
+            price=price,
+            leverage=float(self.settings.leverage),
+            daily_dd=daily_dd,
+            daily_limit=float(self.settings.daily_drawdown_limit),
+            liq_alert_pct=float(getattr(self.settings, "risk_liq_alert_pct", 3.0)),
+            dd_warn_ratio=float(getattr(self.settings, "risk_dd_warn_ratio", 0.8)),
+        )
+        current = {a.key for a in alerts}
+
+        for a in alerts:
+            if a.key not in self._risk_fired:
+                logger.warning(f"⚠️ Alerta de riesgo [{a.severity}]: {a.message}")
+                try:
+                    self.telegram.notify_risk_alert(a.message, a.severity)
+                except Exception as e:
+                    logger.warning(f"No pude mandar alerta de riesgo: {e}")
+
+        # Actualizar el set: las que se resolvieron salen (podrán re-alertar).
+        self._risk_fired = current
 
     def _maybe_reconcile(self, force: bool = False) -> None:
         """

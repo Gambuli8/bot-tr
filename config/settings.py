@@ -127,6 +127,10 @@ class Settings(BaseModel):
     # contiene los data/<sym>/ de todos los bots (montado read-only en el bot
     # listener), /status muestra los 3 bots juntos. Vacío = solo este bot.
     portfolio_data_dir: str = ""
+    # Alertas de riesgo proactivas (push al cruzar umbral, sin spam).
+    risk_alerts_enabled: bool = True
+    risk_liq_alert_pct: float = 3.0    # alerta si el precio está a <= X% de la liquidación
+    risk_dd_warn_ratio: float = 0.8    # alerta si el drawdown diario >= ratio × límite
     # Filtro de horario: lista de horas UTC en las que NO operar. Default
     # empty = todas las horas habilitadas. Ej: "6,7,8,9,10,11" descarta EU AM
     # (validado en aud F: +10× retorno backtest 60d). Cargado vía env
@@ -205,4 +209,7 @@ def load_settings() -> Settings:
         user_stream_enabled=os.getenv("USER_STREAM_ENABLED", "false").lower() == "true",
         telegram_listener_enabled=os.getenv("TELEGRAM_LISTENER_ENABLED", "true").lower() == "true",
         portfolio_data_dir=os.getenv("PORTFOLIO_DATA_DIR", ""),
+        risk_alerts_enabled=os.getenv("RISK_ALERTS_ENABLED", "true").lower() == "true",
+        risk_liq_alert_pct=float(os.getenv("RISK_LIQ_ALERT_PCT", "3.0")),
+        risk_dd_warn_ratio=float(os.getenv("RISK_DD_WARN_RATIO", "0.8")),
     )
