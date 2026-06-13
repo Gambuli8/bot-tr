@@ -75,23 +75,27 @@ def apply_config(settings, cfg: dict) -> None:
 
 
 def run_subperiod_pa(df_main: pd.DataFrame, df_higher: pd.DataFrame,
-                      settings, leverage: float) -> Sim:
+                      settings, leverage: float, exec_cfg: Optional[dict] = None) -> Sim:
+    exec_cfg = exec_cfg or {}
     engine = PriceActionEngine(settings)
-    sim = Sim(settings, leverage=leverage)
+    sim = Sim(settings, leverage=leverage, **exec_cfg)
     warmup = 60
     if len(df_main) <= warmup:
         return sim
     for i in range(warmup, len(df_main)):
         ts = df_main.index[i]
         sim.step(df_main.iloc[i], i, ts)
+        # Llenar orden maker pendiente (no-op en modo taker).
         if sim.position is None:
+            sim._try_fill_pending(df_main.iloc[i], i, ts)
+        if sim.position is None and sim.pending is None:
             df_main_sf = df_main.iloc[: i + 1]
             df_higher_sf = df_higher.loc[: ts]
             if len(df_higher_sf) < 30:
                 continue
             dec = engine.analyze(df_main_sf, df_higher_sf)
             if dec.accion in ("COMPRAR", "VENDER"):
-                sim.open(dec, i, ts)
+                sim.signal(dec, i, ts)
     if sim.position is not None:
         sim.close(float(df_main.iloc[-1]["close"]), "Fin",
                    len(df_main) - 1, df_main.index[-1])
@@ -158,7 +162,21 @@ def main():
     ap.add_argument("--risk-pct", type=float, default=0.08)
     ap.add_argument("--commission", type=float, default=0.0005,
                      help="Mezcla maker/taker para PA (TP es limit, SL es market)")
+    # Modelo de ejecución (opt-in; defaults = comportamiento histórico).
+    ap.add_argument("--entry-mode", choices=["taker", "maker"], default="taker")
+    ap.add_argument("--taker-fee", type=float, default=None)
+    ap.add_argument("--maker-fee", type=float, default=None)
+    ap.add_argument("--slippage", type=float, default=0.0)
+    ap.add_argument("--maker-timeout", type=int, default=2)
     args = ap.parse_args()
+
+    exec_cfg = {
+        "taker_fee": args.taker_fee,
+        "maker_fee": args.maker_fee,
+        "slippage": args.slippage,
+        "entry_mode": args.entry_mode,
+        "maker_timeout_bars": args.maker_timeout,
+    }
 
     higher_tf = HIGHER_TF_MAP[args.timeframe]
 
@@ -175,6 +193,10 @@ def main():
     grid = grid_pa()
     print(f"  Grid size: {len(grid)} configs | leverage {args.leverage}x | "
           f"risk {args.risk_pct:.0%} | fee {args.commission:.4%}")
+    print(f"  Ejecución: entry={args.entry_mode} "
+          f"taker={(args.taker_fee if args.taker_fee is not None else args.commission):.4%} "
+          f"maker={(args.maker_fee if args.maker_fee is not None else args.commission):.4%} "
+          f"slip={args.slippage:.4%}")
 
     bpd = bars_per_day(args.timeframe)
     is_bars = args.is_days * bpd
@@ -208,7 +230,7 @@ def main():
         is_results = []
         for c_idx, cfg in enumerate(grid, 1):
             apply_config(s, cfg)
-            sim = run_subperiod_pa(df_is, df_higher, s, args.leverage)
+            sim = run_subperiod_pa(df_is, df_higher, s, args.leverage, exec_cfg)
             m = sim_metrics(sim)
             is_results.append((cfg, m))
             cstr = f"vm={cfg['pa_vol_mult']:.1f}/asl={cfg['pa_atr_sl_mult']:.1f}/rr={cfg['pa_tp_rr']:.1f}/fr={cfg['pa_fractal_n']}"
@@ -223,7 +245,7 @@ def main():
         print(f"   → BEST IS: ret={best_is['ret']:+.2f}%  PF={best_is['pf']:.2f}  n={best_is['n']}")
 
         apply_config(s, best_cfg)
-        sim_os = run_subperiod_pa(df_os, df_higher, s, args.leverage)
+        sim_os = run_subperiod_pa(df_os, df_higher, s, args.leverage, exec_cfg)
         m_os = sim_metrics(sim_os)
         print(f"   ⇒ OS: ret={m_os['ret']:+.2f}%  PF={m_os['pf']:.2f}  "
                f"n={m_os['n']}  DD={m_os['dd']:.2f}%")
