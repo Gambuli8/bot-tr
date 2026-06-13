@@ -83,69 +83,48 @@ class TelegramNotifier:
         self, price, amount_btc, stop_loss, take_profit,
         reason, confidence, direction: str = "LONG",
     ):
-        invertido = price * amount_btc
+        notional = price * amount_btc
+        lev = getattr(self.settings, "leverage", 1)
+        margin = getattr(self.settings, "margin_mode", "")
+        sl_pct = abs(stop_loss - price) / price * 100
+        tp_pct = abs(take_profit - price) / price * 100
         if direction == "SHORT":
-            ganamos_si = take_profit
-            perdemos_si = stop_loss
-            apuesta = "que <b>baje</b>"
             emoji = "🔻"
-            ganamos_dir = "baja"
-            perdemos_dir = "sube"
+            sl_amt = (stop_loss - price) * amount_btc      # pérdida si toca SL
+            tp_amt = (price - take_profit) * amount_btc     # ganancia si toca TP
         else:
-            ganamos_si = take_profit
-            perdemos_si = stop_loss
-            apuesta = "que <b>suba</b>"
             emoji = "🟢"
-            ganamos_dir = "sube"
-            perdemos_dir = "baja"
-
-        # Cuánto ganaríamos/perderíamos si toca TP/SL
-        if direction == "SHORT":
-            ganancia = (price - take_profit) * amount_btc
-            perdida = (stop_loss - price) * amount_btc
-        else:
-            ganancia = (take_profit - price) * amount_btc
-            perdida = (price - stop_loss) * amount_btc
-
-        ganancia_pct = (ganancia / invertido) * 100
-        perdida_pct = (perdida / invertido) * 100
+            sl_amt = (price - stop_loss) * amount_btc
+            tp_amt = (take_profit - price) * amount_btc
 
         text = (
-            f"{emoji} <b>Abrí una operación</b> apostando {apuesta}\n\n"
-            f"💵 Le metí <b>${invertido:,.2f}</b> ({amount_btc:.6f} {self.base_asset})\n"
-            f"📍 Precio de entrada: <b>${price:,.2f}</b>\n\n"
-            f"🎯 Si {ganamos_dir} a <b>${ganamos_si:,.2f}</b> → <b>ganamos +${ganancia:,.2f}</b> ({ganancia_pct:+.2f}%)\n"
-            f"🛑 Si {perdemos_dir} a <b>${perdemos_si:,.2f}</b> → cerramos con <b>-${perdida:,.2f}</b> ({-perdida_pct:.2f}%)\n\n"
-            f"📝 Motivo: <i>{reason}</i>\n"
-            f"🧠 Confianza: {confidence:.0%}\n\n"
-            f"⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
+            f"{emoji} <b>{direction} ABIERTO — {self.base_asset}/USDT</b>\n\n"
+            f"<pre>\n"
+            f"Entrada      ${price:,.2f}\n"
+            f"Tamaño       ${notional:,.2f} ({amount_btc:.6f} {self.base_asset}) · {lev}x {margin}\n"
+            f"Stop-loss    ${stop_loss:,.2f}  -{sl_pct:.2f}%  (-${sl_amt:,.2f})\n"
+            f"Take-profit  ${take_profit:,.2f}  +{tp_pct:.2f}%  (+${tp_amt:,.2f})\n"
+            f"</pre>\n"
+            f"📝 {reason}\n"
+            f"🧠 Confianza: {confidence:.0%}  ·  🕐 {datetime.utcnow().strftime('%H:%M')} UTC"
         )
         self._send(text)
 
     def notify_sell(
         self, price, pnl_usdt, pnl_pct, reason, direction: str = "LONG",
     ):
-        ganamos = pnl_usdt > 0
-        if ganamos:
-            head_emoji = "🎉"
-            sign = "+"
-            verb = "Ganamos"
-            tail = "Buenísimo che."
-        else:
-            head_emoji = "😔"
-            sign = "-"
-            verb = "Perdimos"
-            tail = "Mala, sale la próxima."
-
-        dir_txt = "SHORT" if direction == "SHORT" else "LONG"
+        win = pnl_usdt > 0
+        emoji = "✅" if win else "🔴"
+        label = "ganancia" if win else "pérdida"
 
         text = (
-            f"{head_emoji} <b>Cerré la operación ({dir_txt})</b>\n\n"
-            f"💸 {verb}: <b>{sign}${abs(pnl_usdt):,.2f}</b> ({sign}{abs(pnl_pct):.2f}%)\n"
-            f"📍 Precio de salida: <b>${price:,.2f}</b>\n\n"
-            f"📝 ¿Por qué cerré? <i>{reason}</i>\n\n"
-            f"<i>{tail}</i>\n"
-            f"⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
+            f"{emoji} <b>CIERRE {direction} — {self.base_asset}/USDT</b> ({label})\n\n"
+            f"<pre>\n"
+            f"Resultado    {pnl_usdt:+,.2f} USDT ({pnl_pct:+.2f}%)\n"
+            f"Salida       ${price:,.2f}\n"
+            f"</pre>\n"
+            f"📝 {reason}\n"
+            f"🕐 {datetime.utcnow().strftime('%H:%M')} UTC"
         )
         self._send(text)
 
@@ -168,21 +147,17 @@ class TelegramNotifier:
 
     def notify_daily_report(self, stats):
         ret = stats.get("total_return_pct", 0)
-        if ret > 0:
-            head = f"📈 <b>Resumen del día</b> — vamos ganando"
-        elif ret < 0:
-            head = f"📉 <b>Resumen del día</b> — vamos perdiendo"
-        else:
-            head = f"➖ <b>Resumen del día</b> — empate"
+        n = stats.get("total_trades", 0)
+        wr_s = f"{stats.get('win_rate_pct', 0):.0f}%" if n > 0 else "—"
         text = (
-            f"{head}\n\n"
-            f"💵 Capital actual: <b>${stats.get('capital', 0):,.2f}</b>\n"
-            f"📊 Ganancia/pérdida total: <b>{ret:+.2f}%</b>\n"
-            f"✅ Acertamos en: <b>{stats.get('win_rate_pct', 0):.1f}%</b> de las operaciones\n"
-            f"🔢 Operaciones hechas: <b>{stats.get('total_trades', 0)}</b>\n"
-            f"📉 Mayor caída en el día: <b>{stats.get('max_drawdown_pct', 0):.2f}%</b>\n"
-            f"⚡ ¿Hay operación abierta?: <b>{'sí' if stats.get('open_position') else 'no'}</b>\n\n"
-            f"⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
+            f"🗓 <b>Reporte diario — {self.base_asset}/USDT</b>\n\n"
+            f"<pre>\n"
+            f"Capital     ${stats.get('capital', 0):,.2f}  ({ret:+.1f}%)\n"
+            f"Trades      {n}   WR {wr_s}\n"
+            f"DD máximo   {stats.get('max_drawdown_pct', 0):.1f}%\n"
+            f"Posición    {'sí' if stats.get('open_position') else 'no'}\n"
+            f"</pre>\n"
+            f"🕐 {datetime.utcnow().strftime('%H:%M')} UTC"
         )
         self._send(text)
 
@@ -241,47 +216,31 @@ class TelegramNotifier:
         dd = stats.get("max_drawdown_pct", 0)
         pos_abierta = stats.get("open_position", False)
 
-        if ret > 0.5:
-            mood = "📈 vamos ganando"
-        elif ret < -0.5:
-            mood = "📉 vamos perdiendo"
-        else:
-            mood = "➖ andamos parejos"
-
-        # Resumen del mercado
-        trend_emoji = {"BULL": "📈 alcista", "BEAR": "📉 bajista", "LATERAL": "➡️ lateral"}.get(
+        trend = {"BULL": "alcista", "BEAR": "bajista", "LATERAL": "lateral"}.get(
             snapshot.trend, snapshot.trend
         )
-        mercado = (
-            f"{self.base_asset} <b>${snapshot.price:,.2f}</b> "
-            f"({snapshot.price_change_1h:+.2f}% 1h)\n"
-            f"Tendencia: {trend_emoji}  •  ADX {snapshot.adx:.0f}"
-        )
-        if mtf is not None:
-            mercado += (
-                f"\nMacro: 1h <b>{mtf.trend_1h}</b> (ADX {mtf.adx_1h:.0f})  "
-                f"•  4h <b>{mtf.trend_4h}</b> (ADX {mtf.adx_4h:.0f})"
-            )
-
-        # Decisión
         if decision.accion == "ESPERAR":
-            dec_line = "💤 No veo oportunidad clara"
+            dec_line = "Sin señal — esperando setup"
         elif decision.accion == "COMPRAR":
-            dec_line = f"🟢 Veo señal de COMPRA ({decision.confianza:.0%})"
+            dec_line = f"Señal COMPRA ({decision.confianza:.0%})"
         else:
-            dec_line = f"🔻 Veo señal de VENTA ({decision.confianza:.0%})"
+            dec_line = f"Señal VENTA ({decision.confianza:.0%})"
 
-        if pos_abierta:
-            pos_line = "💼 Tengo una operación abierta — mirá /position"
-        else:
-            pos_line = "💼 Sin operación abierta"
+        wr_s = f"{wr:.0f}%" if n > 0 else "—"
+        macro = ""
+        if mtf is not None:
+            macro = f"Macro      1h {mtf.trend_1h} · 4h {mtf.trend_4h}\n"
 
         text = (
-            f"<b>📊 Panorama</b> — {mood}\n\n"
-            f"💵 Capital: <b>${cap:,.2f}</b> ({ret:+.2f}%)\n"
-            f"🎯 Acierto: {wr:.0f}% en {n} operaciones  •  DD máx {dd:.2f}%\n"
-            f"{pos_line}\n\n"
-            f"<b>Mercado ahora</b>\n{mercado}\n{dec_line}\n\n"
-            f"⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
+            f"📊 <b>Panorama — {self.base_asset}/USDT</b>\n\n"
+            f"<pre>\n"
+            f"Precio     ${snapshot.price:,.2f} ({snapshot.price_change_1h:+.2f}% 1h)\n"
+            f"Tendencia  {trend} · ADX {snapshot.adx:.0f}\n"
+            f"{macro}"
+            f"Capital    ${cap:,.2f} ({ret:+.1f}%)\n"
+            f"Trades     {n} · WR {wr_s} · DDmax {dd:.1f}%\n"
+            f"Posición   {'sí' if pos_abierta else 'no'}\n"
+            f"</pre>\n"
+            f"{dec_line}  ·  🕐 {datetime.utcnow().strftime('%H:%M')} UTC"
         )
         self._send(text)

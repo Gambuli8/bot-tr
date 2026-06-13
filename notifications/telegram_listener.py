@@ -22,6 +22,7 @@ import requests
 from logs.logger import logger
 from config.settings import Settings
 from core.bot_controller import BotController
+from notifications import portfolio as pf_mod
 
 
 POLL_TIMEOUT_SECONDS = 25                  # long polling de Telegram
@@ -378,126 +379,211 @@ class TelegramListener:
         )
         self._send(text, chat_id=chat_id)
 
+    # ── helpers de datos EN VIVO ──
+
+    def _live_price(self, symbol: Optional[str] = None) -> Optional[float]:
+        """Precio actual del par (None si no se pudo leer)."""
+        try:
+            if self.controller.exchange is not None:
+                return float(self.controller.exchange.get_price(symbol))
+        except Exception as e:
+            logger.warning(f"No pude leer precio en vivo ({symbol}): {e}")
+        return None
+
+    def _real_balance(self) -> Optional[float]:
+        """Balance total USDT del wallet Futures real (None si falla)."""
+        try:
+            if self.controller.exchange is not None:
+                b = self.controller.exchange.get_balance()
+                return float(b.get("usdt_total") or 0.0)
+        except Exception as e:
+            logger.warning(f"No pude leer balance real: {e}")
+        return None
+
+    def _utc_stamp(self) -> str:
+        now = datetime.utcnow()
+        return f"{now.strftime('%H:%M')} UTC · {now.strftime('%d/%m')}"
+
+    def _estado_label(self) -> str:
+        om = self.controller.order_manager
+        if self.controller.is_paused:
+            return "⏸ Pausado"
+        if om is not None and om.state.is_stopped:
+            return "🛑 Frenado (límite diario)"
+        return "🟢 Operando"
+
+    # ── /status ──
+
     def _cmd_status(self, args: list[str], chat_id: str) -> None:
         om = self.controller.order_manager
         if om is None:
-            self._send("Todavía estoy arrancando, dame un toque.", chat_id=chat_id)
+            self._send("⏳ Iniciando, dame un momento.", chat_id=chat_id)
             return
+
+        # Vista PORTAFOLIO si está configurada y hay ≥2 bots con estado.
+        pf_dir = getattr(self.settings, "portfolio_data_dir", "")
+        if pf_dir:
+            bots = pf_mod.load_portfolio(pf_dir)
+            if len(bots) >= 2:
+                self._send(self._render_portfolio(bots), chat_id=chat_id)
+                return
+
+        self._send(self._render_single_status(), chat_id=chat_id)
+
+    def _render_single_status(self) -> str:
+        om = self.controller.order_manager
+        s = self.settings
         stats = om.get_stats()
-        is_paused = self.controller.is_paused
+        sym = s.symbol
+
+        price = self._live_price(sym)
+        bal = self._real_balance()
+        price_s = f"${price:,.2f}" if price is not None else "n/d"
+        bal_s = f"${bal:,.2f}" if bal is not None else "n/d"
         ret = stats["total_return_pct"]
+        n = stats["total_trades"]
+        wr_s = f"{stats['win_rate_pct']:.0f}%" if n > 0 else "—"
 
-        # Estado en una línea
-        if is_paused:
-            estado = "⏸ <b>Pausado</b> — no abro operaciones nuevas"
-        elif stats["is_stopped"]:
-            estado = "🛑 <b>Frenado por caída del día</b> — vuelve mañana"
-        else:
-            estado = "▶️ <b>Andando</b> — buscando oportunidades"
+        lines = [
+            f"📊 <b>{sym}</b> — {self._estado_label()}",
+            "",
+            "<pre>",
+            f"Precio actual   {price_s}",
+            f"Balance wallet  {bal_s}",
+            f"Capital bot     ${stats['capital']:,.2f}  ({ret:+.1f}%)",
+            f"Apalancamiento  {s.leverage}x {s.margin_mode}",
+            f"Trades          {n}   WR {wr_s}   DDmax {stats['max_drawdown_pct']:.1f}%",
+            "</pre>",
+            self._position_oneliner(price),
+            f"🕐 {self._utc_stamp()}",
+        ]
+        return "\n".join(lines)
 
-        # Resumen plata
-        if ret > 0:
-            ret_line = f"📈 Ganamos un <b>{ret:+.2f}%</b> arriba del capital inicial"
-        elif ret < 0:
-            ret_line = f"📉 Vamos perdiendo <b>{ret:.2f}%</b> del capital inicial"
-        else:
-            ret_line = f"➖ Estamos parejos (sin ganancia ni pérdida todavía)"
-
-        pos_line = "💼 Operación abierta: <b>sí</b>" if stats["open_position"] else "💼 Operación abierta: <b>no</b>"
-
-        text = (
-            f"{estado}\n\n"
-            f"💵 Plata ahora: <b>${stats['capital']:,.2f}</b>\n"
-            f"{ret_line}\n"
-            f"🎯 Acertamos en <b>{stats['win_rate_pct']:.0f}%</b> de las operaciones (de {stats['total_trades']} totales)\n"
-            f"📉 Mayor bajón: <b>{stats['max_drawdown_pct']:.2f}%</b>\n"
-            f"{pos_line}\n\n"
-            f"⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
+    def _position_oneliner(self, price: Optional[float]) -> str:
+        """Línea corta del estado de la posición abierta (si hay)."""
+        om = self.controller.order_manager
+        positions = om.state.open_positions or (
+            [om.state.open_position] if om.state.open_position else []
         )
-        self._send(text, chat_id=chat_id)
+        if not positions:
+            return "📍 Sin posición abierta"
+        p = positions[0]
+        direction = p.get("direction", "LONG")
+        if price is None:
+            return f"📍 Posición {direction} abierta (PnL: precio n/d)"
+        pnl, pct = pf_mod.position_pnl(p, price)
+        arrow = "🟢" if pnl >= 0 else "🔴"
+        return f"📍 {direction} abierta · PnL {arrow} <b>{pnl:+.2f} USDT</b> ({pct:+.2f}%)"
+
+    def _render_portfolio(self, bots: list[dict]) -> str:
+        bal = self._real_balance()
+        bal_s = f"${bal:,.2f}" if bal is not None else "n/d"
+
+        header = f"{'Bot':<5}{'Precio':>12} {'Pos':>9} {'Capital':>9}"
+        rows = [header, "─" * len(header)]
+        tot_trades = 0
+        open_pnl = 0.0
+        any_open = False
+        for b in bots:
+            name = b["name"].upper()
+            st = b["state"]
+            if not st:
+                rows.append(f"{name:<5}{'n/d':>12}")
+                continue
+            price = self._live_price(b["symbol"])
+            cap = float(st.get("capital", 0) or 0)
+            tot_trades += int(st.get("total_trades", 0) or 0)
+            positions = st.get("open_positions") or (
+                [st["open_position"]] if st.get("open_position") else []
+            )
+            if positions and price:
+                pnl, _ = pf_mod.position_pnl(positions[0], price)
+                open_pnl += pnl
+                any_open = True
+                d = positions[0].get("direction", "LONG")[0]  # L / S
+                pos_s = f"{d}{pnl:+.1f}"
+            else:
+                pos_s = "—"
+            price_s = f"{price:,.2f}" if price else "n/d"
+            rows.append(f"{name:<5}{price_s:>12} {pos_s:>9} {('$'+format(cap,',.0f')):>9}")
+
+        footer = f"Trades totales: {tot_trades}"
+        if any_open:
+            footer += f"  ·  PnL abierto: {open_pnl:+.2f} USDT"
+
+        return (
+            f"📊 <b>PORTAFOLIO</b> — {self._estado_label()}\n"
+            f"💵 Wallet real: <b>{bal_s}</b>\n\n"
+            f"<pre>\n" + "\n".join(rows) + "\n</pre>\n"
+            f"{footer}\n"
+            f"🕐 {self._utc_stamp()}"
+        )
 
     def _cmd_position(self, args: list[str], chat_id: str) -> None:
         om = self.controller.order_manager
         if om is None or om.state.open_position is None:
-            self._send("Por ahora no tengo nada abierto. Estoy mirando el mercado.", chat_id=chat_id)
+            self._send("📍 Sin posición abierta. Monitoreando el mercado.", chat_id=chat_id)
             return
 
+        s = self.settings
         pos = om.state.open_position
         direction = pos.get("direction", "LONG")
+        base = (pos.get("symbol") or s.symbol).split("/")[0]
         entry = float(pos["entry_price"])
-        amt_btc = float(pos["amount_btc"])
+        amt = float(pos["amount_btc"])
         sl = float(pos["stop_loss"])
         tp = float(pos["take_profit"])
-        invertido = entry * amt_btc
-        entry_time = pos.get("entry_time", "")
+        notional = entry * amt
 
+        price = self._live_price(s.symbol)
+
+        # PnL en vivo
+        if price is not None:
+            pnl, pct = pf_mod.position_pnl(pos, price)
+            arrow = "🟢" if pnl >= 0 else "🔴"
+            pnl_line = f"PnL          {arrow} {pnl:+,.2f} USDT ({pct:+.2f}%)"
+            price_s = f"${price:,.2f}"
+        else:
+            pnl_line = "PnL          n/d (sin precio)"
+            price_s = "n/d"
+
+        # Distancia y monto a SL/TP
+        if direction == "SHORT":
+            sl_dist = (sl - entry) / entry * 100
+            tp_dist = (tp - entry) / entry * 100
+            sl_amt = (entry - sl) * amt   # pérdida si toca SL (SL arriba)
+            tp_amt = (entry - tp) * amt   # ganancia si toca TP (TP abajo)
+        else:
+            sl_dist = (sl - entry) / entry * 100
+            tp_dist = (tp - entry) / entry * 100
+            sl_amt = (sl - entry) * amt   # negativo (pérdida)
+            tp_amt = (tp - entry) * amt   # positivo (ganancia)
+
+        # Tiempo abierta
         try:
-            t0 = datetime.fromisoformat(entry_time.replace("Z", ""))
+            t0 = datetime.fromisoformat(pos.get("entry_time", "").replace("Z", ""))
             mins = int((datetime.utcnow() - t0).total_seconds() // 60)
             hh, mm = divmod(mins, 60)
             elapsed = f"{hh}h {mm}m" if hh else f"{mm}m"
         except Exception:
             elapsed = "n/d"
 
-        # P&L actual
-        pnl_usdt = pnl_pct = None
-        current = None
-        try:
-            if self.controller.exchange is not None:
-                df = self.controller.exchange.get_ohlcv()
-                current = float(df["close"].iloc[-1])
-                if direction == "LONG":
-                    pnl_usdt = (current - entry) * amt_btc
-                    pnl_pct = (current - entry) / entry * 100
-                else:
-                    pnl_usdt = (entry - current) * amt_btc
-                    pnl_pct = (entry - current) / entry * 100
-        except Exception as e:
-            logger.warning(f"No pude obtener precio actual para /position: {e}")
-
-        # Línea de estado
-        if pnl_usdt is None:
-            estado = "<i>(no pude leer el precio actual)</i>"
-        elif pnl_usdt > 0:
-            estado = f"🎉 <b>Vamos ganando +${pnl_usdt:,.2f}</b> ({pnl_pct:+.2f}%)"
-        elif pnl_usdt < 0:
-            estado = f"😬 <b>Vamos perdiendo -${abs(pnl_usdt):,.2f}</b> ({pnl_pct:+.2f}%)"
-        else:
-            estado = f"➖ Justito por ahí, sin ganar ni perder"
-
-        # Cuánto si toca TP/SL
-        if direction == "SHORT":
-            ganancia_tp = (entry - tp) * amt_btc
-            perdida_sl = (sl - entry) * amt_btc
-            dir_humano = "🔻 Aposté a que <b>baja</b>"
-            txt_tp = f"si BAJA a <b>${tp:,.2f}</b>"
-            txt_sl = f"si SUBE a <b>${sl:,.2f}</b>"
-        else:
-            ganancia_tp = (tp - entry) * amt_btc
-            perdida_sl = (entry - sl) * amt_btc
-            dir_humano = "🟢 Aposté a que <b>sube</b>"
-            txt_tp = f"si SUBE a <b>${tp:,.2f}</b>"
-            txt_sl = f"si BAJA a <b>${sl:,.2f}</b>"
-
-        trailing_line = ""
-        if pos.get("trailing_active"):
-            trailing_line = "🎯 <i>Trailing activado: el stop sigue al precio para asegurar ganancia.</i>\n"
-
-        precio_actual_line = (
-            f"💵 Precio ahora: <b>${current:,.2f}</b>\n" if current is not None else ""
-        )
+        emoji = "🟢" if direction == "LONG" else "🔻"
+        trailing = "  ·  🎯 trailing activo" if pos.get("trailing_active") else ""
 
         text = (
-            f"{dir_humano}\n\n"
-            f"📍 Compré a: <b>${entry:,.2f}</b>\n"
-            f"💸 Invertí: <b>${invertido:,.2f}</b> ({amt_btc:.6f} BTC)\n"
-            f"{precio_actual_line}"
-            f"{estado}\n\n"
-            f"🎯 Ganamos +${ganancia_tp:,.2f} {txt_tp}\n"
-            f"🛑 Perdemos -${perdida_sl:,.2f} {txt_sl}\n"
-            f"⏳ Lleva abierta: <b>{elapsed}</b>\n"
-            f"{trailing_line}\n"
-            f"⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
+            f"📈 <b>POSICIÓN — {s.symbol}</b>\n"
+            f"{emoji} {direction} · {s.leverage}x {s.margin_mode}{trailing}\n\n"
+            f"<pre>\n"
+            f"Entrada      ${entry:,.2f}\n"
+            f"Precio       {price_s}\n"
+            f"{pnl_line}\n"
+            f"Invertido    ${notional:,.2f} ({amt:.6f} {base})\n"
+            f"\n"
+            f"Stop-loss    ${sl:,.2f}  {sl_dist:+.2f}%  ({sl_amt:+,.2f})\n"
+            f"Take-profit  ${tp:,.2f}  {tp_dist:+.2f}%  ({tp_amt:+,.2f})\n"
+            f"</pre>\n"
+            f"⏳ Abierta hace {elapsed}  ·  🕐 {self._utc_stamp()}"
         )
         self._send(text, chat_id=chat_id)
 

@@ -123,6 +123,10 @@ class Settings(BaseModel):
     # en true (los demás en false) para evitar el 409 Conflict constante. Las
     # notificaciones salientes siguen funcionando en todos los bots igual.
     telegram_listener_enabled: bool = True
+    # Vista de portafolio en Telegram: si está seteado a un directorio que
+    # contiene los data/<sym>/ de todos los bots (montado read-only en el bot
+    # listener), /status muestra los 3 bots juntos. Vacío = solo este bot.
+    portfolio_data_dir: str = ""
     # Filtro de horario: lista de horas UTC en las que NO operar. Default
     # empty = todas las horas habilitadas. Ej: "6,7,8,9,10,11" descarta EU AM
     # (validado en aud F: +10× retorno backtest 60d). Cargado vía env
@@ -200,4 +204,5 @@ def load_settings() -> Settings:
         margin_mode=os.getenv("MARGIN_MODE", "isolated").lower(),
         user_stream_enabled=os.getenv("USER_STREAM_ENABLED", "false").lower() == "true",
         telegram_listener_enabled=os.getenv("TELEGRAM_LISTENER_ENABLED", "true").lower() == "true",
+        portfolio_data_dir=os.getenv("PORTFOLIO_DATA_DIR", ""),
     )

@@ -50,12 +50,18 @@ services:
       - .env.btc
     volumes:
       - ./data/btc:/app/data
+      # Vista de portafolio: el bot-btc (único con listener Telegram activo) lee
+      # el state.json de los 3 bots para que /status muestre todos juntos.
+      # Read-only: nunca escribe acá.
+      - ./data:/app/all_data:ro
     environment:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
       TZ: "UTC"
       # Marcadores que el cliente puede usar para diferenciar logs de los 4 bots
       BOT_SYMBOL_TAG: "BTC"
+      # /status agregado de los 3 bots (apunta al montaje read-only de arriba)
+      PORTFOLIO_DATA_DIR: "/app/all_data"
 
   bot-sol:
     <<: *bot-defaults
