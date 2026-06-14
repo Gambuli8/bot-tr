@@ -20,6 +20,11 @@ import requests
 logger = logging.getLogger("notifier")
 
 
+def _esc(s) -> str:
+    """Escapa texto dinámico para parse_mode=HTML (evita HTTP 400 con '<='/'>=')."""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 _BOT_TOKEN: Optional[str] = None
 _CHAT_ID: Optional[str] = None
 _API_URL: Optional[str] = None
@@ -99,12 +104,12 @@ def notify_close(symbol: str, direction: str, exit_price: float,
         f"💵 Precio salida: <b>${exit_price:,.2f}</b>\n"
         f"📊 PnL: <b>{sign}${pnl_usdt:,.2f}</b>  ({sign}{pnl_pct:.2f}%)\n"
         f"💰 Balance total: <b>${balance:,.2f}</b>"
-        + (f"\n📝 Motivo: <i>{reason}</i>" if reason else "")
+        + (f"\n📝 Motivo: <i>{_esc(reason)}</i>" if reason else "")
     )
     return send_message(text)
 
 
 def notify_critical(message: str) -> bool:
     """Excepciones críticas o fallos de conexión."""
-    text = f"🚨 <b>ERROR CRÍTICO</b>\n\n{message[:1000]}"
+    text = f"🚨 <b>ERROR CRÍTICO</b>\n\n{_esc(message[:1000])}"
     return send_message(text)

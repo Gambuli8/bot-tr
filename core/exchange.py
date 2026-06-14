@@ -305,6 +305,25 @@ class ExchangeClient:
         }
 
     @retry(max_attempts=3, base_delay=1.0)
+    def get_position(self, symbol: Optional[str] = None) -> dict:
+        """
+        Posición REAL abierta en el exchange para el símbolo. Devuelve el dict de
+        ccxt (con contracts, side, entryPrice, ...) o {} si no hay posición.
+        Se usa en la reconciliación para detectar drift (posición en Binance que
+        el estado local no conoce).
+        """
+        symbol = symbol or self.settings.symbol
+        try:
+            poss = self.exchange.fetch_positions([symbol])
+        except Exception as e:
+            logger.warning(f"No pude leer posiciones del exchange ({symbol}): {e}")
+            return {}
+        for p in poss:
+            if abs(float(p.get("contracts") or 0)) > 0:
+                return p
+        return {}
+
+    @retry(max_attempts=3, base_delay=1.0)
     def get_price(self, symbol: Optional[str] = None) -> float:
         """Precio actual del par (de mainnet si estamos en testnet)."""
         symbol = symbol or self.settings.symbol
@@ -365,12 +384,18 @@ class ExchangeClient:
         side: str,
         amount_usdt: float,
         client_order_id: str,
+        reduce_only: bool = False,
     ) -> dict:
         """
         Coloca una orden de mercado.
         side: 'buy' o 'sell'
         amount_usdt: capital a usar en USDT
         client_order_id: ID único para idempotencia
+        reduce_only: si True, la orden SOLO puede cerrar/reducir, NUNCA abrir una
+          posición nueva. CRÍTICO para los cierres: si el estado local cree que
+          hay posición pero el exchange ya la cerró (ej. el SL se ejecutó), una
+          orden sin reduceOnly abriría una posición OPUESTA fantasma. Con
+          reduceOnly, Binance la rechaza por "no hay nada que reducir" → seguro.
         """
         symbol = self.settings.symbol
         # Asegurar leverage/margin configurados en el exchange antes de abrir
@@ -390,14 +415,19 @@ class ExchangeClient:
             amount_btc = self.exchange.amount_to_precision(symbol, amount_btc)
             check_notional = float(amount_btc) * price
 
-        # Pre-flight: validar filtros antes de mandar (evita errores genéricos)
-        ok, reason = self.validate_order_filters(
-            float(amount_btc), float(check_notional), symbol=symbol,
-        )
-        if not ok:
-            raise ValueError(f"Orden rechazada por filtros: {reason}")
+        # Pre-flight: validar filtros antes de mandar. Los cierres (reduce_only)
+        # NO se validan contra MIN_NOTIONAL: hay que poder cerrar siempre, incluso
+        # posiciones chicas/dust que quedaron por debajo del mínimo.
+        if not reduce_only:
+            ok, reason = self.validate_order_filters(
+                float(amount_btc), float(check_notional), symbol=symbol,
+            )
+            if not ok:
+                raise ValueError(f"Orden rechazada por filtros: {reason}")
 
         params = {"newClientOrderId": client_order_id}
+        if reduce_only:
+            params["reduceOnly"] = True
 
         order = self.exchange.create_market_order(
             symbol=symbol,

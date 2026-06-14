@@ -432,6 +432,7 @@ class OrderManager:
                         side=close_side,
                         amount_usdt=float(position.amount_btc),  # qty en sell
                         client_order_id=f"{client_order_id}_rollback",
+                        reduce_only=True,
                     )
                 except Exception as e2:
                     logger.critical(
@@ -510,6 +511,7 @@ class OrderManager:
                     side=close_side,
                     amount_usdt=float(pos.amount_btc),  # cantidad para sell
                     client_order_id=f"{pos.client_order_id}_close",
+                    reduce_only=True,  # NUNCA abrir: si ya está flat, se rechaza
                 )
             except Exception as e:
                 logger.error(
@@ -872,6 +874,7 @@ class OrderManager:
                             side=close_side,
                             amount_usdt=float(pos.amount_btc),
                             client_order_id=f"{pos.client_order_id}_reconcile_close",
+                            reduce_only=True,
                         )
                         result["actions"].append("posición cerrada a mercado (sin protecciones)")
                     except Exception as e:
@@ -886,7 +889,29 @@ class OrderManager:
                     )
 
         else:
-            # Sin posición local: cualquier orden "bot_*" viva es huérfana
+            # Sin posición local PERO ¿hay una posición real en el exchange?
+            # Esto es DRIFT peligroso (ej. un cierre sin reduceOnly que abrió una
+            # posición fantasma, o una manual). Alertamos fuerte; NO auto-cerramos
+            # (podría ser una posición manual del usuario en el mismo símbolo).
+            try:
+                ex_pos = self.exchange.get_position()
+                contracts = abs(float(ex_pos.get("contracts") or 0)) if ex_pos else 0.0
+                if contracts > 0:
+                    side = ex_pos.get("side", "?")
+                    entry = ex_pos.get("entryPrice", "?")
+                    upnl = ex_pos.get("unrealizedPnl", "?")
+                    liq = ex_pos.get("liquidationPrice", "?")
+                    msg = (
+                        f"POSICIÓN FANTASMA: hay {contracts} {side} en el exchange "
+                        f"(entry {entry}, uPnL {upnl}, liq {liq}) pero el bot no la "
+                        f"conoce (state local sin posición). Revisá/cerrá manualmente."
+                    )
+                    logger.critical(f"❌ {msg}")
+                    result["issues"].append(msg)
+            except Exception as e:
+                result["issues"].append(f"No pude chequear posición real: {e}")
+
+            # Cualquier orden "bot_*" viva es huérfana
             for o in our_orders:
                 oid = str(o.get("id", ""))
                 client_id = o.get("clientOrderId", "")

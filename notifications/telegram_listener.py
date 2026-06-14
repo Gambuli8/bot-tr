@@ -644,7 +644,7 @@ class TelegramListener:
             ts = t.get("exit_time", "")[:16].replace("T", " ")
             lines.append(
                 f"{emoji} {ts} | {pnl:+.2f} USDT ({pnl_pct:+.2f}%) "
-                f"| {str(t.get('exit_reason', ''))[:40]}"
+                f"| {self._escape(str(t.get('exit_reason', ''))[:40])}"
             )
         self._send("\n".join(lines), chat_id=chat_id)
 

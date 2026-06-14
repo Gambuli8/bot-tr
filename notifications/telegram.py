@@ -10,6 +10,17 @@ from logs.logger import logger
 from config.settings import Settings
 
 
+def _esc(s) -> str:
+    """
+    Escapa texto dinámico para parse_mode=HTML de Telegram. CRÍTICO: los motivos
+    de cierre traen '<=' / '>=' (ej. 'Stop-loss: $X <= $Y') que Telegram
+    interpreta como tags HTML inválidos → HTTP 400 y el mensaje NO se envía.
+    """
+    return (
+        str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+
+
 class TelegramNotifier:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -57,13 +68,13 @@ class TelegramNotifier:
 
         if decision.accion == "ESPERAR":
             titulo = f"{action_emoji} Por ahora me quedo quieto"
-            extra = f"<i>Lo que veo:</i> {decision.razon[:160]}"
+            extra = f"<i>Lo que veo:</i> {_esc(decision.razon[:160])}"
         elif decision.accion == "COMPRAR":
             titulo = f"{action_emoji} Veo oportunidad de COMPRAR (subir)"
-            extra = f"<i>Motivo:</i> {decision.razon[:160]}"
+            extra = f"<i>Motivo:</i> {_esc(decision.razon[:160])}"
         else:
             titulo = f"{action_emoji} Veo oportunidad de VENDER (bajar)"
-            extra = f"<i>Motivo:</i> {decision.razon[:160]}"
+            extra = f"<i>Motivo:</i> {_esc(decision.razon[:160])}"
 
         text = (
             f"{titulo}\n\n"
@@ -105,7 +116,7 @@ class TelegramNotifier:
             f"Stop-loss    ${stop_loss:,.2f}  -{sl_pct:.2f}%  (-${sl_amt:,.2f})\n"
             f"Take-profit  ${take_profit:,.2f}  +{tp_pct:.2f}%  (+${tp_amt:,.2f})\n"
             f"</pre>\n"
-            f"📝 {reason}\n"
+            f"📝 {_esc(reason)}\n"
             f"🧠 Confianza: {confidence:.0%}  ·  🕐 {datetime.utcnow().strftime('%H:%M')} UTC"
         )
         self._send(text)
@@ -123,7 +134,7 @@ class TelegramNotifier:
             f"Resultado    {pnl_usdt:+,.2f} USDT ({pnl_pct:+.2f}%)\n"
             f"Salida       ${price:,.2f}\n"
             f"</pre>\n"
-            f"📝 {reason}\n"
+            f"📝 {_esc(reason)}\n"
             f"🕐 {datetime.utcnow().strftime('%H:%M')} UTC"
         )
         self._send(text)
@@ -142,15 +153,15 @@ class TelegramNotifier:
             "🚨 <b>ALERTA DE RIESGO</b>" if severity == "critical"
             else "⚠️ <b>Atención — riesgo</b>"
         )
-        text = f"{head}\n\n{message}\n\n🕐 {datetime.utcnow().strftime('%H:%M')} UTC"
+        text = f"{head}\n\n{_esc(message)}\n\n🕐 {datetime.utcnow().strftime('%H:%M')} UTC"
         self._send(text)
 
     def notify_warning(self, message):
-        text = f"⚠️ <b>Atención</b>\n\n{message}\n\n⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
+        text = f"⚠️ <b>Atención</b>\n\n{_esc(message)}\n\n⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
         self._send(text)
 
     def notify_critical(self, message):
-        text = f"🚨 <b>Algo grave pasó</b>\n\n{message}\n\n⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
+        text = f"🚨 <b>Algo grave pasó</b>\n\n{_esc(message)}\n\n⏰ {datetime.utcnow().strftime('%H:%M')} UTC"
         self._send(text)
 
     def notify_daily_report(self, stats):
