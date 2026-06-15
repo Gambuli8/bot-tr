@@ -50,44 +50,45 @@ services:
       - .env.btc
     volumes:
       - ./data/btc:/app/data
-      # Vista de portafolio: el bot-btc (único con listener Telegram activo) lee
-      # el state.json de los 3 bots para que /status muestre todos juntos.
-      # Read-only: nunca escribe acá.
-      - ./data:/app/all_data:ro
     environment:
       PYTHONUNBUFFERED: "1"
       PYTHONIOENCODING: "utf-8"
       TZ: "UTC"
-      # Marcadores que el cliente puede usar para diferenciar logs de los 4 bots
+      # Único bot tras decomisionar SOL/AVAX (2026-06-15): asume el 100% del wallet.
+      # /status vuelve a modo single-bot (sin PORTFOLIO_DATA_DIR).
       BOT_SYMBOL_TAG: "BTC"
-      # /status agregado de los 3 bots (apunta al montaje read-only de arriba)
-      PORTFOLIO_DATA_DIR: "/app/all_data"
 
-  bot-sol:
-    <<: *bot-defaults
-    container_name: agent-trading-sol
-    env_file:
-      - .env.sol
-    volumes:
-      - ./data/sol:/app/data
-    environment:
-      PYTHONUNBUFFERED: "1"
-      PYTHONIOENCODING: "utf-8"
-      TZ: "UTC"
-      BOT_SYMBOL_TAG: "SOL"
-
-  bot-avax:
-    <<: *bot-defaults
-    container_name: agent-trading-avax
-    env_file:
-      - .env.avax
-    volumes:
-      - ./data/avax:/app/data
-    environment:
-      PYTHONUNBUFFERED: "1"
-      PYTHONIOENCODING: "utf-8"
-      TZ: "UTC"
-      BOT_SYMBOL_TAG: "AVAX"
+  # ─────────────────────────────────────────────────────────────────────────
+  # SOL y AVAX DECOMISIONADOS el 2026-06-15: el WFA con costos reales mostró que
+  # NO tienen edge en el régimen actual (SOL −23% OS, AVAX −5% OS). Todo el
+  # capital se concentra en BTC (único edge robusto: +33% OS). Para reactivarlos
+  # hay que re-validar por WFA. Bloques conservados (comentados) por si se retoman.
+  #
+  # bot-sol:
+  #   <<: *bot-defaults
+  #   container_name: agent-trading-sol
+  #   env_file:
+  #     - .env.sol
+  #   volumes:
+  #     - ./data/sol:/app/data
+  #   environment:
+  #     PYTHONUNBUFFERED: "1"
+  #     PYTHONIOENCODING: "utf-8"
+  #     TZ: "UTC"
+  #     BOT_SYMBOL_TAG: "SOL"
+  #
+  # bot-avax:
+  #   <<: *bot-defaults
+  #   container_name: agent-trading-avax
+  #   env_file:
+  #     - .env.avax
+  #   volumes:
+  #     - ./data/avax:/app/data
+  #   environment:
+  #     PYTHONUNBUFFERED: "1"
+  #     PYTHONIOENCODING: "utf-8"
+  #     TZ: "UTC"
+  #     BOT_SYMBOL_TAG: "AVAX"
 
   # LINK descartado en Fase 3 (WFA con leverage 7× → ❌ 3/7 OS positivas,
   # OS total +6.37%, PF mediano 0.97). Si querés re-evaluarlo, mirá los logs
