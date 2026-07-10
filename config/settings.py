@@ -91,6 +91,17 @@ class Settings(BaseModel):
     pa_sl_min_pct: float = 0.003       # SL mínimo en % del entry (filtro ruido)
     pa_sl_max_pct: float = 0.05        # SL máximo en % del entry (filtro extremos)
 
+    # ─── Donchian Engine (breakout N-velas + volumen + ADX, TF 15m) ───
+    dc_period: int = 20                # N del canal (máx/mín de las N velas previas)
+    dc_vol_ratio_min: float = 1.0      # volumen >= ratio × MA(volume, 20)
+    dc_adx_min: float = 20.0           # Capa 2: régimen tendencial (ADX >= umbral)
+    dc_adx_period: int = 14
+    dc_atr_period: int = 14
+    dc_sl_atr_mult: float = 1.5        # SL en modo "atr": 1.5 × ATR
+    dc_tp_atr_mult: float = 3.0        # TP dinámico: 3 × ATR (R:R 1:2 vs 1.5 ATR)
+    # SL inicial: "channel" = banda opuesta | "atr" = 1.5×ATR | "tighter" = el más cercano
+    dc_sl_mode: str = "tighter"
+
     # ─── Scalping Engine (BB squeeze + expansion, TF 5m) ───
     scalp_bb_window: int = 20
     scalp_bb_dev: int = 2
@@ -152,7 +163,8 @@ class Settings(BaseModel):
     active_hours_utc: str = ""
     # Cantidad máxima de posiciones abiertas en simultáneo.
     max_concurrent_trades: int = 2
-    # Motor activo: "scalping" (5m BB squeeze) | "price_action" (1h sweeps) | "technical" | "claude"
+    # Motor activo: "scalping" (5m BB squeeze) | "donchian" (15m breakout) |
+    # "price_action" (1h sweeps) | "technical" | "claude"
     engine: str = "scalping"
     # Kelly fraccionado: tamaño dinámico de posición según edge reciente.
     use_kelly_sizing: bool = False
@@ -201,6 +213,12 @@ def load_settings() -> Settings:
         active_hours_utc=os.getenv("ACTIVE_HOURS_UTC", ""),
         max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "2")),
         engine=os.getenv("ENGINE", "scalping"),
+        dc_period=int(os.getenv("DC_PERIOD", "20")),
+        dc_vol_ratio_min=float(os.getenv("DC_VOL_RATIO_MIN", "1.0")),
+        dc_adx_min=float(os.getenv("DC_ADX_MIN", "20")),
+        dc_sl_atr_mult=float(os.getenv("DC_SL_ATR_MULT", "1.5")),
+        dc_tp_atr_mult=float(os.getenv("DC_TP_ATR_MULT", "3.0")),
+        dc_sl_mode=os.getenv("DC_SL_MODE", "tighter").lower(),
         tp_scaling_enabled=os.getenv("TP_SCALING_ENABLED", "false").lower() == "true",
         dynamic_trailing_enabled=os.getenv("DYNAMIC_TRAILING", "false").lower() == "true",
         scalp_skip_hours_utc=os.getenv("SCALP_SKIP_HOURS_UTC", ""),

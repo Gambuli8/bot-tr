@@ -35,6 +35,10 @@ class MainStrategy:
         if engine_name == "scalping":
             self.agent = ScalpingEngine(settings)
             logger.info("⚡ Motor: SCALPING (BB squeeze + expansion, TF 5m)")
+        elif engine_name == "donchian":
+            from core.donchian_engine import DonchianEngine
+            self.agent = DonchianEngine(settings)
+            logger.info("📐 Motor: DONCHIAN (breakout N-velas + volumen + ADX, TF 15m)")
         elif engine_name == "price_action":
             self.agent = PriceActionEngine(settings)
             logger.info("📊 Motor: PRICE ACTION (1h trigger + 4h structure)")
@@ -345,9 +349,12 @@ class MainStrategy:
     def _call_engine(self, df, snapshot, trade_history, mtf):
         """Dispatcher por tipo de engine. Cada uno tiene su firma."""
         name = (self.engine_name or "").lower()
-        if name == "scalping":
-            # ScalpingEngine necesita df completo + índice de la última vela
-            return self.agent.analyze(df, len(df) - 1)
+        if name in ("scalping", "donchian"):
+            # Estos engines necesitan el df completo + índice de la última vela.
+            # OJO: la última fila de get_ohlcv es la vela EN FORMACIÓN; evaluamos
+            # la anterior (cerrada) para que la señal no cambie intra-vela.
+            idx = len(df) - 2 if name == "donchian" and len(df) >= 2 else len(df) - 1
+            return self.agent.analyze(df, idx)
         if name == "price_action":
             # PriceActionEngine necesita df_1h y df_4h. Si TF base = 1h, lo usamos
             # como 1h; el 4h lo trae el exchange con MTF.
