@@ -39,7 +39,7 @@ La "desaceleración y giro" se confirma en el paso siguiente (cambio de estructu
 
 | | |
 |---|---|
-| Stop Loss | 0.75 − ⚙️ 0.1 × ATR(14) de 1H |
+| Stop Loss | nivel fijo ⚙️ **0.786** del impulso (opción alternativa: 0.75 − 0.1 × ATR 1H) |
 | Take Profit | techo del impulso (nivel 0) |
 | Margen | fijo, 1–2 USDT (`MARGIN_PER_TRADE_USDT`) |
 | Apalancamiento | el mínimo que acepte BingX para ese margen (tope `MAX_LEVERAGE`) |
@@ -56,12 +56,12 @@ El bot **no entra** (y te avisa por qué) si:
 - El **R:R neto de comisiones es menor a 1.5**.
 - El bot está en pausa (`/pausa`).
 
-## Decisiones abiertas (confirmar antes de operar real)
+## Decisiones tomadas (2026-09-16)
 
-1. Invalidación del 0.75: ¿por **cierre de 1H** (actual) o por **mecha**?
-2. ¿Hace falta además una **vela diaria de rechazo** (mecha ≥ 50 %) o alcanza con tocar la zona + cambio 1H (actual)?
-3. Colchón del SL: 0.1 × ATR 1H (actual) o un nivel fijo (por ejemplo 0.786).
-4. R:R mínimo 1.5 (actual).
+1. El 0.75 se invalida por **cierre de 1H**: las mechas que barren liquidez no cancelan el setup.
+2. **No** se exige vela diaria de rechazo: tocar la zona + cambio de estructura en 1H alcanza.
+3. SL en **0.786 fijo** del impulso: el riesgo por operación queda atado a la estructura, no a la volatilidad.
+4. **R:R mínimo 1.5** neto de comisiones (break-even ≈ 40 % de acierto).
 
 ## Sobre validar la estrategia
 

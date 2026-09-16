@@ -14,8 +14,8 @@ Ejemplo de `entry`:
 {
   "secret": "…", "event": "entry", "id": "BTCUSDT-L-1789585800000",
   "symbol": "BTCUSDT.P", "side": "LONG", "price": 75832.5,
-  "sl": 74950.0, "tp": 78200.0,
-  "fib_start": 73100.0, "fib_end": 78200.0, "fib_618": 75048.2, "fib_75": 74375.0,
+  "sl": 74191.4, "tp": 78200.0,
+  "fib_start": 73100.0, "fib_end": 78200.0, "fib_618": 75048.2, "fib_75": 74375.0, "fib_sl": 74191.4,
   "zone_low": 72800.0, "zone_high": 73400.0,
   "time": 1789585800000, "note": "ruptura diagonal 5m"
 }
@@ -48,6 +48,7 @@ class Signal(BaseModel):
     fib_end: Optional[float] = None    # fin del impulso (nivel 0.0) = TP natural
     fib_618: Optional[float] = None
     fib_75: Optional[float] = None
+    fib_sl: Optional[float] = None     # nivel del Stop Loss (0.786)
     zone_low: Optional[float] = None
     zone_high: Optional[float] = None
     note: str = Field(default="", max_length=300)

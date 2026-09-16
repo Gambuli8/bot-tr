@@ -71,19 +71,21 @@ def cmd_test_signal(args) -> int:
     price = client.price(args.symbol)
     long = args.side == "LONG"
     impulse = price * 0.04
-    start = price - impulse * 0.618 if long else price + impulse * 0.618
-    end = start + impulse if long else start - impulse
+    # Impulso armado para que el precio actual quede justo en el 0.618.
+    end = price + impulse * 0.618 if long else price - impulse * 0.618
+    start = end - impulse if long else end + impulse
     f618 = end - impulse * 0.618 if long else end + impulse * 0.618
     f75 = end - impulse * 0.75 if long else end + impulse * 0.75
+    f786 = end - impulse * 0.786 if long else end + impulse * 0.786
     payload = {
         "secret": s.webhook_secret, "event": args.event,
         "id": f"TEST-{args.symbol}-{args.side[0]}-{int(time.time())}",
         "symbol": args.symbol, "side": args.side, "price": price, "time": int(time.time() * 1000),
-        "fib_start": start, "fib_end": end, "fib_618": f618, "fib_75": f75,
+        "fib_start": start, "fib_end": end, "fib_618": f618, "fib_75": f75, "fib_sl": f786,
         "zone_low": start * 0.995, "zone_high": start * 1.005, "note": "PRUEBA manual (no es una señal real)",
     }
     if args.event == "entry":
-        payload["sl"] = f75 * (0.998 if long else 1.002)
+        payload["sl"] = f786
         payload["tp"] = end
     resp = requests.post(args.url.rstrip("/") + "/tv/webhook", json=payload, timeout=10)
     print(resp.status_code, resp.text)

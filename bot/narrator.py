@@ -78,8 +78,9 @@ class Narrator:
                     f"La estructura de 1H giró a <b>{bias}</b>. Tracé Fibonacci del impulso "
                     f"({px(s.fib_start)} → {px(s.fib_end)}).\n"
                     f"• Zona de entrada (0.618): <b>{px(s.fib_618)}</b>\n"
-                    f"• Invalidación (0.75): <b>{px(s.fib_75)}</b>\n"
-                    f"👉 Espero que el precio retroceda hasta el 0.618.{note}")
+                    f"• Invalidación (cierre 1H más allá del 0.75): <b>{px(s.fib_75)}</b>\n"
+                    + (f"• Stop Loss si entro (0.786): <b>{px(s.fib_sl)}</b>\n" if s.fib_sl else "")
+                    + f"👉 Espero que el precio retroceda hasta el 0.618.{note}")
         if s.event == "fib":
             return (f"{self._head('🎯', f'{asset}: retroceso en zona de entrada')}\n"
                     f"El precio ({px(s.price)}) llegó al 0.618 ({px(s.fib_618)}) sin romper el 0.75 "

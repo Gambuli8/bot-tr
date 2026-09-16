@@ -15,7 +15,7 @@
 //       según config) → "cancel".
 //   5m  Diagonal = línea que une los 2 últimos máximos decrecientes del retroceso
 //       (o el techo del impulso + el último máximo). Cierre de 5m por encima → "entry".
-//   SL  0.75 − colchón × ATR 1H.   TP  techo del impulso (nivel 0).
+//   SL  nivel fijo 0.786 del impulso (configurable).   TP  techo del impulso (nivel 0).
 //
 //  El bot (backend) vuelve a validar todo: R:R mínimo, liquidación, slippage, etc.
 // ─────────────────────────────────────────────────────────────────────────────
@@ -38,7 +38,9 @@ hPivotLen      = input.int(3, "Pivote 1H (velas a cada lado)", minval = 1, group
 fibEntry       = input.float(0.618, "Nivel de entrada", step = 0.001, group = grpH)
 fibInval       = input.float(0.75, "Nivel de invalidación", step = 0.01, group = grpH)
 invalMode      = input.string("Cierre 1H", "Se invalida si rompe el 0.75 por", options = ["Cierre 1H", "Mecha"], group = grpH)
-slBufAtr       = input.float(0.1, "Colchón del SL más allá del 0.75 (× ATR 1H)", step = 0.05, group = grpH)
+slMode         = input.string("Fibo fijo", "Stop Loss", options = ["Fibo fijo", "0.75 − ATR"], group = grpH)
+slFib          = input.float(0.786, "Nivel Fibo del SL (modo Fibo fijo)", step = 0.001, group = grpH)
+slBufAtr       = input.float(0.1, "Colchón bajo el 0.75 (× ATR 1H, modo ATR)", step = 0.05, group = grpH)
 chochExpiryH   = input.int(48, "Horas máx. para el cambio 1H tras tocar la zona", minval = 1, group = grpH)
 triggerExpiryH = input.int(48, "Horas máx. para retroceso + gatillo 5m", minval = 1, group = grpH)
 
@@ -114,6 +116,7 @@ type Setup
     int impEndBar
     float f618
     float f75
+    float fSL               // nivel Fibo del SL (0.786 por defecto)
     int stageTime
     array<float> pivP
     array<int> pivB
@@ -131,7 +134,7 @@ f_json(Setup s, string ev, float price, float sl, float tp, string note) =>
     if not na(s.zoneLo)
         j += ',"zone_low":' + f_str(s.zoneLo) + ',"zone_high":' + f_str(s.zoneHi)
     if not na(s.impEnd)
-        j += ',"fib_start":' + f_str(s.extreme) + ',"fib_end":' + f_str(s.impEnd) + ',"fib_618":' + f_str(s.f618) + ',"fib_75":' + f_str(s.f75)
+        j += ',"fib_start":' + f_str(s.extreme) + ',"fib_end":' + f_str(s.impEnd) + ',"fib_618":' + f_str(s.f618) + ',"fib_75":' + f_str(s.f75) + ',"fib_sl":' + f_str(s.fSL)
     j + ',"note":"' + note + '"}'
 
 emit(Setup s, string ev, float price, float sl, float tp, string note) =>
@@ -142,6 +145,7 @@ recalcFib(Setup s) =>
     rng = s.impEnd - s.extreme       // positivo en LONG, negativo en SHORT
     s.f618 := s.impEnd - fibEntry * rng
     s.f75 := s.impEnd - fibInval * rng
+    s.fSL := s.impEnd - slFib * rng
 
 reset(Setup s) =>
     s.state := 0
@@ -154,6 +158,7 @@ reset(Setup s) =>
     s.impEndBar := na
     s.f618 := na
     s.f75 := na
+    s.fSL := na
     s.pivP.clear()
     s.pivB.clear()
 
@@ -235,6 +240,7 @@ step(Setup s) =>
             if showDraw
                 line.new(s.impEndBar, s.f618, bar_index + 24, s.f618, color = color.orange, style = line.style_dashed)
                 line.new(s.impEndBar, s.f75, bar_index + 24, s.f75, color = color.red, style = line.style_dotted)
+                line.new(s.impEndBar, s.fSL, bar_index + 24, s.fSL, color = color.maroon, style = line.style_solid)
         else if s.state == 3
             n = s.pivP.size()
             if n >= 1
@@ -250,7 +256,7 @@ step(Setup s) =>
                     breakout = isLong ? (close > lineNow and close[1] <= linePrev) : (close < lineNow and close[1] >= linePrev)
                     insideFib = isLong ? close > s.f75 : close < s.f75
                     if breakout and insideFib
-                        sl = isLong ? s.f75 - slBufAtr * hAtr : s.f75 + slBufAtr * hAtr
+                        sl = slMode == "Fibo fijo" ? s.fSL : (isLong ? s.f75 - slBufAtr * hAtr : s.f75 + slBufAtr * hAtr)
                         tp = s.impEnd
                         emit(s, "entry", close, sl, tp, "ruptura de la diagonal en 5m")
                         if showDraw
