@@ -1,0 +1,50 @@
+# Bot BingX: recibe alertas de TradingView y opera Futuros Perpetuos.
+#
+# En el VPS se engancha a la red de Caddy (proyecto n8n-financiero), que publica
+# https://ggambuli-n8n.online/tv/* → bingx-bot:8080. El puerto NO se publica a internet.
+#
+#   docker compose up -d --build
+#   docker compose logs -f bingx-bot
+#   docker compose exec bingx-bot python -m bot.cli check
+
+services:
+  bingx-bot:
+    build: .
+    image: bingx-bot:latest
+    container_name: bingx-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      - ./data/bingx:/app/data
+    ports:
+      - "127.0.0.1:8080:8080"   # sólo accesible desde el propio VPS (pruebas)
+    networks:
+      - caddy
+    labels:
+      - autoheal=true
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.50"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: bingx-autoheal
+    restart: unless-stopped
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+networks:
+  caddy:
+    external: true
+    name: n8n-financiero_n8n_net
