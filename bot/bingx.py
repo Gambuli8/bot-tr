@@ -31,6 +31,9 @@ BASE_URLS = {
     "demo": "https://open-api-vst.bingx.com",
 }
 
+INTERVAL_MS = {"5m": 5 * 60_000, "15m": 15 * 60_000, "1h": 60 * 60_000, "4h": 4 * 60 * 60_000,
+               "1d": 24 * 60 * 60_000}
+
 
 class BingXError(Exception):
     def __init__(self, code: Any, msg: str, path: str = ""):
@@ -176,6 +179,30 @@ class BingXClient:
             for k in data or []
         ]
         return sorted(out, key=lambda k: k["time"])
+
+    def klines_history(self, symbol: str, interval: str, bars: int, closed_only: bool = True) -> list[dict]:
+        """Hasta `bars` velas hacia atrás, paginando de a 1000 (el máximo de BingX)."""
+        interval_ms = INTERVAL_MS[interval]
+        collected: dict[int, dict] = {}
+        end_time: Optional[int] = None
+        while len(collected) < bars:
+            params = {"symbol": symbol, "interval": interval, "limit": min(1000, bars - len(collected) + 1)}
+            if end_time is not None:
+                params["endTime"] = end_time
+            data = self._request("GET", "/openApi/swap/v3/quote/klines", params, signed=False) or []
+            page = [{"time": int(k["time"]), "open": _f(k["open"]), "high": _f(k["high"]),
+                     "low": _f(k["low"]), "close": _f(k["close"]), "volume": _f(k["volume"])} for k in data]
+            new = [k for k in page if k["time"] not in collected]
+            if not new:
+                break
+            for k in new:
+                collected[k["time"]] = k
+            end_time = min(k["time"] for k in page) - 1
+        out = sorted(collected.values(), key=lambda k: k["time"])
+        if closed_only:
+            now_ms = int(time.time() * 1000)
+            out = [k for k in out if k["time"] + interval_ms <= now_ms]
+        return out[-bars:]
 
     # ───────── cuenta ─────────
 

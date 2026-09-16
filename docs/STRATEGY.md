@@ -1,5 +1,9 @@
 # Estrategia: Zona 1D + Fibonacci 1H + Diagonal 5m
 
+La corre el bot en `bot/strategy.py` (velas del mercado real de BingX, cada 5 min). El indicador
+`tradingview/bingx_fibo_mtf.pine` tiene la misma lógica para verla en el gráfico: **si se cambia una
+regla, hay que cambiarla en los dos**.
+
 Versión mecánica (sin interpretación) de la estrategia acordada. Todo lo marcado con ⚙️ es
 configurable en el indicador de TradingView sin tocar código.
 
@@ -28,6 +32,7 @@ La "desaceleración y giro" se confirma en el paso siguiente (cambio de estructu
 - **Etapa `fib`:** el precio retrocede y toca el **0.618** del impulso.
 - **Invalidación:** rompe el **0.75** → `cancel`. ⚙️ "Cierre 1H" (por defecto) o "Mecha".
 - Se cancela si pasan ⚙️ 48 h sin retroceso + gatillo.
+- Se cancela si, ya en el 0.618, el precio vuelve al techo del impulso (TP) sin haber gatillado.
 
 ## 4. Cinco minutos — gatillo
 

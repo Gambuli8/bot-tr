@@ -69,6 +69,10 @@ class Settings:
     max_signal_age_s: int
     max_slippage_pct: float
 
+    # Origen de las señales: "internal" (el bot analiza solo) | "tradingview" (alertas webhook)
+    strategy_source: str
+    scan_delay_s: float
+
     # Webhook TradingView
     webhook_secret: str
     enforce_tv_ips: bool
@@ -101,6 +105,10 @@ class Settings:
         return "REAL 💵" if self.is_live else "DEMO 🧪"
 
     @property
+    def uses_tradingview(self) -> bool:
+        return self.strategy_source == "tradingview"
+
+    @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token and self.telegram_chat_id)
 
@@ -114,6 +122,8 @@ class Settings:
             errors.append("BINGX_MODE debe ser 'demo' o 'live'")
         if not self.bingx_api_key or not self.bingx_api_secret:
             errors.append("Faltan BINGX_API_KEY / BINGX_API_SECRET")
+        if self.strategy_source not in ("internal", "tradingview"):
+            errors.append("STRATEGY_SOURCE debe ser 'internal' o 'tradingview'")
         if len(self.webhook_secret) < 16:
             errors.append("WEBHOOK_SECRET debe tener al menos 16 caracteres")
         if not 0.5 <= self.margin_per_trade_usdt <= 5:
@@ -161,6 +171,8 @@ def load_settings(env_file: str | None = None) -> Settings:
         daily_loss_limit_usdt=_env_float("DAILY_LOSS_LIMIT_USDT", 3.0),
         max_signal_age_s=_env_int("MAX_SIGNAL_AGE_S", 180),
         max_slippage_pct=_env_float("MAX_SLIPPAGE_PCT", 0.4),
+        strategy_source=_env("STRATEGY_SOURCE", "internal").lower(),
+        scan_delay_s=_env_float("SCAN_DELAY_S", 8.0),
         webhook_secret=_env("WEBHOOK_SECRET"),
         enforce_tv_ips=_env_bool("ENFORCE_TV_IPS", True),
         telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),

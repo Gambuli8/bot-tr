@@ -229,8 +229,11 @@ step(Setup s) =>
             s.pivB.push(pivBar)
 
         brokeInval = invalMode == "Mecha" ? (isLong ? low < s.f75 : high > s.f75) : (newH1 and (isLong ? hClose < s.f75 : hClose > s.f75))
+        passedTarget = s.state == 3 and (isLong ? high >= s.impEnd : low <= s.impEnd)
         if brokeInval
             cancel(s, "rompio el 0.75")
+        else if passedTarget
+            cancel(s, "el precio volvio al objetivo sin gatillo en 5m")
         else if time - s.stageTime > triggerExpiryH * 3600000
             cancel(s, s.state == 2 ? "no retrocedio al 0.618 a tiempo" : "sin gatillo en 5m a tiempo")
         else if s.state == 2 and (isLong ? low <= s.f618 : high >= s.f618)

@@ -32,6 +32,7 @@ from bot.executor import Executor
 from bot.monitor import Monitor
 from bot.narrator import Narrator
 from bot.reports import Reporter
+from bot.scanner import Scanner
 from bot.signals import Signal
 from bot.store import Store
 from bot.telegram import TelegramBot
@@ -79,6 +80,9 @@ class App:
         self.executor = Executor(s, self.client, self.store, self.narrator, self.telegram.send)
         self.monitor = Monitor(s, self.client, self.store, self.executor, self.narrator,
                                self.reporter, self.telegram.send)
+        self.scanner = None if s.uses_tradingview else Scanner(
+            s, self.client, self.store, self.executor, self.telegram.send, delay_s=s.scan_delay_s,
+            market=BingXClient("", "", "live"))
         self.telegram.client, self.telegram.store = self.client, self.store
         self.telegram.executor, self.telegram.reporter = self.executor, self.reporter
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="signal")
@@ -110,11 +114,15 @@ class App:
             self.telegram.send(self.narrator.alert(f"No pude leer el saldo de BingX: {exc}", critical=True))
 
         self.monitor.start()
+        if self.scanner is not None:
+            self.scanner.start()
         self.telegram.start_listener()
         self.telegram.send(self.narrator.started(balance, s.symbols, s.margin_per_trade_usdt))
 
     def shutdown(self) -> None:
         self.monitor.stop()
+        if self.scanner is not None:
+            self.scanner.stop()
         self.telegram.stop()
         self.pool.shutdown(wait=True, cancel_futures=False)
 
@@ -147,8 +155,15 @@ def health():
     beat = bot.store.heartbeat_path
     age = time.time() - int(beat.read_text()) if beat.exists() else None
     ok = age is not None and age < bot.settings.monitor_interval_s * 5
-    return JSONResponse({"ok": ok, "mode": bot.settings.mode, "heartbeat_age_s": age},
-                        status_code=200 if ok else 503)
+    body = {"ok": ok, "mode": bot.settings.mode, "source": bot.settings.strategy_source, "heartbeat_age_s": age}
+    scanner = getattr(bot, "scanner", None)
+    if scanner is not None:
+        # El warm-up tarda ~1 min; después el scanner tiene que correr al menos cada 5 min.
+        scan_age = time.time() - scanner.last_scan_ok if scanner.last_scan_ok else None
+        body["scan_age_s"] = scan_age
+        if scanner.ready and (scan_age is None or scan_age > 15 * 60):
+            ok = body["ok"] = False
+    return JSONResponse(body, status_code=200 if ok else 503)
 
 
 @app.post("/tv/webhook")
@@ -156,7 +171,12 @@ async def tradingview_webhook(request: Request):
     bot: App = state["bot"]
     ip = _client_ip(request)
     # Loopback permitido para `python -m bot.cli test-signal` dentro del container.
-    if bot.settings.enforce_tv_ips and ip not in TRADINGVIEW_IPS | {"127.0.0.1", "::1"}:
+    loopback = ip in ("127.0.0.1", "::1")
+    if not bot.settings.uses_tradingview and not loopback:
+        # Con el motor interno, TradingView no puede disparar operaciones.
+        log.warning("Webhook ignorado (STRATEGY_SOURCE=internal) desde %s", ip)
+        return JSONResponse({"error": "tradingview webhook disabled"}, status_code=403)
+    if bot.settings.enforce_tv_ips and ip not in TRADINGVIEW_IPS and not loopback:
         log.warning("Webhook rechazado por IP %s", ip)
         return JSONResponse({"error": "forbidden"}, status_code=403)
 

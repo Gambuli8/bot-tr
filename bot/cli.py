@@ -5,6 +5,9 @@ Herramientas de línea de comandos.
       Verifica .env, conexión y firma con BingX, saldo, modo de posición, y
       muestra para cada par cuánto apalancamiento y cantidad usaría con tu margen.
 
+  python -m bot.cli replay --days 5 [--symbol BTC-USDT]
+      Corre el motor sobre velas reales de los últimos días y muestra qué habría hecho (no opera).
+
   python -m bot.cli test-signal --event zone --symbol BTC-USDT --side LONG [--url http://127.0.0.1:8080]
       Manda una alerta de prueba al webhook (como si fuera TradingView) para ver
       el mensaje en Telegram. Los eventos 'entry' sólo se permiten en modo demo.
@@ -92,17 +95,103 @@ def cmd_test_signal(args) -> int:
     return 0 if resp.ok else 1
 
 
+def cmd_replay(args) -> int:
+    """Corre el motor sobre los últimos días de velas reales y lista lo que habría hecho (no opera)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from bot.fmt import price
+    from bot.sizing import build_plan
+    from bot.strategy import StrategyParams, SymbolStrategy, build_bars, build_daily_zones, build_hourly
+
+    s = load_settings()
+    client = BingXClient(s.bingx_api_key, s.bingx_api_secret, s.mode)   # specs de contrato del modo actual
+    market = BingXClient("", "", "live")                                # velas del mercado real
+    tz = ZoneInfo(s.timezone)
+    params = StrategyParams()
+    symbols = [args.symbol] if args.symbol else s.symbols
+    bars_5m = min(int(args.days * 288), 20000)
+    totals = {"zone": 0, "choch": 0, "fib": 0, "cancel": 0, "entry": 0}
+    results = []  # (symbol, pnl_usdt, r_multiple)
+    for sym in symbols:
+        zones = build_daily_zones(market.klines_history(sym, "1d", 400), params)
+        hourly = build_hourly(market.klines_history(sym, "1h", int(args.days * 24) + 200), params)
+        bars = build_bars(market.klines_history(sym, "5m", bars_5m), hourly, zones, params)
+        engine = SymbolStrategy(sym, params)
+        spec = client.contract(sym)
+        busy_until = -1  # una posición por par, como el ejecutor
+        print(f"\n=== {sym} · {len(bars)} velas 5m ===")
+        for i, bar in enumerate(bars):
+            for ev in engine.on_bar(bar):
+                totals[ev["event"]] += 1
+                if ev["event"] != "entry" and not args.verbose:
+                    continue
+                when = datetime.fromtimestamp(ev["time"] / 1000, tz).strftime("%d/%m %H:%M")
+                line = f"  {when} {ev['side']:<5} {ev['event']:<6} {price(ev['price'])}  {ev['note']}"
+                if ev["event"] == "entry":
+                    plan = build_plan(symbol=sym, direction=ev["side"], entry=ev["price"], stop_loss=ev["sl"],
+                                      take_profit=ev["tp"], spec=spec, margin_usdt=s.margin_per_trade_usdt,
+                                      max_leverage=s.max_leverage, min_rr=s.min_rr)
+                    if not plan.ok:
+                        line += f" → NO opera: {plan.reason}"
+                    elif i <= busy_until:
+                        line += " → NO opera: ya había una operación abierta en el par"
+                    else:
+                        outcome, busy_until = _simulate(bars, i, ev["side"], ev["sl"], ev["tp"])
+                        pnl = {"TP": plan.reward_usdt, "SL": -plan.risk_usdt}.get(outcome)
+                        if pnl is not None:
+                            results.append((sym, pnl, pnl / plan.risk_usdt))
+                        line += (f" | ×{plan.leverage} SL {price(ev['sl'])} TP {price(ev['tp'])} R:R {plan.rr:.2f}"
+                                 f" → {outcome}{'' if pnl is None else f' {pnl:+.3f} USDT'}")
+                print(line)
+        active = [f"{x.side} etapa {x.state}" for x in engine.setups() if x.state > 0]
+        print(f"  en curso al final: {', '.join(active) or 'ninguno'}")
+
+    print(f"\nEventos: {totals}")
+    if results:
+        wins = [r for r in results if r[1] > 0]
+        net = sum(r[1] for r in results)
+        print(f"Operaciones simuladas cerradas: {len(results)} · ganadas {len(wins)} "
+              f"({len(wins) / len(results):.0%}) · resultado neto {net:+.3f} USDT · "
+              f"promedio {sum(r[2] for r in results) / len(results):+.2f} R")
+        for sym in symbols:
+            rows = [r for r in results if r[0] == sym]
+            if rows:
+                print(f"  {sym:<10} {len(rows):>3} ops · ganadas {sum(1 for r in rows if r[1] > 0):>2} · "
+                      f"{sum(r[1] for r in rows):+.3f} USDT")
+        print("ADVERTENCIA: muestra chica, sin slippage ni límite diario/tope de posiciones. No valida la estrategia.")
+    return 0
+
+
+def _simulate(bars, entry_i: int, side: str, sl: float, tp: float) -> tuple[str, int]:
+    """Qué tocó primero después de la entrada. Si SL y TP caen en la misma vela, se asume SL (conservador)."""
+    for j in range(entry_i + 1, len(bars)):
+        b = bars[j]
+        hit_sl = b.low <= sl if side == "LONG" else b.high >= sl
+        hit_tp = b.high >= tp if side == "LONG" else b.low <= tp
+        if hit_sl:
+            return "SL", j
+        if hit_tp:
+            return "TP", j
+    return "ABIERTA", len(bars)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="bot.cli")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("check")
+    r = sub.add_parser("replay")
+    r.add_argument("--days", type=float, default=5)
+    r.add_argument("--symbol", default="")
+    r.add_argument("--verbose", action="store_true", help="mostrar también zona, cambio 1H, 0,618 y cancelaciones")
     t = sub.add_parser("test-signal")
     t.add_argument("--event", choices=["zone", "choch", "fib", "cancel", "entry"], default="zone")
     t.add_argument("--symbol", default="BTC-USDT")
     t.add_argument("--side", choices=["LONG", "SHORT"], default="LONG")
     t.add_argument("--url", default="http://127.0.0.1:8080")
     args = parser.parse_args()
-    sys.exit(cmd_check() if args.cmd == "check" else cmd_test_signal(args))
+    handlers = {"check": lambda: cmd_check(), "replay": lambda: cmd_replay(args), "test-signal": lambda: cmd_test_signal(args)}
+    sys.exit(handlers[args.cmd]())
 
 
 if __name__ == "__main__":

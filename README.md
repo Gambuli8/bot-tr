@@ -1,29 +1,30 @@
-# Bot de trading BingX (TradingView → VPS → BingX)
+# Bot de trading BingX
 
-Bot para Futuros Perpetuos USDT-M de BingX. La estrategia corre en TradingView (Pine Script);
-el bot en el VPS recibe las alertas, valida, calcula el tamaño con **margen fijo de 1–2 USDT**,
-opera en BingX con SL y TP, y te cuenta todo por Telegram.
+Bot para Futuros Perpetuos USDT-M de BingX. **Analiza solo** la estrategia Zona 1D + Fibonacci 1H +
+Diagonal 5m con velas de BingX (gratis, sin TradingView pago), opera con **margen fijo de 1–2 USDT**
+con SL y TP, y te cuenta todo por Telegram.
 
 ```
-TradingView (5m, un indicador por par)
-  │  webhook JSON: zone → choch → fib → entry  (o cancel)
-  ▼
-https://ggambuli-n8n.online/tv/webhook  (Caddy, HTTPS)
-  ▼
-bingx-bot (FastAPI, Docker)
-  ├─ valida: secret, IP de TradingView, duplicados, pausa, antigüedad, slippage
-  ├─ sizing: margen fijo → apalancamiento mínimo · liquidación vs SL · R:R neto
-  ├─ BingX: orden a mercado + SL + TP (isolated, one-way, cierres reduceOnly)
+bingx-bot (Docker, VPS)
+  ├─ scanner: cada 5 min baja velas 1D/1H/5m de los 6 pares → motor de estrategia (bot/strategy.py)
+  │     eventos: zona → cambio 1H → 0,618 → entrada (o cancelado)
+  ├─ ejecutor: valida (duplicados, pausa, slippage, límite diario) → sizing (margen fijo, apalancamiento
+  │     mínimo, liquidación vs SL, R:R neto) → BingX: orden + SL + TP (isolated, one-way, reduceOnly)
   ├─ monitor: detecta cierres TP/SL, PnL real, SL faltante, posiciones desconocidas
-  ├─ Telegram: narra cada etapa, entradas, salidas · comandos /estado /pausa /cerrar…
+  ├─ Telegram: narra cada etapa, entradas, salidas · /estado /hoy /semana /mes /pausa /cerrar
   └─ resúmenes semanales y mensuales → Telegram + Google Drive
+
+TradingView (opcional): el indicador tradingview/bingx_fibo_mtf.pine dibuja lo mismo en el gráfico
+(funciona en el plan gratis). Con STRATEGY_SOURCE=tradingview las entradas llegan por webhook (plan pago).
 ```
 
 ## Estructura
 
 | Archivo | Qué hace |
 |---|---|
-| `bot/server.py` | Webhook `/tv/webhook`, `/tv/health`, arranque |
+| `bot/server.py` | Arranque, `/tv/health`, webhook opcional `/tv/webhook` |
+| `bot/strategy.py` | Motor de la estrategia (misma lógica que el Pine) |
+| `bot/scanner.py` | Baja velas cada 5 min y le pasa los eventos al ejecutor |
 | `bot/signals.py` | Formato del JSON que manda TradingView |
 | `bot/executor.py` | Controles y apertura de operaciones |
 | `bot/sizing.py` | Margen fijo → apalancamiento, cantidad, riesgo, R:R |
@@ -32,8 +33,8 @@ bingx-bot (FastAPI, Docker)
 | `bot/narrator.py` | Mensajes en castellano simple |
 | `bot/telegram.py` | Envío y comandos |
 | `bot/reports.py`, `bot/drive.py` | Resúmenes y subida a Drive |
-| `bot/cli.py` | `check` (verifica todo) y `test-signal` (alertas de prueba) |
-| `tradingview/bingx_fibo_mtf.pine` | La estrategia (indicador con alertas) |
+| `bot/cli.py` | `check` (verifica todo), `replay` (motor sobre velas reales) y `test-signal` |
+| `tradingview/bingx_fibo_mtf.pine` | La estrategia para ver en el gráfico (y alertas opcionales) |
 | `docs/STRATEGY.md` | Reglas exactas de la estrategia |
 | `docs/DEPLOY.md` | Puesta en marcha: BingX, Telegram, VPS, TradingView, Drive, demo → real |
 
