@@ -75,13 +75,19 @@ def apply_config(settings, cfg: dict) -> None:
 
 
 def run_subperiod_pa(df_main: pd.DataFrame, df_higher: pd.DataFrame,
-                      settings, leverage: float, exec_cfg: Optional[dict] = None) -> Sim:
+                      settings, leverage: float, exec_cfg: Optional[dict] = None,
+                      max_lookback: Optional[int] = None) -> Sim:
     exec_cfg = exec_cfg or {}
     engine = PriceActionEngine(settings)
     sim = Sim(settings, leverage=leverage, **exec_cfg)
     warmup = 60
     if len(df_main) <= warmup:
         return sim
+    # max_lookback: pasar solo una ventana TRAILING al motor en vez del slice
+    # creciente. PA solo usa swings recientes (últimos 2 highs/lows + último sweep),
+    # así que con ~600 velas el resultado es equivalente pero O(n) en vez de O(n²).
+    # None = comportamiento histórico (slice completo) → preserva el WFA validado.
+    hi_cap = 250 if max_lookback else None
     for i in range(warmup, len(df_main)):
         ts = df_main.index[i]
         sim.step(df_main.iloc[i], i, ts)
@@ -89,8 +95,11 @@ def run_subperiod_pa(df_main: pd.DataFrame, df_higher: pd.DataFrame,
         if sim.position is None:
             sim._try_fill_pending(df_main.iloc[i], i, ts)
         if sim.position is None and sim.pending is None:
-            df_main_sf = df_main.iloc[: i + 1]
+            lo = max(0, i + 1 - max_lookback) if max_lookback else 0
+            df_main_sf = df_main.iloc[lo: i + 1]
             df_higher_sf = df_higher.loc[: ts]
+            if hi_cap:
+                df_higher_sf = df_higher_sf.iloc[-hi_cap:]
             if len(df_higher_sf) < 30:
                 continue
             dec = engine.analyze(df_main_sf, df_higher_sf)
@@ -168,6 +177,9 @@ def main():
     ap.add_argument("--maker-fee", type=float, default=None)
     ap.add_argument("--slippage", type=float, default=0.0)
     ap.add_argument("--maker-timeout", type=int, default=2)
+    ap.add_argument("--max-lookback", type=int, default=None,
+                    help="Ventana trailing (velas) que ve el motor PA → O(n). "
+                         "Default None = slice completo (más lento pero idéntico al WFA validado).")
     args = ap.parse_args()
 
     exec_cfg = {
@@ -230,7 +242,8 @@ def main():
         is_results = []
         for c_idx, cfg in enumerate(grid, 1):
             apply_config(s, cfg)
-            sim = run_subperiod_pa(df_is, df_higher, s, args.leverage, exec_cfg)
+            sim = run_subperiod_pa(df_is, df_higher, s, args.leverage, exec_cfg,
+                                   max_lookback=args.max_lookback)
             m = sim_metrics(sim)
             is_results.append((cfg, m))
             cstr = f"vm={cfg['pa_vol_mult']:.1f}/asl={cfg['pa_atr_sl_mult']:.1f}/rr={cfg['pa_tp_rr']:.1f}/fr={cfg['pa_fractal_n']}"
@@ -245,7 +258,8 @@ def main():
         print(f"   → BEST IS: ret={best_is['ret']:+.2f}%  PF={best_is['pf']:.2f}  n={best_is['n']}")
 
         apply_config(s, best_cfg)
-        sim_os = run_subperiod_pa(df_os, df_higher, s, args.leverage, exec_cfg)
+        sim_os = run_subperiod_pa(df_os, df_higher, s, args.leverage, exec_cfg,
+                                  max_lookback=args.max_lookback)
         m_os = sim_metrics(sim_os)
         print(f"   ⇒ OS: ret={m_os['ret']:+.2f}%  PF={m_os['pf']:.2f}  "
                f"n={m_os['n']}  DD={m_os['dd']:.2f}%")
