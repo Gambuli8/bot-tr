@@ -376,9 +376,8 @@ def main():
 
     candidates = [row for row in table if row[0] != "REF" and row[2]["n"] >= 50 and row[2]["avg"] > 0]
     both = [row for row in table if row[2]["n"] and row[3]["n"] and row[2]["avg"] > 0 and row[3]["avg"] > 0]
-    print(f"
-Variantes positivas en IS y en OOS a la vez: "
-          f"{', '.join(f'{e} · {m}' for e, m, *_ in both) or 'NINGUNA'}")
+    both_names = ", ".join(f"{e} · {m}" for e, m, *_ in both) or "NINGUNA"
+    print(f"\nVariantes positivas en IS y en OOS a la vez: {both_names}")
     if not candidates:
         print("Ninguna variante con ≥ 50 operaciones es positiva in-sample: no hay nada que validar fuera de muestra.")
     else:
