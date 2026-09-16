@@ -63,3 +63,34 @@ def test_rejects_when_leverage_cap_exceeded():
 def test_prices_rounded_to_contract_precision():
     p = plan(sl=74700.04, tp=78500.06)
     assert p.sl_str == "74700.0" and p.tp_str == "78500.1"
+
+
+# ───────── riesgo fijo ─────────
+
+from bot.sizing import build_plan_fixed_risk  # noqa: E402
+
+
+def fixed(symbol="BTC-USDT", direction="LONG", entry=75000.0, sl=74250.0, tp=77000.0, risk=0.5, **kw):
+    params = dict(symbol=symbol, direction=direction, entry=entry, stop_loss=sl, take_profit=tp,
+                  spec=SPECS[symbol], risk_usdt=risk, max_leverage=20, min_rr=1.5)
+    params.update(kw)
+    return build_plan_fixed_risk(**params)
+
+
+def test_fixed_risk_never_exceeds_target_and_keeps_liquidation_beyond_sl():
+    p = fixed()                                  # SL a 1 %
+    assert p.ok, p.reason
+    assert 0.40 < p.risk_usdt <= 0.5             # redondeo hacia abajo de la cantidad
+    assert p.qty_str == "0.0006"
+    liq_dist = abs(p.entry - p.liquidation_price) / p.entry
+    assert p.sl_distance_pct / 100 < liq_dist * 0.8
+
+
+def test_fixed_risk_rejects_when_minimum_contract_needs_more_risk():
+    p = fixed(symbol="DOGE-USDT", entry=0.25, sl=0.20, tp=0.40, risk=0.5)   # 25 DOGE × 0,05 = 1,25 USDT
+    assert not p.ok and "mínimo" in p.reason
+
+
+def test_fixed_risk_rr_filter():
+    p = fixed(tp=75500.0)
+    assert not p.ok and "R:R" in p.reason

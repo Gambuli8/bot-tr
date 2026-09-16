@@ -42,6 +42,13 @@ class StrategyParams:
     m_pivot_len: int = 3
     allow_long: bool = True
     allow_short: bool = True
+    # Filtros de confluencia (apagados por defecto: se activan de a uno para testear)
+    filter_trend: bool = False      # sólo a favor de la EMA diaria (último día cerrado)
+    trend_ema_period: int = 50
+    filter_impulse: bool = False    # impulso 1H (nivel 1 → 0) ≥ impulse_atr_mult × ATR(14) 1H
+    impulse_atr_mult: float = 1.5
+    filter_volume: bool = False     # vela gatillo de 5m con volumen > SMA(volume_sma)
+    volume_sma: int = 20
 
 
 # ───────────────────────── indicadores ─────────────────────────
@@ -63,6 +70,32 @@ def atr_series(candles: list[dict], period: int = 14) -> list[Optional[float]]:
         else:
             rma = (rma * (period - 1) + tr) / period
         out.append(rma)
+    return out
+
+
+def ema_series(values: list[float], period: int) -> list[Optional[float]]:
+    """EMA estilo Pine (ta.ema): semilla = SMA de las primeras `period` velas."""
+    out: list[Optional[float]] = []
+    k = 2 / (period + 1)
+    cur: Optional[float] = None
+    for i, v in enumerate(values):
+        if cur is None:
+            if i + 1 == period:
+                cur = sum(values[:period]) / period
+        else:
+            cur = v * k + cur * (1 - k)
+        out.append(cur)
+    return out
+
+
+def sma_series(values: list[float], period: int) -> list[Optional[float]]:
+    out: list[Optional[float]] = []
+    total = 0.0
+    for i, v in enumerate(values):
+        total += v
+        if i >= period:
+            total -= values[i - period]
+        out.append(total / period if i + 1 >= period else None)
     return out
 
 
@@ -94,13 +127,25 @@ class DailyZones:
     sup: list[Optional[float]]
     res: list[Optional[float]]
     tol: list[Optional[float]]
+    close: list[float] = field(default_factory=list)
+    ema: list[Optional[float]] = field(default_factory=list)
+
+    def _idx(self, t_ms: int) -> int:
+        # Último día cerrado antes de la vela t: open_time + 1d <= t
+        return bisect.bisect_right(self.day_open, t_ms - MS_1D) - 1
 
     def at(self, t_ms: int) -> tuple[Optional[float], Optional[float], Optional[float]]:
-        # Último día cerrado antes de la vela t: open_time + 1d <= t
-        idx = bisect.bisect_right(self.day_open, t_ms - MS_1D) - 1
+        idx = self._idx(t_ms)
         if idx < 0:
             return None, None, None
         return self.sup[idx], self.res[idx], self.tol[idx]
+
+    def trend_at(self, t_ms: int) -> tuple[Optional[float], Optional[float]]:
+        """(cierre, EMA) del último día cerrado."""
+        idx = self._idx(t_ms)
+        if idx < 0 or not self.ema:
+            return None, None
+        return self.close[idx], self.ema[idx]
 
 
 def build_daily_zones(daily: list[dict], p: StrategyParams) -> DailyZones:
@@ -128,7 +173,8 @@ def build_daily_zones(daily: list[dict], p: StrategyParams) -> DailyZones:
         sups.append(sup)
         ress.append(res)
         tols.append(tol)
-    return DailyZones([c["time"] for c in daily], sups, ress, tols)
+    closes = [c["close"] for c in daily]
+    return DailyZones([c["time"] for c in daily], sups, ress, tols, closes, ema_series(closes, p.trend_ema_period))
 
 
 @dataclass
@@ -221,6 +267,10 @@ class Bar5:
     d_sup: Optional[float]
     d_res: Optional[float]
     d_tol: Optional[float]
+    volume: float = 0.0
+    vol_sma: Optional[float] = None
+    d_close: Optional[float] = None     # cierre del último día cerrado
+    d_ema: Optional[float] = None       # EMA diaria del último día cerrado
 
     @property
     def close_time(self) -> int:
@@ -344,6 +394,10 @@ class SymbolStrategy:
                 self._cancel(s, bar, "no retrocedió al 0,618 a tiempo" if s.state == 2
                              else "no hubo gatillo en 5m a tiempo", events)
             elif s.state == 2 and (bar.low <= s.f618 if is_long else bar.high >= s.f618):
+                impulse = abs(s.imp_end - s.extreme)
+                if p.filter_impulse and h is not None and h.atr and impulse < p.impulse_atr_mult * h.atr:
+                    self._cancel(s, bar, f"impulso débil (menor a {p.impulse_atr_mult:g}×ATR de 1H)", events)
+                    return
                 s.state = 3
                 s.stage_time = bar.time
                 events.append(self._event(s, "fib", bar, bar.close, "retroceso en 0,618 sin romper 0,75"))
@@ -360,6 +414,13 @@ class SymbolStrategy:
                     breakout = (bar.close > line_now and bar.prev_close <= line_prev) if is_long \
                         else (bar.close < line_now and bar.prev_close >= line_prev)
                     inside = bar.close > s.f75 if is_long else bar.close < s.f75
+                    if breakout and inside and p.filter_volume and not (bar.vol_sma and bar.volume > bar.vol_sma):
+                        return  # ruptura sin volumen: se sigue esperando otra
+                    if breakout and inside and p.filter_trend:
+                        if bar.d_ema is None or bar.d_close is None or \
+                                (bar.d_close <= bar.d_ema if is_long else bar.d_close >= bar.d_ema):
+                            self._cancel(s, bar, f"va contra la tendencia diaria (EMA{p.trend_ema_period})", events)
+                            return
                     if breakout and inside:
                         buf = p.sl_buf_atr * (h.atr or 0) if h else 0
                         if p.sl_mode == "structure":
@@ -379,11 +440,13 @@ def build_bars(m5: list[dict], hourly: HourlyContext, zones: DailyZones, p: Stra
     """Convierte velas de 5m cerradas en Bar5 con todo el contexto (sin mirar el futuro)."""
     ph5 = pivots_confirmed(m5, p.m_pivot_len, "high")
     pl5 = pivots_confirmed(m5, p.m_pivot_len, "low")
+    vol_sma = sma_series([c.get("volume", 0.0) for c in m5], p.volume_sma)
     bars: list[Bar5] = []
     prev_h1_time: Optional[int] = None
     for i, c in enumerate(m5):
         h1 = hourly.last_closed(c["time"])
         d_sup, d_res, d_tol = zones.at(c["time"])
+        d_close, d_ema = zones.trend_at(c["time"])
         h1_time = h1.time if h1 else None
         bars.append(Bar5(
             index=c["time"] // MS_5M, time=c["time"], high=c["high"], low=c["low"], close=c["close"],
@@ -391,6 +454,7 @@ def build_bars(m5: list[dict], hourly: HourlyContext, zones: DailyZones, p: Stra
             ph5=ph5[i], pl5=pl5[i], h1=h1,
             new_h1=h1_time is not None and h1_time != prev_h1_time and i > 0,
             d_sup=d_sup, d_res=d_res, d_tol=d_tol,
+            volume=c.get("volume", 0.0), vol_sma=vol_sma[i], d_close=d_close, d_ema=d_ema,
         ))
         prev_h1_time = h1_time
     return bars

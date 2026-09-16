@@ -170,3 +170,53 @@ def test_build_bars_flags_new_hour():
     bars = build_bars(m5, hourly, zones, StrategyParams())
     flagged = [b.time for b in bars if b.new_h1]
     assert flagged == [2 * MS_1H, 3 * MS_1H]
+
+
+# ───────── filtros de confluencia ─────────
+
+def _to_trigger(engine, **last_bar_attrs):
+    run_long_until_fib(engine)
+    engine.on_bar(bar(34, high=105.2, low=103.1, close=103.5, ph5=105.0))
+    trigger = bar(35, high=104.8, low=103.4, close=104.5, prev_close=103.5)
+    for k, v in last_bar_attrs.items():
+        setattr(trigger, k, v)
+    return engine.on_bar(trigger)
+
+
+def test_trend_filter_cancels_counter_trend_entry():
+    engine = SymbolStrategy("BTC-USDT", StrategyParams(allow_short=False, filter_trend=True))
+    ev = _to_trigger(engine, d_close=95.0, d_ema=100.0)          # diario bajista → no LONG
+    assert [e["event"] for e in ev] == ["cancel"] and "tendencia" in ev[0]["note"]
+    engine = SymbolStrategy("BTC-USDT", StrategyParams(allow_short=False, filter_trend=True))
+    ev = _to_trigger(engine, d_close=105.0, d_ema=100.0)         # a favor → entra
+    assert [e["event"] for e in ev] == ["entry"]
+
+
+def test_volume_filter_waits_for_volume():
+    engine = SymbolStrategy("BTC-USDT", StrategyParams(allow_short=False, filter_volume=True))
+    ev = _to_trigger(engine, volume=90.0, vol_sma=100.0)
+    assert ev == [] and engine.long.state == 3                   # sigue esperando
+    engine = SymbolStrategy("BTC-USDT", StrategyParams(allow_short=False, filter_volume=True))
+    assert [e["event"] for e in _to_trigger(engine, volume=150.0, vol_sma=100.0)] == ["entry"]
+
+
+def test_impulse_filter_cancels_weak_impulse():
+    # Impulso 100 → 108 = 8; ATR 1H del fixture = 2 → 8 ≥ 1,5×2 pasa; con ATR 6 → 8 < 9 se cancela
+    engine = SymbolStrategy("BTC-USDT", StrategyParams(allow_short=False, filter_impulse=True))
+    events = run_long_until_fib(engine)
+    assert events[-1]["event"] == "fib"
+
+    engine = SymbolStrategy("BTC-USDT", StrategyParams(allow_short=False, filter_impulse=True))
+    engine.on_bar(bar(0, high=102, low=100.6, close=101.8, new_h1=True, h1=h1(1, high=103, low=100.5, close=101.5)))
+    engine.on_bar(bar(12, high=104, low=100.2, close=103.8, new_h1=True, h1=h1(2, high=104.5, low=100.0, close=104.0)))
+    engine.on_bar(bar(24, high=106.5, low=103.5, close=106.0, new_h1=True,
+                      h1=h1(3, high=107.0, low=103.0, close=106.0, atr=6.0)))
+    engine.on_bar(bar(25, high=108.0, low=106.0, close=107.5, h1=h1(3, high=107.0, low=103.0, close=106.0, atr=6.0)))
+    ev = engine.on_bar(bar(30, high=104.6, low=103.0, close=103.2, h1=h1(3, high=107.0, low=103.0, close=106.0, atr=6.0)))
+    assert [e["event"] for e in ev] == ["cancel"] and "impulso débil" in ev[0]["note"]
+
+
+def test_structure_sl_below_impulse_start():
+    engine = SymbolStrategy("BTC-USDT", StrategyParams(allow_short=False, sl_mode="structure"))
+    ev = _to_trigger(engine, h1=h1(3, high=107.0, low=103.0, close=106.0, atr=2.0))
+    assert ev[0]["sl"] == pytest.approx(100.0 - 0.1 * 2.0)       # inicio del impulso − 0,1×ATR 1H
