@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 
 from bot.bingx import BingXClient, BingXError, Position
 from bot.config import Settings
+from bot.fmt import money, pct, price
 from bot.narrator import Narrator
 from bot.signals import Signal
 from bot.sizing import build_plan
@@ -75,14 +76,22 @@ class Executor:
 
     # ───────── etapas de análisis ─────────
 
+    @staticmethod
+    def setup_key(sig: Signal) -> str:
+        """El indicador sigue un único setup por par y dirección: la etapa nueva reemplaza a la anterior."""
+        return f"{sig.symbol}:{sig.side}"
+
     def _track_setup(self, sig: Signal) -> None:
         if sig.event == "cancel":
-            self.store.set_setup(sig.id, None)
+            self.store.set_setup(self.setup_key(sig), None)
             return
-        stage = {"zone": "zona diaria", "choch": "cambio 1H", "fib": "esperando gatillo 5m"}[sig.event]
-        self.store.set_setup(sig.id, {"symbol": sig.symbol, "side": sig.side, "stage": stage,
-                                      "price": sig.price, "fib_618": sig.fib_618, "fib_75": sig.fib_75,
-                                      "updated": time.time()})
+        stage = {"zone": "en zona diaria, esperando cambio 1H",
+                 "choch": "cambio 1H, esperando retroceso al 0,618",
+                 "fib": "en 0,618, esperando gatillo 5m"}[sig.event]
+        self.store.set_setup(self.setup_key(sig), {
+            "id": sig.id, "symbol": sig.symbol, "side": sig.side, "stage": stage, "price": sig.price,
+            "fib_618": sig.fib_618, "fib_75": sig.fib_75, "fib_sl": sig.fib_sl,
+            "zone_low": sig.zone_low, "zone_high": sig.zone_high, "updated": time.time()})
 
     # ───────── entrada ─────────
 
@@ -104,7 +113,7 @@ class Executor:
         if sig.time and self.s.max_signal_age_s > 0:
             age = time.time() - sig.time / 1000
             if age > self.s.max_signal_age_s:
-                return self._reject(sig, f"la señal llegó tarde ({age:.0f}s de antigüedad)")
+                return self._reject(sig, f"la señal llegó tarde ({age:.0f} s de atraso, máximo {self.s.max_signal_age_s} s)")
 
         try:
             positions = self.client.positions()
@@ -118,7 +127,7 @@ class Executor:
 
         day_pnl = self.todays_realized_pnl()
         if day_pnl <= -abs(self.s.daily_loss_limit_usdt):
-            return self._reject(sig, f"se alcanzó el límite de pérdida del día ({day_pnl:.2f} USDT)")
+            return self._reject(sig, f"se alcanzó el límite de pérdida del día (hoy {money(day_pnl, True)}, límite {money(-abs(self.s.daily_loss_limit_usdt), True)})")
 
         try:
             spec = self.client.contract(sig.symbol)
@@ -130,8 +139,8 @@ class Executor:
 
         slippage = abs(live - sig.price) / sig.price * 100
         if slippage > self.s.max_slippage_pct:
-            return self._reject(sig, f"el precio se movió {slippage:.2f}% desde la señal "
-                                     f"({sig.price} → {live}); máximo {self.s.max_slippage_pct}%")
+            return self._reject(sig, f"el precio se movió {pct(slippage)} desde la señal "
+                                     f"({price(sig.price)} → {price(live)}); máximo {pct(self.s.max_slippage_pct)}")
 
         plan = build_plan(symbol=sig.symbol, direction=sig.side, entry=live,
                           stop_loss=float(sig.sl), take_profit=float(sig.tp), spec=spec,
@@ -175,7 +184,7 @@ class Executor:
             "mode": self.s.mode, "fib_618": sig.fib_618, "fib_75": sig.fib_75,
         }
         self.store.open_trade(sig.symbol, record)
-        self.store.set_setup(sig.id, None)
+        self.store.set_setup(self.setup_key(sig), None)
         self.store.log_event("opened", **record)
         self.notify(self.narrator.entry_opened(sig, plan, record["entry_price"]))
         return {"status": "opened", "trade": record}

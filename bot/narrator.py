@@ -1,14 +1,18 @@
 """
 Traduce lo que hace el bot a mensajes cortos y fáciles de entender (Telegram, HTML).
 Sólo arma textos: no manda nada ni toca el exchange.
+
+Números en formato argentino ($76.014,1 · +$0,335 · −0,68%): ver bot/fmt.py.
 """
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from bot.fmt import money, pct, price, qty, ratio
 from bot.signals import Signal
 from bot.sizing import TradePlan
 
@@ -18,27 +22,25 @@ def esc(value) -> str:
     return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def px(value: Optional[float]) -> str:
-    """Precio con decimales según magnitud: 75,832.5 · 3,012.45 · 0.1234 · 0.08123."""
-    if value is None:
-        return "—"
-    v = float(value)
-    a = abs(v)
-    decimals = 1 if a >= 10000 else 2 if a >= 100 else 3 if a >= 10 else 4 if a >= 1 else 5
-    return f"{v:,.{decimals}f}"
-
-
-def usd(value: float, signed: bool = False) -> str:
-    sign = "+" if signed and value > 0 else ""
-    return f"{sign}{value:.2f} USDT" if abs(value) >= 0.01 or value == 0 else f"{sign}{value:.4f} USDT"
-
-
 def side_word(side: str) -> str:
-    return "COMPRA (LONG) 📈" if side == "LONG" else "VENTA (SHORT) 📉"
+    return "📈 COMPRA (LONG)" if side == "LONG" else "📉 VENTA (SHORT)"
 
 
-def duration(ms: int) -> str:
+def side_short(side: str) -> str:
+    return "📈 LONG" if side == "LONG" else "📉 SHORT"
+
+
+def move_pct(reference: Optional[float], target: Optional[float]) -> Optional[float]:
+    """Variación % con signo de `reference` a `target`."""
+    if not reference or target is None:
+        return None
+    return (target - reference) / reference * 100
+
+
+def duration(ms: float) -> str:
     minutes = int(ms / 60000)
+    if minutes < 1:
+        return "menos de 1 min"
     if minutes < 60:
         return f"{minutes} min"
     hours, minutes = divmod(minutes, 60)
@@ -48,99 +50,184 @@ def duration(ms: int) -> str:
     return f"{days} d {hours} h"
 
 
+def asset_of(symbol: str) -> str:
+    return symbol.split("-")[0]
+
+
 class Narrator:
     def __init__(self, mode_label: str, tz: str):
         self.mode_label = mode_label
         self.tz = ZoneInfo(tz)
 
     def _head(self, emoji: str, title: str) -> str:
-        return f"{emoji} <b>{esc(title)}</b>  <i>[{self.mode_label}]</i>"
+        return f"{emoji} <b>{esc(title)}</b> · <i>{self.mode_label}</i>"
 
-    def now(self) -> str:
-        return datetime.now(self.tz).strftime("%d/%m %H:%M")
+    def stamp(self, ts: Optional[float] = None) -> str:
+        return datetime.fromtimestamp(ts or time.time(), self.tz).strftime("%d/%m %H:%M")
 
     # ───────── análisis (etapas del setup) ─────────
 
     def setup_event(self, s: Signal) -> str:
-        asset = esc(s.base_asset)
+        asset = s.base_asset
         bias = "alcista" if s.side == "LONG" else "bajista"
         zone_kind = "soporte" if s.side == "LONG" else "resistencia"
         note = f"\n<i>{esc(s.note)}</i>" if s.note else ""
 
         if s.event == "zone":
-            zona = f"{px(s.zone_low)} – {px(s.zone_high)}" if s.zone_low and s.zone_high else px(s.price)
-            return (f"{self._head('🔎', f'{asset}: llegó a una zona diaria')}\n"
-                    f"El precio ({px(s.price)}) está en una zona de <b>{zone_kind}</b> del gráfico diario "
-                    f"({zona}) y está perdiendo fuerza.\n"
-                    f"👉 Todavía no hago nada: espero que en 1H cambie la tendencia.{note}")
+            zona = (f"{price(s.zone_low)} – {price(s.zone_high)}"
+                    if s.zone_low and s.zone_high else price(s.price))
+            return (f"{self._head('🔎', f'{asset}: llegó a una zona diaria')}\n\n"
+                    f"El precio ({price(s.price)}) entró en una zona de <b>{zone_kind}</b> del diario:\n"
+                    f"📍 Zona: <b>{zona}</b>\n\n"
+                    f"👉 Todavía no opero: espero que en 1H cambie la tendencia a {bias}.{note}")
+
         if s.event == "choch":
-            return (f"{self._head('📐', f'{asset}: cambio de tendencia en 1H')}\n"
-                    f"La estructura de 1H giró a <b>{bias}</b>. Tracé Fibonacci del impulso "
-                    f"({px(s.fib_start)} → {px(s.fib_end)}).\n"
-                    f"• Zona de entrada (0.618): <b>{px(s.fib_618)}</b>\n"
-                    f"• Invalidación (cierre 1H más allá del 0.75): <b>{px(s.fib_75)}</b>\n"
-                    + (f"• Stop Loss si entro (0.786): <b>{px(s.fib_sl)}</b>\n" if s.fib_sl else "")
-                    + f"👉 Espero que el precio retroceda hasta el 0.618.{note}")
+            lines = [f"{self._head('📐', f'{asset}: cambio de tendencia en 1H')}", "",
+                     f"La estructura de 1H giró a <b>{bias}</b>. Tracé Fibonacci del impulso "
+                     f"{price(s.fib_start)} → {price(s.fib_end)}:",
+                     f"🎯 Entrada (0,618): <b>{price(s.fib_618)}</b>",
+                     f"⛔ Invalidación (cierre 1H pasando 0,75): <b>{price(s.fib_75)}</b>"]
+            if s.fib_sl:
+                lines.append(f"🛑 Stop Loss si entro (0,786): <b>{price(s.fib_sl)}</b>")
+            if s.fib_end:
+                lines.append(f"🏁 Take Profit si entro (techo del impulso): <b>{price(s.fib_end)}</b>")
+            lines += ["", f"👉 Espero que el precio retroceda hasta el 0,618 "
+                          f"({pct(move_pct(s.price, s.fib_618), signed=True)} desde acá).{note}"]
+            return "\n".join(lines)
+
         if s.event == "fib":
-            return (f"{self._head('🎯', f'{asset}: retroceso en zona de entrada')}\n"
-                    f"El precio ({px(s.price)}) llegó al 0.618 ({px(s.fib_618)}) sin romper el 0.75 "
-                    f"({px(s.fib_75)}).\n"
-                    f"👉 Ahora miro 5 minutos: si rompe la diagonal del retroceso, entro en "
-                    f"{side_word(s.side)}.{note}")
+            return (f"{self._head('🎯', f'{asset}: retroceso en zona de entrada')}\n\n"
+                    f"El precio ({price(s.price)}) llegó al 0,618 ({price(s.fib_618)}) "
+                    f"sin romper el 0,75 ({price(s.fib_75)}).\n\n"
+                    f"👉 Miro 5 minutos: si rompe la diagonal del retroceso, entro en "
+                    f"<b>{side_word(s.side)}</b>.{note}")
+
         if s.event == "cancel":
-            return (f"{self._head('❌', f'{asset}: setup cancelado')}\n"
-                    f"Descarto la oportunidad {bias}. Motivo: {esc(s.note or 'se invalidó la estructura')}.\n"
+            return (f"{self._head('❌', f'{asset}: setup cancelado')}\n\n"
+                    f"🗑️ Descarto la oportunidad {bias}.\n"
+                    f"📝 Motivo: {esc(s.note or 'se invalidó la estructura')}.\n\n"
                     f"👉 Sigo buscando.")
-        return f"{self._head('ℹ️', asset)} evento {esc(s.event)}"
+        return f"{self._head('ℹ️', asset)}\nEvento {esc(s.event)}"
 
     # ───────── operaciones ─────────
 
     def entry_opened(self, s: Signal, plan: TradePlan, fill_price: float) -> str:
-        asset = esc(s.base_asset)
+        asset = s.base_asset
         return (f"{self._head('🟢', f'ENTRÉ en {asset}')}\n"
-                f"<b>{side_word(plan.direction)}</b> a <b>{px(fill_price)}</b>\n\n"
-                f"💰 Margen: {usd(plan.margin_used)} · Apalancamiento {plan.leverage}x · "
-                f"Posición {usd(plan.notional)}\n"
-                f"🛑 Stop Loss: {px(plan.stop_loss)} ({plan.sl_distance_pct:.2f}%) → pierdo ~{usd(plan.risk_usdt)}\n"
-                f"🎯 Take Profit: {px(plan.take_profit)} ({plan.tp_distance_pct:.2f}%) → gano ~{usd(plan.reward_usdt)}\n"
-                f"⚖️ Riesgo/Beneficio: 1 : {plan.rr:.1f}\n\n"
-                f"<b>Por qué entré:</b> zona diaria + cambio de tendencia en 1H + retroceso al 0.618 "
-                f"sin romper 0.75 + ruptura de la diagonal en 5m."
+                f"<b>{side_word(plan.direction)}</b> a <b>{price(fill_price)}</b>\n\n"
+                f"💰 Margen <b>{money(plan.margin_used)}</b> · Apalancamiento <b>×{plan.leverage}</b>\n"
+                f"📦 Posición {money(plan.notional)} ({qty(plan.qty)} {asset})\n\n"
+                f"🛑 Stop Loss <b>{price(plan.stop_loss)}</b> ({pct(move_pct(fill_price, plan.stop_loss), True)})\n"
+                f"     → pérdida máx. <b>{money(-plan.risk_usdt, True)}</b>\n"
+                f"🎯 Take Profit <b>{price(plan.take_profit)}</b> ({pct(move_pct(fill_price, plan.take_profit), True)})\n"
+                f"     → ganancia <b>{money(plan.reward_usdt, True)}</b>\n"
+                f"⚖️ Riesgo/Beneficio <b>1 : {ratio(plan.rr)}</b>\n\n"
+                f"<b>Por qué entré:</b> zona diaria ✔ · cambio de tendencia 1H ✔ · "
+                f"retroceso al 0,618 sin romper 0,75 ✔ · ruptura de la diagonal en 5m ✔"
                 + (f"\n<i>{esc(s.note)}</i>" if s.note else ""))
 
     def entry_rejected(self, s: Signal, reason: str) -> str:
-        return (f"{self._head('⚠️', f'{esc(s.base_asset)}: señal de entrada, pero NO entré')}\n"
-                f"Motivo: {esc(reason)}")
+        return (f"{self._head('⚠️', f'{s.base_asset}: señal de entrada, pero NO entré')}\n\n"
+                f"📝 Motivo: {esc(reason)}")
 
     def entry_failed(self, s: Signal, error: str) -> str:
-        return (f"{self._head('🚨', f'{esc(s.base_asset)}: error al abrir la operación')}\n"
-                f"{esc(error)}\nRevisá BingX. El bot no reintenta solo para no duplicar órdenes.")
+        return (f"{self._head('🚨', f'{s.base_asset}: error al abrir la operación')}\n\n"
+                f"{esc(error)}\n\nRevisá BingX. El bot no reintenta solo para no duplicar órdenes.")
 
-    def trade_closed(self, rec: dict) -> str:
+    def trade_closed(self, rec: dict, day_total: Optional[float] = None) -> str:
         pnl = rec["pnl_usdt"]
         won = pnl > 0
-        emoji = "✅" if won else "🔴"
         why = {"TP": "llegó al Take Profit 🎯", "SL": "tocó el Stop Loss 🛑",
-               "MANUAL": "cierre manual", "LIQ": "liquidación ⚠️"}.get(rec.get("exit_reason"), "cierre")
+               "MANUAL": "cierre manual ✋", "LIQ": "liquidación ⚠️"}.get(rec.get("exit_reason"), "cierre")
         margin = rec.get("margin_used") or 0
-        pct = f" ({pnl / margin * 100:+.1f}% del margen)" if margin else ""
-        asset = rec["symbol"].split("-")[0]
+        on_margin = f" ({pct(pnl / margin * 100, True, 1)} del margen)" if margin else ""
+        asset = asset_of(rec["symbol"])
         title = f"CERRÉ {asset} — {'GANANCIA' if won else 'PÉRDIDA'}"
-        return (f"{self._head(emoji, title)}\n"
-                f"{side_word(rec['direction'])}: {px(rec['entry_price'])} → {px(rec.get('exit_price'))}\n"
-                f"Motivo: {why}\n"
-                f"Resultado: <b>{usd(pnl, signed=True)}</b>{pct}\n"
-                f"Comisiones y funding: {usd(rec.get('fees_usdt', 0))}\n"
-                f"Duración: {duration(rec['closed_at'] - rec['opened_at'])}")
+        lines = [
+            f"{self._head('✅' if won else '🔴', title)}",
+            f"{side_short(rec['direction'])}: {price(rec['entry_price'])} → {price(rec.get('exit_price'))} "
+            f"({pct(move_pct(rec['entry_price'], rec.get('exit_price')), True)})",
+            "",
+            f"📝 Motivo: {why}",
+            f"💵 Resultado: <b>{money(pnl, True)}</b>{on_margin}",
+            f"🧾 Comisiones y funding: {money(-abs(rec.get('fees_usdt', 0)), True)}",
+            f"⏱️ Duración: {duration(rec['closed_at'] - rec['opened_at'])}",
+        ]
+        if day_total is not None:
+            lines.append(f"\n📅 Acumulado de hoy: <b>{money(day_total, True)}</b>")
+        return "\n".join(lines)
+
+    # ───────── /estado ─────────
+
+    def status(self, *, paused: bool, balance: Optional[dict], balance_error: str, positions: list,
+               positions_error: str, open_trades: dict, setups: dict, day_pnl: float, day_count: int,
+               daily_limit: float, margin: float, max_positions: int, symbols: list[str], demo: bool) -> str:
+        lines = [f"📊 <b>Estado</b> · <i>{self.mode_label}</i> · {self.stamp()}", "", "💼 <b>Cuenta</b>"]
+        if balance:
+            suffix = " <i>(saldo de prueba)</i>" if demo else ""
+            lines += [f"💵 Saldo: <b>{money(balance['balance'])}</b>{suffix}",
+                      f"🟢 Disponible: {money(balance['available'])}",
+                      f"📊 PnL abierto: {money(balance['unrealized_pnl'], True)}"]
+        else:
+            lines.append(f"💵 Saldo: no disponible ({esc(balance_error)})")
+        ops = "operación" if day_count == 1 else "operaciones"
+        lines.append(f"📅 Hoy: <b>{money(day_pnl, True)}</b> ({day_count} {ops})")
+        lines.append(f"🛡️ Límite de pérdida diaria: {money(-abs(daily_limit), True)}")
+
+        lines += ["", "⚙️ <b>Operativa</b>",
+                  f"🚦 Nuevas entradas: {'⏸️ en pausa' if paused else '▶️ activas'}",
+                  f"💰 Margen por operación: {money(margin)} · máx. {max_positions} posiciones",
+                  f"🪙 Pares: {' · '.join(asset_of(s) for s in symbols)}"]
+
+        lines += ["", f"📂 <b>Operaciones abiertas ({len(positions)}/{max_positions})</b>"]
+        if positions_error:
+            lines.append(f"No disponible ({esc(positions_error)})")
+        elif not positions:
+            lines.append("💤 Ninguna.")
+        for p in positions:
+            trade = open_trades.get(p.symbol, {})
+            margin_used = trade.get("margin_used") or (p.margin or None)
+            pnl_margin = f" ({pct(p.unrealized_pnl / margin_used * 100, True, 1)} del margen)" if margin_used else ""
+            opened = trade.get("opened_at")
+            since = f" · hace {duration(time.time() * 1000 - opened)}" if opened else ""
+            lines.append(f"• <b>{asset_of(p.symbol)}</b> {side_short(p.side)} ×{p.leverage:.0f}{since}")
+            lines.append(f"   🔹 Entrada {price(p.entry_price)} → ahora {price(p.mark_price)}")
+            lines.append(f"   💹 PnL: <b>{money(p.unrealized_pnl, True)}</b>{pnl_margin}")
+            if trade:
+                lines.append(f"   🛑 SL {price(trade.get('stop_loss'))} ({pct(move_pct(p.mark_price, trade.get('stop_loss')), True)}) · "
+                             f"🎯 TP {price(trade.get('take_profit'))} ({pct(move_pct(p.mark_price, trade.get('take_profit')), True)})")
+            else:
+                lines.append("   ⚠️ No la abrió el bot")
+
+        lines += ["", "🔎 <b>Analizando</b>"]
+        if not setups:
+            lines.append("👀 Ningún setup en curso: espero que el precio llegue a una zona diaria.")
+        for info in sorted(setups.values(), key=lambda i: i.get("updated", 0), reverse=True):
+            ago = duration((time.time() - info.get("updated", time.time())) * 1000)
+            lines.append(f"• <b>{asset_of(info['symbol'])}</b> {side_short(info['side'])} — "
+                         f"⏳ {esc(info['stage'])} <i>(hace {ago})</i>")
+            levels = []
+            if info.get("fib_618"):
+                levels.append(f"🎯 0,618 {price(info['fib_618'])}")
+            if info.get("fib_75"):
+                levels.append(f"⛔ 0,75 {price(info['fib_75'])}")
+            if info.get("fib_sl"):
+                levels.append(f"🛑 0,786 {price(info['fib_sl'])}")
+            if not levels and info.get("zone_low") and info.get("zone_high"):
+                levels.append(f"📍 zona {price(info['zone_low'])} – {price(info['zone_high'])}")
+            if levels:
+                lines.append("   " + " · ".join(levels))
+        return "\n".join(lines)
 
     # ───────── sistema ─────────
 
     def started(self, balance: Optional[float], symbols: list[str], margin: float) -> str:
-        bal = usd(balance) if balance is not None else "no disponible"
-        pares = ", ".join(s.split("-")[0] for s in symbols)
-        return (f"{self._head('🤖', 'Bot encendido')}\n"
-                f"Saldo: {bal}\nPares: {esc(pares)}\nMargen por operación: {usd(margin)}\n"
-                f"Escribí /ayuda para ver los comandos.")
+        bal = money(balance) if balance is not None else "no disponible"
+        return (f"{self._head('🤖', 'Bot encendido')}\n\n"
+                f"💵 Saldo: <b>{bal}</b>\n"
+                f"🪙 Pares: {' · '.join(asset_of(s) for s in symbols)}\n"
+                f"💰 Margen por operación: {money(margin)}\n\n"
+                f"💬 Escribí /ayuda para ver los comandos.")
 
     def alert(self, text: str, critical: bool = False) -> str:
-        return f"{self._head('🚨' if critical else '⚠️', 'Atención')}\n{esc(text)}"
+        return f"{self._head('🚨' if critical else '⚠️', 'Atención')}\n\n{esc(text)}"

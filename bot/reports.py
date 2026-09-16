@@ -17,7 +17,8 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from bot.config import Settings
-from bot.narrator import duration, esc, px, usd
+from bot.fmt import money, num, pct, price
+from bot.narrator import duration, esc, side_short
 from bot.store import Store
 
 log = logging.getLogger(__name__)
@@ -110,25 +111,29 @@ def compute_stats(trades: list[dict], events: list[dict]) -> dict:
 
 
 def telegram_text(period: Period, st: dict, mode_label: str, drive_link: Optional[str]) -> str:
-    pf = f"{st['profit_factor']:.2f}" if st["profit_factor"] is not None else "—"
+    pf = num(st["profit_factor"]) if st["profit_factor"] is not None else "—"
     emoji = "📈" if st["net"] > 0 else "📉" if st["net"] < 0 else "➖"
     lines = [
-        f"🗓️ <b>{esc(period.title)}</b>  <i>[{mode_label}]</i>",
+        f"🗓️ <b>{esc(period.title)}</b> · <i>{mode_label}</i>",
         "",
-        f"{emoji} Resultado: <b>{usd(st['net'], signed=True)}</b>",
-        f"Operaciones: {st['trades']} (✅ {st['wins']} · 🔴 {st['losses']}) · acierto {st['win_rate']:.0f}%",
-        f"Profit factor: {pf} · Drawdown máx: {usd(st['max_drawdown'])}",
-        f"Comisiones: {usd(st['fees'])}",
+        f"{emoji} Resultado: <b>{money(st['net'], True)}</b>",
+        f"🔢 Operaciones: {st['trades']} (✅ {st['wins']} · 🔴 {st['losses']})",
+        f"🎯 Acierto: {pct(st['win_rate'], decimals=0)} · ⚖️ Profit factor: {pf}",
+        f"📉 Drawdown máx.: {money(-st['max_drawdown'], True)}",
+        f"🧾 Comisiones y funding: {money(-st['fees'], True)}",
     ]
     if st["by_symbol"]:
         lines.append("")
-        lines.append("<b>Por par:</b>")
+        lines.append("🪙 <b>Por par</b>")
         for sym, row in sorted(st["by_symbol"].items(), key=lambda kv: -kv[1]["pnl"]):
-            lines.append(f"• {esc(sym.split('-')[0])}: {row['trades']} ops · {usd(row['pnl'], signed=True)}")
+            icon = "🟢" if row["pnl"] > 0 else "🔴" if row["pnl"] < 0 else "⚪"
+            lines.append(f"{icon} {esc(sym.split('-')[0])}: {row['trades']} ops · <b>{money(row['pnl'], True)}</b>")
     lines += [
         "",
-        f"🔎 Análisis: {st['zones']} zonas · {st['chochs']} cambios 1H · {st['fibs']} retrocesos al 0.618 · "
-        f"{st['cancels']} cancelados · {st['entries_signaled']} señales de entrada",
+        "🔎 <b>Análisis</b>",
+        f"📍 Zonas diarias: {st['zones']} · 📐 Cambios 1H: {st['chochs']}",
+        f"🎯 Retrocesos al 0,618: {st['fibs']} · ❌ Cancelados: {st['cancels']}",
+        f"🚀 Señales de entrada: {st['entries_signaled']}",
     ]
     if drive_link:
         lines += ["", f'📄 <a href="{esc(drive_link)}">Informe completo en Drive</a>']
@@ -136,7 +141,7 @@ def telegram_text(period: Period, st: dict, mode_label: str, drive_link: Optiona
 
 
 def html_report(period: Period, st: dict, mode_label: str, tz: ZoneInfo) -> str:
-    pf = f"{st['profit_factor']:.2f}" if st["profit_factor"] is not None else "—"
+    pf = num(st["profit_factor"]) if st["profit_factor"] is not None else "—"
 
     def row(cells: list[str], tag: str = "td") -> str:
         return "<tr>" + "".join(f"<{tag}>{c}</{tag}>" for c in cells) + "</tr>"
@@ -144,16 +149,16 @@ def html_report(period: Period, st: dict, mode_label: str, tz: ZoneInfo) -> str:
     trades_rows = "".join(
         row([
             datetime.fromtimestamp(t["opened_at"] / 1000, tz).strftime("%d/%m %H:%M"),
-            esc(t["symbol"]), t["direction"], px(t["entry_price"]), px(t.get("exit_price")),
-            t.get("exit_reason", ""), f"{t['pnl_usdt']:+.4f}", duration(t["closed_at"] - t["opened_at"]),
+            esc(t["symbol"]), side_short(t["direction"]), price(t["entry_price"]), price(t.get("exit_price")),
+            t.get("exit_reason", ""), money(t["pnl_usdt"], True), duration(t["closed_at"] - t["opened_at"]),
         ])
         for t in st["list"]
     ) or row(["Sin operaciones en el período"] + [""] * 7)
 
     symbol_rows = "".join(
-        row([esc(sym), str(r["trades"]), f"{(r['wins'] / r['trades'] * 100):.0f}%", f"{r['pnl']:+.4f}"])
+        row([esc(sym), str(r["trades"]), pct(r["wins"] / r["trades"] * 100, decimals=0), money(r["pnl"], True)])
         for sym, r in sorted(st["by_symbol"].items(), key=lambda kv: -kv[1]["pnl"])
-    ) or row(["—", "0", "—", "0"])
+    ) or row(["—", "0", "—", "$0,00"])
 
     rejection_rows = "".join(row([esc(reason), str(n)]) for reason, n in st["rejections"].most_common(8)) \
         or row(["Ninguna", "0"])
@@ -164,20 +169,20 @@ def html_report(period: Period, st: dict, mode_label: str, tz: ZoneInfo) -> str:
 <p>Modo: <b>{esc(mode_label)}</b> · Generado: {datetime.now(tz):%d/%m/%Y %H:%M}</p>
 <h2>Resultado</h2>
 <table border="1" cellpadding="6">
-{row(["Resultado neto", f"<b>{st['net']:+.4f} USDT</b>"])}
+{row(["Resultado neto", f"<b>{money(st['net'], True)}</b>"])}
 {row(["Operaciones", f"{st['trades']} (ganadas {st['wins']} / perdidas {st['losses']})"])}
-{row(["Tasa de acierto", f"{st['win_rate']:.1f}%"])}
+{row(["Tasa de acierto", pct(st['win_rate'], decimals=1)])}
 {row(["Profit factor", pf])}
-{row(["Ganancia promedio / pérdida promedio", f"{st['avg_win']:+.4f} / {st['avg_loss']:+.4f} USDT"])}
-{row(["Mejor operación", f"{esc(best['symbol'])} {best['pnl_usdt']:+.4f} USDT" if best else "—"])}
-{row(["Peor operación", f"{esc(worst['symbol'])} {worst['pnl_usdt']:+.4f} USDT" if worst else "—"])}
-{row(["Drawdown máximo", f"{st['max_drawdown']:.4f} USDT"])}
+{row(["Ganancia promedio / pérdida promedio", f"{money(st['avg_win'], True)} / {money(st['avg_loss'], True)}"])}
+{row(["Mejor operación", f"{esc(best['symbol'])} {money(best['pnl_usdt'], True)}" if best else "—"])}
+{row(["Peor operación", f"{esc(worst['symbol'])} {money(worst['pnl_usdt'], True)}" if worst else "—"])}
+{row(["Drawdown máximo", money(-st['max_drawdown'], True)])}
 {row(["Racha máxima de pérdidas", str(st['max_loss_streak'])])}
-{row(["Comisiones + funding", f"{st['fees']:.4f} USDT"])}
+{row(["Comisiones + funding", money(-st['fees'], True)])}
 {row(["Salidas", " · ".join(f"{k}: {v}" for k, v in st['exit_reasons'].items()) or "—"])}
 </table>
 <h2>Por par</h2>
-<table border="1" cellpadding="6">{row(["Par", "Operaciones", "Acierto", "PnL (USDT)"], "th")}{symbol_rows}</table>
+<table border="1" cellpadding="6">{row(["Par", "Operaciones", "Acierto", "Resultado"], "th")}{symbol_rows}</table>
 <h2>Actividad de análisis</h2>
 <p>Zonas diarias detectadas: {st['zones']} · Cambios de tendencia 1H: {st['chochs']} ·
 Retrocesos al 0.618: {st['fibs']} · Setups cancelados: {st['cancels']} · Señales de entrada: {st['entries_signaled']}</p>
@@ -185,7 +190,7 @@ Retrocesos al 0.618: {st['fibs']} · Setups cancelados: {st['cancels']} · Seña
 <table border="1" cellpadding="6">{row(["Motivo", "Veces"], "th")}{rejection_rows}</table>
 <h2>Detalle de operaciones</h2>
 <table border="1" cellpadding="6">
-{row(["Apertura", "Par", "Lado", "Entrada", "Salida", "Motivo", "PnL (USDT)", "Duración"], "th")}
+{row(["Apertura", "Par", "Lado", "Entrada", "Salida", "Motivo", "Resultado", "Duración"], "th")}
 {trades_rows}
 </table>
 </body></html>"""

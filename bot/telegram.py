@@ -23,7 +23,8 @@ from zoneinfo import ZoneInfo
 import requests
 
 from bot.config import Settings, normalize_symbol
-from bot.narrator import esc, px, side_word, usd
+from bot.fmt import money
+from bot.narrator import asset_of, esc, side_short
 
 if TYPE_CHECKING:
     from bot.bingx import BingXClient
@@ -143,67 +144,59 @@ class TelegramBot:
 
     def _cmd_ayuda(self, args, chat_id) -> None:
         self.send(
-            "🤖 <b>Comandos</b>\n"
-            "/estado — saldo, operaciones abiertas y qué estoy analizando\n"
-            "/hoy — resultado del día\n"
-            "/semana — resumen de la semana en curso\n"
-            "/mes — resumen del mes en curso\n"
-            "/pausa — no abro nuevas operaciones (las abiertas siguen protegidas)\n"
-            "/reanudar — vuelvo a operar\n"
-            "/cerrar BTC — cierro la operación de ese par", chat_id)
+            "🤖 <b>Comandos</b>\n\n"
+            "📊 /estado — saldo, operaciones abiertas y qué estoy analizando\n"
+            "📅 /hoy — resultado del día\n"
+            "🗓️ /semana — resumen de la semana en curso\n"
+            "📆 /mes — resumen del mes en curso\n"
+            "⏸️ /pausa — no abro nuevas operaciones (las abiertas siguen protegidas)\n"
+            "▶️ /reanudar — vuelvo a operar\n"
+            "✋ /cerrar BTC — cierro la operación de ese par", chat_id)
+
+    def _today(self) -> list[dict]:
+        tz = ZoneInfo(self.s.timezone)
+        start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+        return self.store.closed_trades(int(start.timestamp() * 1000))
 
     def _cmd_estado(self, args, chat_id) -> None:
-        assert self.client and self.store
-        lines = [f"📊 <b>Estado</b>  <i>[{self.s.mode_label}]</i>",
-                 f"Nuevas entradas: {'⏸️ EN PAUSA' if self.store.paused else '▶️ activas'}"]
+        assert self.client and self.store and self.executor
+        balance, balance_error = None, ""
         try:
-            bal = self.client.balance()
-            lines.append(f"Saldo: {usd(bal['balance'])} · Disponible: {usd(bal['available'])} · "
-                         f"PnL abierto: {usd(bal['unrealized_pnl'], signed=True)}")
+            balance = self.client.balance()
         except Exception as exc:
-            lines.append(f"Saldo: no disponible ({esc(exc)})")
-
+            balance_error = str(exc)
+        positions, positions_error = [], ""
         try:
             positions = self.client.positions()
         except Exception as exc:
-            positions = []
-            lines.append(f"Posiciones: no disponible ({esc(exc)})")
-        lines.append("")
-        if positions:
-            lines.append(f"<b>Operaciones abiertas ({len(positions)}):</b>")
-            for p in positions:
-                trade = self.store.open_trades.get(p.symbol, {})
-                lines.append(
-                    f"• {esc(p.symbol.split('-')[0])} {side_word(p.side)} desde {px(p.entry_price)} → "
-                    f"ahora {px(p.mark_price)} · <b>{usd(p.unrealized_pnl, signed=True)}</b>\n"
-                    f"   SL {px(trade.get('stop_loss'))} · TP {px(trade.get('take_profit'))} · {p.leverage:.0f}x")
-        else:
-            lines.append("Sin operaciones abiertas.")
-
-        setups = self.store.state.get("setups", {})
-        lines.append("")
-        if setups:
-            lines.append("<b>Analizando:</b>")
-            for info in setups.values():
-                extra = f" (0.618 {px(info.get('fib_618'))} · 0.75 {px(info.get('fib_75'))})" if info.get("fib_618") else ""
-                lines.append(f"• {esc(info['symbol'].split('-')[0])} {info['side']}: {esc(info['stage'])}{extra}")
-        else:
-            lines.append("Ningún setup en curso: esperando que el precio llegue a una zona diaria.")
-        self.send("\n".join(lines), chat_id)
+            positions_error = str(exc)
+        today = self._today()
+        self.send(self.executor.narrator.status(
+            paused=self.store.paused, balance=balance, balance_error=balance_error,
+            positions=positions, positions_error=positions_error,
+            open_trades=self.store.open_trades, setups=self.store.state.get("setups", {}),
+            day_pnl=sum(t["pnl_usdt"] for t in today), day_count=len(today),
+            daily_limit=self.s.daily_loss_limit_usdt, margin=self.s.margin_per_trade_usdt,
+            max_positions=self.s.max_open_positions, symbols=self.s.symbols, demo=not self.s.is_live,
+        ), chat_id)
 
     def _cmd_hoy(self, args, chat_id) -> None:
         assert self.store
-        tz = ZoneInfo(self.s.timezone)
-        start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
-        trades = self.store.closed_trades(int(start.timestamp() * 1000))
+        trades = self._today()
         if not trades:
-            self.send("Hoy todavía no cerré operaciones.", chat_id)
+            self.send("📅 Hoy todavía no cerré operaciones.", chat_id)
             return
         total = sum(t["pnl_usdt"] for t in trades)
-        lines = [f"📅 <b>Hoy</b>: {len(trades)} operaciones · <b>{usd(total, signed=True)}</b>"]
+        wins = sum(1 for t in trades if t["pnl_usdt"] > 0)
+        lines = [f"📅 <b>Hoy</b> · <i>{self.s.mode_label}</i>",
+                 f"💵 Resultado: <b>{money(total, True)}</b>",
+                 f"🔢 Operaciones: {len(trades)} (✅ {wins} · 🔴 {len(trades) - wins})", ""]
+        reasons = {"TP": "TP 🎯", "SL": "SL 🛑", "MANUAL": "manual ✋"}
+        tz = ZoneInfo(self.s.timezone)
         for t in trades:
-            lines.append(f"• {esc(t['symbol'].split('-')[0])} {t['direction']} {t.get('exit_reason', '')}: "
-                         f"{usd(t['pnl_usdt'], signed=True)}")
+            hour = datetime.fromtimestamp(t["closed_at"] / 1000, tz).strftime("%H:%M")
+            lines.append(f"• {hour} <b>{esc(asset_of(t['symbol']))}</b> {side_short(t['direction'])} · "
+                         f"{reasons.get(t.get('exit_reason'), 'otro')} · <b>{money(t['pnl_usdt'], True)}</b>")
         self.send("\n".join(lines), chat_id)
 
     def _cmd_semana(self, args, chat_id) -> None:

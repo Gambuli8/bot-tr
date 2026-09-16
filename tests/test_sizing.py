@@ -34,14 +34,14 @@ def test_doge_quantity_rounded_to_integer_contracts():
 
 def test_short_requires_sl_above():
     bad = plan(direction="SHORT", sl=74000, tp=73000)
-    assert not bad.ok and "SHORT" in bad.reason
+    assert not bad.ok and "en SHORT" in bad.reason
     good = plan(direction="SHORT", sl=76900, tp=73000)
     assert good.ok, good.reason
 
 
 def test_rejects_wrong_side_levels_for_long():
     p = plan(sl=76000)
-    assert not p.ok and "LONG" in p.reason
+    assert not p.ok and "en LONG" in p.reason
 
 
 def test_rejects_when_liquidation_before_stop():

@@ -21,6 +21,7 @@ from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Optional
 
 from bot.bingx import ContractSpec
+from bot.fmt import money, pct, price, qty as fmt_qty, ratio
 
 # Margen de mantenimiento aproximado para estimar liquidación (isolated).
 DEFAULT_MMR = 0.005
@@ -87,10 +88,12 @@ def build_plan(
         base.reason = "precios inválidos (<= 0)"
         return base
     if direction == "LONG" and not (stop_loss < entry < take_profit):
-        base.reason = f"LONG requiere SL < precio < TP (SL {stop_loss}, precio {entry}, TP {take_profit})"
+        base.reason = (f"en LONG el SL tiene que quedar abajo y el TP arriba del precio "
+                       f"(SL {price(stop_loss)} · precio {price(entry)} · TP {price(take_profit)})")
         return base
     if direction == "SHORT" and not (take_profit < entry < stop_loss):
-        base.reason = f"SHORT requiere TP < precio < SL (TP {take_profit}, precio {entry}, SL {stop_loss})"
+        base.reason = (f"en SHORT el SL tiene que quedar arriba y el TP abajo del precio "
+                       f"(TP {price(take_profit)} · precio {price(entry)} · SL {price(stop_loss)})")
         return base
 
     sl_dist = abs(entry - stop_loss) / entry
@@ -106,15 +109,15 @@ def build_plan(
             break
         leverage += 1
     if leverage > max_leverage:
-        base.reason = (f"con {margin_usdt} USDT de margen haría falta más de {max_leverage}x "
-                       f"para el mínimo de {spec.symbol} ({spec.min_qty} ≈ {spec.min_qty * entry:.2f} USDT)")
+        base.reason = (f"con {money(margin_usdt)} de margen haría falta más de ×{max_leverage} "
+                       f"para el mínimo de {spec.symbol} ({fmt_qty(spec.min_qty)} ≈ {money(spec.min_qty * entry)})")
         return base
 
     liq = estimate_liquidation(entry, leverage, direction, mmr)
     liq_dist = abs(entry - liq) / entry
     if sl_dist >= liq_dist * LIQ_SAFETY:
-        base.reason = (f"el SL está a {sl_dist:.2%} pero con {leverage}x la liquidación está a {liq_dist:.2%}: "
-                       f"liquidaría antes de tocar el stop")
+        base.reason = (f"el SL está a {pct(sl_dist * 100)} pero con ×{leverage} la liquidación está a "
+                       f"{pct(liq_dist * 100)}: liquidaría antes de tocar el stop")
         return base
 
     qty_f = float(qty)
@@ -136,7 +139,7 @@ def build_plan(
     )
     if rr < min_rr:
         plan.ok = False
-        plan.reason = f"R:R neto {rr:.2f} menor al mínimo {min_rr}"
+        plan.reason = f"R:R neto 1 : {ratio(rr, 2)}, menor al mínimo 1 : {ratio(min_rr, 2)}"
     return plan
 
 

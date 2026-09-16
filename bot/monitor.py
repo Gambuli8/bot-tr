@@ -122,7 +122,7 @@ class Monitor:
         self.store.log_closed_trade(record)
         self.store.pop_open_trade(symbol)
         self.store.log_event("closed", symbol=symbol, pnl_usdt=record["pnl_usdt"], reason=record["exit_reason"])
-        self.notify(self.narrator.trade_closed(record))
+        self.notify(self.narrator.trade_closed(record, day_total=self.executor.todays_realized_pnl()))
 
     def _realized(self, symbol: str, start_ms: int, end_ms: int) -> tuple[float, float, Optional[float]]:
         """(pnl_neto, comisiones+funding, precio_de_salida). Espera unos segundos a que BingX lo registre."""

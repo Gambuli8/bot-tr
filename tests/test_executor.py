@@ -84,11 +84,11 @@ def test_setup_events_are_narrated_and_tracked(executor, store, messages):
     sig = Signal(event="choch", id="setup-1", symbol="ETHUSDT.P", side="SHORT", price=3000,
                  fib_start=2900, fib_end=3200, fib_618=3014.6, fib_75=2975)
     assert executor.handle(sig)["status"] == "narrated"
-    assert "setup-1" in store.state["setups"]
+    assert store.state["setups"]["ETH-USDT:SHORT"]["id"] == "setup-1"
     assert "cambio de tendencia" in messages[-1]
     executor.handle(Signal(event="cancel", id="setup-1", symbol="ETHUSDT.P", side="SHORT", price=3050,
                            note="cerró por encima del 0.75"))
-    assert "setup-1" not in store.state["setups"]
+    assert "ETH-USDT:SHORT" not in store.state["setups"]
 
 
 def test_missing_stop_loss_gets_replaced(executor, client, messages):
