@@ -1,4 +1,4 @@
-# Resumen del proyecto — Bot de trading BingX (al 16/09/2026)
+# Resumen del proyecto — Bot de trading BingX (al 16/09/2026, actualizado con la iteración 2)
 
 > Documento para compartir con otro asistente (Gemini) y retomar el trabajo con contexto completo.
 > Horarios en hora de Argentina (UTC−3).
@@ -113,6 +113,69 @@ misma vela cuenta SL, 1 posición por par, máx. 3 abiertas, límite diario de 3
    (ETH real exige ×13), por eso puede dar positivo en R y levemente negativo en USDT. La frecuencia baja a
    ~5–6 operaciones por mes entre los 6 pares.
 
+
+### 7.b Iteración 2 (pedido de Gemini): riesgo fijo, gestión activa, filtros nuevos, 2 años
+
+**Qué se implementó** (todo activable por parámetro):
+- `bot/sizing.py → build_plan_fixed_risk`: **riesgo fijo** por operación (0,50 USDT). Cantidad = riesgo /
+  (distancia al SL + comisiones), redondeada hacia abajo; se descarta si no llega al mínimo del contrato.
+  Apalancamiento = el máximo que mantiene la liquidación lejos del SL (margen mínimo).
+- `bot/strategy.py → StrategyParams`: `sl_mode="structure"` (inicio del impulso − 0,1×ATR 1H),
+  `filter_trend` (EMA50 diaria), `filter_impulse` (impulso ≥ 1,5×ATR 1H), `filter_volume` (vela gatillo con
+  volumen > SMA20). Apagados por defecto: el bot en demo sigue con las reglas originales.
+- `scripts/backtest.py`: gestión `BE` (SL a break-even + comisiones en +1R), `PARC` (cierra 50 % en +1R),
+  ambas; **2 años** (26/09/2024 → 16/09/2026); OOS = últimos 8 meses (desde 19/01/2026); selección objetiva
+  de **20 pares** (entre los 40 más líquidos, mejor ATR% diario en IS / spread actual de BingX); estadístico t.
+
+**Cómo correrlo:**
+```
+python scripts/backtest.py --months 24 --oos-months 8 --pairs auto --n-pairs 20
+python scripts/backtest.py --months 24 --oos-months 8 --pairs current
+python scripts/backtest.py --pairs BTC-USDT,ETH-USDT --risk 0.5 --max-open 3 --daily-loss 3
+```
+
+**Resultados — 20 pares objetivos** (R por operación · t entre paréntesis; t ≥ 2 ≈ evidencia razonable):
+
+| Variante | IS (16 meses) | OOS (8 meses) |
+|---|---|---|
+| REF — reglas actuales del bot | 1784 ops · 24 % · **−0,12 R** (t −3,0) | 913 ops · 23 % · **−0,21 R** (t −3,8) |
+| BASE — SL estructural + EMA50 | 310 ops · 31 % · −0,17 R (t −2,3) | 164 ops · 33 % · −0,09 R (t −0,9) |
+| BASE + BE | 310 · 25 % · −0,14 R | 171 · 22 % · −0,12 R |
+| BASE + PARC | 310 · 31 % · −0,17 R | 164 · 33 % · −0,08 R |
+| BASE + BE + PARC | 310 · 44 % · −0,15 R | 171 · 51 % · −0,09 R |
+| BASE + IMP | 311 · 31 % · −0,17 R | 165 · 33 % · −0,10 R |
+| BASE + VOL | 185 · 30 % · −0,17 R (t −1,8) | 91 · 43 % · **+0,17 R** (t +1,2) |
+| BASE + VOL + BE + PARC | 185 · 46 % · −0,13 R | 94 · 59 % · +0,09 R (t +0,9) |
+
+**Resultados — los 6 pares actuales** (mismo período):
+
+| Variante | IS | OOS |
+|---|---|---|
+| REF | 724 · 24 % · −0,13 R (t −2,1) | 310 · 22 % · −0,28 R (t −3,3) |
+| BASE | 86 · 28 % · −0,25 R | 41 · 37 % · +0,03 R |
+| BASE + VOL | 48 · 33 % · −0,05 R | 29 · 59 % · +0,60 R (t +2,4) |
+| BASE + VOL + BE + PARC | 48 · 56 % · +0,07 R (t +0,5) | 30 · 70 % · +0,29 R (t +1,7) |
+
+**Conclusiones de la iteración 2:**
+1. **Las reglas actuales pierden con evidencia fuerte**: ~2.700 operaciones en 2 años y 20 pares, negativas
+   en los dos períodos (t −3 a −3,8). No es mala suerte de un mes.
+2. **El SL estructural + EMA50 no alcanza**: con más datos da negativo (el +0,16 R de la iteración 1 era ruido
+   de una muestra de 22 operaciones).
+3. **Break-even y parcial suben mucho la tasa de acierto (hasta 50–70 %) pero no crean ventaja**: cambian
+   la forma de los resultados, no el promedio.
+4. **El filtro de fuerza del impulso no filtra casi nada** (casi todos los impulsos ya superan 1,5×ATR).
+5. **El filtro de volumen es lo único que mejora**, pero es **negativo en IS y positivo en OOS en los dos
+   universos** → patrón de dependencia de régimen (los últimos 8 meses fueron favorables), no una ventaja
+   estable. En 20 pares, **ninguna variante es positiva en IS y OOS a la vez**.
+6. Sólo una combinación (BASE + VOL + BE + PARC en los 6 pares actuales) es positiva en ambos períodos, con
+   78 operaciones en total y t < 2: no es evidencia suficiente. Además genera ~3 operaciones por mes, así que
+   juntar 100 operaciones en demo llevaría más de 2 años.
+7. Riesgo fijo de 0,50 USDT: ~13 % de las entradas se descartan por no llegar al mínimo de contrato; el margen
+   máximo usado a la vez fue ~7,5 USDT con 20 pares.
+
+**Contexto de investigaciones anteriores del mismo repo (bot Binance, 2026):** liquidity sweeps 1H, breakouts
+de volatilidad, IFVG y tendencia diaria multi-activo tampoco pasaron validaciones de varios años. Lo único que
+se sostuvo fue **captura de funding delta-neutral** (≈ +7,6 %/año, 92 % de meses positivos, drawdown ~0,3 %).
 
 ## 8. En qué nos puede ayudar Gemini para mejorar la tasa de acierto
 

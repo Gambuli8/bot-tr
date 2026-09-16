@@ -374,8 +374,14 @@ def main():
     for k, v in sorted(rejects.items()):
         print(f"  {k}: {v}")
 
-    candidates = [row for row in table if row[0] != "REF" and row[2]["n"] >= 50]
-    if candidates:
+    candidates = [row for row in table if row[0] != "REF" and row[2]["n"] >= 50 and row[2]["avg"] > 0]
+    both = [row for row in table if row[2]["n"] and row[3]["n"] and row[2]["avg"] > 0 and row[3]["avg"] > 0]
+    print(f"
+Variantes positivas en IS y en OOS a la vez: "
+          f"{', '.join(f'{e} · {m}' for e, m, *_ in both) or 'NINGUNA'}")
+    if not candidates:
+        print("Ninguna variante con ≥ 50 operaciones es positiva in-sample: no hay nada que validar fuera de muestra.")
+    else:
         best = max(candidates, key=lambda row: row[2]["avg"])
         eng, mgmt, ins, oos, accepted, *_ = best
         print(f"\n=== Elegida por IS (máx. R/op con ≥ 50 ops): {eng} · {mgmt} ===")
