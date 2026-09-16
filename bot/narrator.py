@@ -157,12 +157,12 @@ class Narrator:
             lines.append(f"\n📅 Acumulado de hoy: <b>{money(day_total, True)}</b>")
         return "\n".join(lines)
 
-    # ───────── /estado ─────────
+    # ───────── /estado (un mensaje general + uno por moneda) ─────────
 
-    def status(self, *, paused: bool, balance: Optional[dict], balance_error: str, positions: list,
-               positions_error: str, open_trades: dict, setups: dict, day_pnl: float, day_count: int,
-               daily_limit: float, margin: float, max_positions: int, symbols: list[str], demo: bool) -> str:
-        lines = [f"📊 <b>Estado</b> · <i>{self.mode_label}</i> · {self.stamp()}", "", "💼 <b>Cuenta</b>"]
+    def status_header(self, *, paused: bool, balance: Optional[dict], balance_error: str, open_count: int,
+                      positions_error: str, setups_count: int, day_pnl: float, day_count: int,
+                      daily_limit: float, margin: float, max_positions: int, demo: bool) -> str:
+        lines = [f"📊 <b>Estado general</b> · <i>{self.mode_label}</i> · {self.stamp()}", "", "💼 <b>Cuenta</b>"]
         if balance:
             suffix = " <i>(saldo de prueba)</i>" if demo else ""
             lines += [f"💵 Saldo: <b>{money(balance['balance'])}</b>{suffix}",
@@ -173,50 +173,54 @@ class Narrator:
         ops = "operación" if day_count == 1 else "operaciones"
         lines.append(f"📅 Hoy: <b>{money(day_pnl, True)}</b> ({day_count} {ops})")
         lines.append(f"🛡️ Límite de pérdida diaria: {money(-abs(daily_limit), True)}")
-
         lines += ["", "⚙️ <b>Operativa</b>",
                   f"🚦 Nuevas entradas: {'⏸️ en pausa' if paused else '▶️ activas'}",
-                  f"💰 Margen por operación: {money(margin)} · máx. {max_positions} posiciones",
-                  f"🪙 Pares: {' · '.join(asset_of(s) for s in symbols)}"]
+                  f"💰 Margen por operación: {money(margin)}",
+                  f"📂 Operaciones abiertas: {'no disponible' if positions_error else f'{open_count}/{max_positions}'}",
+                  f"🔎 Setups en análisis: {setups_count}",
+                  "", "👇 Detalle por moneda:"]
+        return "\n".join(lines)
 
-        lines += ["", f"📂 <b>Operaciones abiertas ({len(positions)}/{max_positions})</b>"]
-        if positions_error:
-            lines.append(f"No disponible ({esc(positions_error)})")
-        elif not positions:
-            lines.append("💤 Ninguna.")
-        for p in positions:
-            trade = open_trades.get(p.symbol, {})
-            margin_used = trade.get("margin_used") or (p.margin or None)
-            pnl_margin = f" ({pct(p.unrealized_pnl / margin_used * 100, True, 1)} del margen)" if margin_used else ""
+    def coin_status(self, *, symbol: str, last_price: Optional[float], position=None,
+                    trade: Optional[dict] = None, setups: list[dict]) -> str:
+        asset = asset_of(symbol)
+        lines = [f"🪙 <b>{asset}</b> · {price(last_price)}"]
+
+        if position is not None:
+            trade = trade or {}
+            margin_used = trade.get("margin_used") or (position.margin or None)
+            pnl_margin = (f" ({pct(position.unrealized_pnl / margin_used * 100, True, 1)} del margen)"
+                          if margin_used else "")
             opened = trade.get("opened_at")
             since = f" · hace {duration(time.time() * 1000 - opened)}" if opened else ""
-            lines.append(f"• <b>{asset_of(p.symbol)}</b> {side_short(p.side)} ×{p.leverage:.0f}{since}")
-            lines.append(f"   🔹 Entrada {price(p.entry_price)} → ahora {price(p.mark_price)}")
-            lines.append(f"   💹 PnL: <b>{money(p.unrealized_pnl, True)}</b>{pnl_margin}")
+            lines += ["", f"📂 <b>Operación abierta</b>: {side_short(position.side)} ×{position.leverage:.0f}{since}",
+                      f"🔹 Entrada {price(position.entry_price)} → ahora {price(position.mark_price)}",
+                      f"💹 PnL: <b>{money(position.unrealized_pnl, True)}</b>{pnl_margin}"]
             if trade:
-                lines.append(f"   🛑 SL {price(trade.get('stop_loss'))} ({pct(move_pct(p.mark_price, trade.get('stop_loss')), True)}) · "
-                             f"🎯 TP {price(trade.get('take_profit'))} ({pct(move_pct(p.mark_price, trade.get('take_profit')), True)})")
+                lines.append(f"🛑 SL {price(trade.get('stop_loss'))} "
+                             f"({pct(move_pct(position.mark_price, trade.get('stop_loss')), True)}) · "
+                             f"🎯 TP {price(trade.get('take_profit'))} "
+                             f"({pct(move_pct(position.mark_price, trade.get('take_profit')), True)})")
             else:
-                lines.append("   ⚠️ No la abrió el bot")
+                lines.append("⚠️ Esta posición no la abrió el bot")
+        else:
+            lines += ["", "📂 Sin operación abierta"]
 
-        lines += ["", "🔎 <b>Analizando</b>"]
+        lines.append("")
         if not setups:
-            lines.append("👀 Ningún setup en curso: espero que el precio llegue a una zona diaria.")
-        for info in sorted(setups.values(), key=lambda i: i.get("updated", 0), reverse=True):
+            lines.append("👀 Sin setups: espero que llegue a una zona diaria.")
+        for info in sorted(setups, key=lambda i: i.get("side", "")):
             ago = duration((time.time() - info.get("updated", time.time())) * 1000)
-            lines.append(f"• <b>{asset_of(info['symbol'])}</b> {side_short(info['side'])} — "
-                         f"⏳ {esc(info['stage'])} <i>(hace {ago})</i>")
-            levels = []
+            lines.append(f"🔎 {side_short(info['side'])} — ⏳ {esc(info['stage'])} <i>(hace {ago})</i>")
             if info.get("fib_618"):
-                levels.append(f"🎯 0,618 {price(info['fib_618'])}")
-            if info.get("fib_75"):
-                levels.append(f"⛔ 0,75 {price(info['fib_75'])}")
-            if info.get("fib_sl"):
-                levels.append(f"🛑 0,786 {price(info['fib_sl'])}")
-            if not levels and info.get("zone_low") and info.get("zone_high"):
-                levels.append(f"📍 zona {price(info['zone_low'])} – {price(info['zone_high'])}")
-            if levels:
-                lines.append("   " + " · ".join(levels))
+                lines.append(f"   🎯 Entrada 0,618: {price(info['fib_618'])}")
+                lines.append(f"   ⛔ Invalida 0,75: {price(info.get('fib_75'))}")
+                if info.get("fib_sl"):
+                    lines.append(f"   🛑 SL 0,786: {price(info['fib_sl'])}")
+                if last_price:
+                    lines.append(f"   📏 Distancia a la entrada: {pct(move_pct(last_price, info['fib_618']), True)}")
+            elif info.get("zone_low") and info.get("zone_high"):
+                lines.append(f"   📍 Zona: {price(info['zone_low'])} – {price(info['zone_high'])}")
         return "\n".join(lines)
 
     # ───────── sistema ─────────

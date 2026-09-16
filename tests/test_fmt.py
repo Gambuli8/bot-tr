@@ -32,27 +32,30 @@ def test_pct_and_qty():
     assert qty(1250.5) == "1.250,5"
 
 
-def test_status_renders_positions_and_setups():
+def test_status_header_and_coin_messages():
     n = Narrator("DEMO 🧪", "America/Argentina/Buenos_Aires")
     now_ms = time.time() * 1000
-    text = n.status(
-        paused=False,
-        balance={"balance": 100000.0, "available": 99998.1, "unrealized_pnl": 0.021},
-        balance_error="", positions_error="",
-        positions=[Position("BTC-USDT", "LONG", 0.0001, 76014.1, 76200.0, 0.0186, 4, 0, 1.9, "1")],
-        open_trades={"BTC-USDT": {"stop_loss": 75500.0, "take_profit": 77000.0, "margin_used": 1.9,
-                                  "opened_at": now_ms - 3_600_000}},
-        setups={"ETH-USDT:SHORT": {"symbol": "ETH-USDT", "side": "SHORT", "stage": "cambio 1H",
-                                   "fib_618": 2400.5, "fib_75": 2420.0, "fib_sl": 2425.0,
-                                   "updated": time.time() - 600}},
-        day_pnl=-0.12, day_count=1, daily_limit=3, margin=2, max_positions=3,
-        symbols=["BTC-USDT", "ETH-USDT"], demo=True,
-    )
-    assert "$100.000,00" in text and "+$0,021" in text
-    assert "−$0,12" in text and "−$3,00" in text
-    assert "SL $75.500,0 (−0,92%)" in text and "TP $77.000,0 (+1,05%)" in text
-    assert "ETH" in text and "0,618 $2.400,50" in text
-    assert "hace 1 h 0 min" in text
+    header = n.status_header(
+        paused=False, balance={"balance": 100000.0, "available": 99998.1, "unrealized_pnl": 0.021},
+        balance_error="", open_count=1, positions_error="", setups_count=1,
+        day_pnl=-0.12, day_count=1, daily_limit=3, margin=2, max_positions=3, demo=True)
+    assert "$100.000,00" in header and "+$0,021" in header
+    assert "−$0,12" in header and "−$3,00" in header and "1/3" in header
+
+    btc = n.coin_status(
+        symbol="BTC-USDT", last_price=76200.0,
+        position=Position("BTC-USDT", "LONG", 0.0001, 76014.1, 76200.0, 0.0186, 4, 0, 1.9, "1"),
+        trade={"stop_loss": 75500.0, "take_profit": 77000.0, "margin_used": 1.9, "opened_at": now_ms - 3_600_000},
+        setups=[])
+    assert btc.startswith("🪙 <b>BTC</b>")
+    assert "SL $75.500,0 (−0,92%)" in btc and "TP $77.000,0 (+1,05%)" in btc
+    assert "hace 1 h 0 min" in btc
+
+    eth = n.coin_status(symbol="ETH-USDT", last_price=2390.0, setups=[
+        {"symbol": "ETH-USDT", "side": "SHORT", "stage": "cambio 1H", "fib_618": 2400.5, "fib_75": 2420.0,
+         "fib_sl": 2425.0, "updated": time.time() - 600}])
+    assert "Sin operación abierta" in eth and "Entrada 0,618: $2.400,50" in eth
+    assert "Distancia a la entrada: +0,44%" in eth
 
 
 def test_choch_message_has_signed_distance():

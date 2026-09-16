@@ -160,6 +160,7 @@ class TelegramBot:
 
     def _cmd_estado(self, args, chat_id) -> None:
         assert self.client and self.store and self.executor
+        narrator = self.executor.narrator
         balance, balance_error = None, ""
         try:
             balance = self.client.balance()
@@ -170,15 +171,31 @@ class TelegramBot:
             positions = self.client.positions()
         except Exception as exc:
             positions_error = str(exc)
+        setups = self.store.state.get("setups", {})
         today = self._today()
-        self.send(self.executor.narrator.status(
+        self.send(narrator.status_header(
             paused=self.store.paused, balance=balance, balance_error=balance_error,
-            positions=positions, positions_error=positions_error,
-            open_trades=self.store.open_trades, setups=self.store.state.get("setups", {}),
+            open_count=len(positions), positions_error=positions_error, setups_count=len(setups),
             day_pnl=sum(t["pnl_usdt"] for t in today), day_count=len(today),
             daily_limit=self.s.daily_loss_limit_usdt, margin=self.s.margin_per_trade_usdt,
-            max_positions=self.s.max_open_positions, symbols=self.s.symbols, demo=not self.s.is_live,
+            max_positions=self.s.max_open_positions, demo=not self.s.is_live,
         ), chat_id)
+
+        by_symbol = {p.symbol: p for p in positions}
+        extra = [p.symbol for p in positions if p.symbol not in self.s.symbols]
+        for symbol in self.s.symbols + extra:
+            position = by_symbol.get(symbol)
+            last_price = position.mark_price if position else None
+            if last_price is None:
+                try:
+                    last_price = self.client.price(symbol)
+                except Exception:
+                    last_price = None
+            self.send(narrator.coin_status(
+                symbol=symbol, last_price=last_price, position=position,
+                trade=self.store.open_trades.get(symbol),
+                setups=[v for v in setups.values() if v.get("symbol") == symbol],
+            ), chat_id)
 
     def _cmd_hoy(self, args, chat_id) -> None:
         assert self.store

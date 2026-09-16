@@ -19,7 +19,9 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -43,11 +45,14 @@ TRADINGVIEW_IPS = {"52.89.214.238", "34.212.75.30", "54.218.53.128", "52.32.178.
 log = logging.getLogger("bot")
 
 
-def setup_logging(data_dir) -> None:
+def setup_logging(data_dir, tz_name: str) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     if hasattr(sys.stdout, "reconfigure"):  # consolas Windows (cp1252) no rompen con emojis
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    tz = ZoneInfo(tz_name)
     fmt = logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
+    # Logs en horario de Argentina (o el TIMEZONE configurado), no en UTC
+    fmt.converter = lambda secs: datetime.fromtimestamp(secs, tz).timetuple()
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.handlers.clear()
@@ -68,7 +73,7 @@ class App:
         if errors:
             raise SystemExit("Configuración inválida:\n- " + "\n- ".join(errors))
         s = self.settings
-        setup_logging(s.data_dir)
+        setup_logging(s.data_dir, s.timezone)
 
         self.store = Store(s.data_dir)
         self.client = BingXClient(s.bingx_api_key, s.bingx_api_secret, s.mode)

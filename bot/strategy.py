@@ -34,7 +34,8 @@ class StrategyParams:
     fib_entry: float = 0.618
     fib_inval: float = 0.75
     inval_by_close: bool = True     # True: cierre 1H · False: mecha
-    sl_fib: float = 0.786           # SL fijo en Fibo (None → 0.75 − ATR)
+    sl_mode: str = "fib"            # fib: nivel sl_fib · atr: 0.75 − colchón×ATR 1H · structure: inicio del impulso − colchón
+    sl_fib: float = 0.786
     sl_buf_atr: float = 0.1
     choch_expiry_h: int = 48
     trigger_expiry_h: int = 48
@@ -360,11 +361,13 @@ class SymbolStrategy:
                         else (bar.close < line_now and bar.prev_close >= line_prev)
                     inside = bar.close > s.f75 if is_long else bar.close < s.f75
                     if breakout and inside:
-                        if p.sl_fib:
-                            sl = s.fsl
-                        else:
-                            buf = p.sl_buf_atr * (h.atr or 0) if h else 0
+                        buf = p.sl_buf_atr * (h.atr or 0) if h else 0
+                        if p.sl_mode == "structure":
+                            sl = s.extreme - buf if is_long else s.extreme + buf
+                        elif p.sl_mode == "atr":
                             sl = s.f75 - buf if is_long else s.f75 + buf
+                        else:
+                            sl = s.fsl
                         events.append(self._event(s, "entry", bar, bar.close,
                                                   "ruptura de la diagonal en 5m", sl=sl, tp=s.imp_end))
                         s.reset()

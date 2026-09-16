@@ -50,6 +50,7 @@ class Scanner:
         self.engines = {sym: SymbolStrategy(sym, self.params) for sym in settings.symbols}
         self.last_index: dict[str, int] = {}
         self._zones_cache: dict[str, tuple[int, object]] = {}
+        self._last_close: dict[str, float] = {}
         self._stop = threading.Event()
         self.last_scan_ok: Optional[float] = None
         self.ready = False
@@ -111,31 +112,39 @@ class Scanner:
             if prev is not None and bar.index > prev and now_ms - bar.close_time <= LIVE_GRACE_MS:
                 self._dispatch(events)
         self.last_index[symbol] = bars[-1].index
+        self._last_close[symbol] = bars[-1].close
         log.info("Warm-up %s: %d velas 5m, setups activos: %d",
                  symbol, len(bars), sum(1 for s in engine.setups() if s.state > 0))
         return True
 
     def warmup(self) -> None:
-        summary, failed = [], []
-        for symbol, engine in list(self.engines.items()):
+        failed = []
+        for symbol in list(self.engines):
             if not self.warmup_symbol(symbol):
                 failed.append(symbol.split("-")[0])
-                continue
-            summary += [f"• {symbol.split('-')[0]} {'📈' if s.direction == 1 else '📉'} {s.side}: "
-                        f"{STAGE_LABELS[s.state]}" for s in self.engines[symbol].setups() if s.state > 0]
 
         self._persist()
         self.sync_setups()
         self.ready = True
         self.last_scan_ok = time.time()
         pairs = " · ".join(sym.split("-")[0] for sym in self.engines)
-        body = "\n".join(summary) if summary else "👀 Ningún setup en curso: espero que el precio llegue a una zona diaria."
         warn = (f"\n\n⚠️ No pude leer el historial de {', '.join(failed)}: lo reintento en cada ciclo."
                 if failed else "")
         self.notify(f"🧠 <b>Motor de análisis listo</b>\n\n"
                     f"📚 Revisé los últimos ~5 días de {pairs}.\n"
                     f"⏱️ A partir de ahora analizo cada vela de 5 minutos.\n\n"
-                    f"🔎 <b>En curso</b>\n{body}{warn}")
+                    f"👇 Qué quedó en curso en cada moneda:{warn}")
+        narrator = getattr(self.executor, "narrator", None)
+        if narrator is None:
+            return
+        setups = self.store.state.get("setups", {})
+        for symbol in self.engines:
+            if symbol.split("-")[0] in failed:
+                continue
+            last = self._last_close.get(symbol)
+            self.notify(narrator.coin_status(
+                symbol=symbol, last_price=last, position=None, trade=None,
+                setups=[v for v in setups.values() if v.get("symbol") == symbol]))
 
     # ───────── ciclo en vivo ─────────
 
