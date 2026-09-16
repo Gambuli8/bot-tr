@@ -25,3 +25,6 @@ _legacy_local/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Respaldo del bot Binance en el VPS (.env viejos con claves, data vieja)
+legacy-binance/
