@@ -1,46 +1,27 @@
 # Secretos
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 *.pem
 *.key
 
-# Entorno virtual
+# Entornos y caches
 venv/
 .venv/
-env/
-ENV/
-
-# Python caches
 __pycache__/
 *.py[cod]
-*$py.class
 .pytest_cache/
-.mypy_cache/
 .ruff_cache/
-*.egg-info/
-build/
-dist/
 
-# Estado runtime del bot (paper trading, journals, audit, bot.log).
-# NOTA: la carpeta logs/ NO se ignora porque ahí vive el código (logger.py).
-# El bot.log se persiste en data/, junto al state.json.
+# Estado runtime (trades, eventos, logs, reportes)
 data/
 
-# Pero sí ignoramos los logs runtime que históricamente quedaron en logs/
-logs/bot.log
-logs/bot.log.*
-logs/run_stdout.log
+# Archivo local del bot anterior (Binance) — respaldo en la rama legacy/binance-bot
+_legacy_local/
 
 # IDE / OS
 .vscode/
 .idea/
-*.swp
-*.swo
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Backups locales
-*.bak
-*.before_*
