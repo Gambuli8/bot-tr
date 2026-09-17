@@ -61,8 +61,8 @@ class Executor:
 
         self.store.log_event("signal", **sig.model_dump(exclude={"secret"}))
 
-        if sig.symbol not in self.s.symbols:
-            reason = f"{sig.symbol} no está en la lista de pares habilitados"
+        if sig.symbol not in self.s.directional_symbols:
+            reason = f"{sig.symbol} no está en la lista de pares de la estrategia direccional"
             self.store.log_event("rejected", id=sig.id, reason=reason)
             return {"status": "rejected", "reason": reason}
 
@@ -122,8 +122,9 @@ class Executor:
 
         if any(p.symbol == sig.symbol for p in positions) or sig.symbol in self.store.open_trades:
             return self._reject(sig, f"ya hay una operación abierta en {sig.base_asset}")
-        if len(positions) >= self.s.max_open_positions:
-            return self._reject(sig, f"ya hay {len(positions)} operaciones abiertas (máximo {self.s.max_open_positions})")
+        directional = [p for p in positions if p.symbol not in self.s.carry_symbols]
+        if len(directional) >= self.s.max_open_positions:
+            return self._reject(sig, f"ya hay {len(directional)} operaciones abiertas (máximo {self.s.max_open_positions})")
 
         day_pnl = self.todays_realized_pnl()
         if day_pnl <= -abs(self.s.daily_loss_limit_usdt):

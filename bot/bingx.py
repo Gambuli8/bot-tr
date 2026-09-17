@@ -331,6 +331,42 @@ class BingXClient:
             params["endTime"] = end_ms
         return self._request("GET", "/openApi/swap/v2/user/income", params) or []
 
+    # ───────── futuros: órdenes sin SL/TP y margen aislado (modo carry) ─────────
+
+    def place_market(self, symbol: str, side: str, qty: str, reduce_only: bool = False) -> dict:
+        """Orden a mercado simple (BUY/SELL) en modo one-way."""
+        params = {"symbol": symbol, "side": side, "positionSide": "BOTH", "type": "MARKET", "quantity": qty}
+        if reduce_only:
+            params["reduceOnly"] = "true"
+        data = self._request("POST", "/openApi/swap/v2/trade/order", params)
+        return data.get("order", data) if isinstance(data, dict) else {}
+
+    def add_isolated_margin(self, symbol: str, amount: float) -> None:
+        self._request("POST", "/openApi/swap/v2/trade/positionMargin",
+                      {"symbol": symbol, "amount": f"{amount:.4f}", "type": 1, "positionSide": "BOTH"})
+
+    # ───────── spot ─────────
+
+    def spot_symbols(self) -> dict[str, dict]:
+        data = self._request("GET", "/openApi/spot/v1/common/symbols", signed=False) or {}
+        return {s["symbol"]: s for s in data.get("symbols", [])}
+
+    def spot_balances(self) -> dict[str, float]:
+        data = self._request("GET", "/openApi/spot/v1/account/balance") or {}
+        return {b["asset"]: _f(b.get("free")) + _f(b.get("locked")) for b in data.get("balances", [])}
+
+    def spot_market_order(self, symbol: str, side: str, qty: str) -> dict:
+        data = self._request("POST", "/openApi/spot/v1/trade/order",
+                             {"symbol": symbol, "side": side, "type": "MARKET", "quantity": qty})
+        return data or {}
+
+    # ───────── transferencias internas (nunca retiros) ─────────
+
+    def transfer(self, asset: str, amount: float, from_account: str, to_account: str) -> dict:
+        """Mueve saldo entre billeteras propias: 'spot' ↔ 'USDTMPerp' (futuros USDT-M)."""
+        return self._request("POST", "/openApi/api/asset/v1/transfer", {
+            "asset": asset, "amount": f"{amount:.2f}", "fromAccount": from_account, "toAccount": to_account}) or {}
+
     def position_history(self, symbol: str, start_ms: int, end_ms: int) -> list[dict]:
         try:
             data = self._request("GET", "/openApi/swap/v1/trade/positionHistory",

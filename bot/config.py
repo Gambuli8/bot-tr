@@ -101,6 +101,17 @@ class Settings:
     monitor_interval_s: int
     port: int
 
+    # Modo carry (captura de funding: spot + short)
+    carry_enabled: bool = False
+    carry_symbols: list = field(default_factory=list)
+    carry_capital_usdt: float = 0.0
+    carry_leverage: float = 2.0
+    carry_rebalance_pct: float = 0.3
+    carry_reinvest_pct: float = 0.03
+    carry_min_trade_usdt: float = 5.0
+    carry_interval_s: int = 300
+    carry_asset: str = ""
+
     extra: dict = field(default_factory=dict)
 
     @property
@@ -127,6 +138,12 @@ class Settings:
     def strategy_params(self):
         from bot.strategy import StrategyParams
         return StrategyParams(sl_mode=self.sl_mode, filter_trend=self.filter_trend)
+
+    @property
+    def directional_symbols(self) -> list[str]:
+        """Pares de la estrategia direccional: se excluyen los del carry (en one-way se anularían)."""
+        excluded = set(self.carry_symbols) if self.carry_enabled else set()
+        return [s for s in self.symbols if s not in excluded]
 
     @property
     def uses_tradingview(self) -> bool:
@@ -156,6 +173,11 @@ class Settings:
             errors.append("MARGIN_PER_TRADE_USDT fuera de rango seguro (0.5–5)")
         if self.sizing_mode == "risk" and not 0.1 <= self.risk_per_trade_usdt <= 5:
             errors.append("RISK_PER_TRADE_USDT fuera de rango seguro (0.1–5)")
+        if self.carry_enabled:
+            if not 1 <= self.carry_leverage <= 5:
+                errors.append("CARRY_LEVERAGE fuera de rango seguro (1–5)")
+            if self.carry_capital_usdt <= 0 or not self.carry_symbols:
+                errors.append("CARRY_CAPITAL_USDT y CARRY_SYMBOLS son obligatorios con CARRY_ENABLED=true")
         if self.sl_mode not in ("fib", "atr", "structure"):
             errors.append("SL_MODE debe ser fib, atr o structure")
         if not 1 <= self.max_leverage <= 25:
@@ -207,6 +229,15 @@ def load_settings(env_file: str | None = None) -> Settings:
         risk_per_trade_usdt=_env_float("RISK_PER_TRADE_USDT", 0.5),
         sl_mode=_env("SL_MODE", "fib").lower(),
         filter_trend=_env_bool("FILTER_TREND", False),
+        carry_enabled=_env_bool("CARRY_ENABLED", False),
+        carry_symbols=[normalize_symbol(s) for s in _env("CARRY_SYMBOLS", "BTC-USDT,ETH-USDT,DOGE-USDT,XRP-USDT").split(",") if s.strip()],
+        carry_capital_usdt=_env_float("CARRY_CAPITAL_USDT", 0.0),
+        carry_leverage=_env_float("CARRY_LEVERAGE", 2.0),
+        carry_rebalance_pct=_env_float("CARRY_REBALANCE_PCT", 0.3),
+        carry_reinvest_pct=_env_float("CARRY_REINVEST_PCT", 0.03),
+        carry_min_trade_usdt=_env_float("CARRY_MIN_TRADE_USDT", 5.0),
+        carry_interval_s=_env_int("CARRY_INTERVAL_S", 300),
+        carry_asset=_env("CARRY_ASSET", ""),
         webhook_secret=_env("WEBHOOK_SECRET"),
         enforce_tv_ips=_env_bool("ENFORCE_TV_IPS", True),
         telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),

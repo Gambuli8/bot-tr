@@ -47,6 +47,7 @@ class TelegramBot:
         self.store: Optional["Store"] = None
         self.executor: Optional["Executor"] = None
         self.reporter: Optional["Reporter"] = None
+        self.carry = None
 
     # ───────── envío ─────────
 
@@ -127,6 +128,7 @@ class TelegramBot:
             "/pausa": self._cmd_pausa, "/pause": self._cmd_pausa,
             "/reanudar": self._cmd_reanudar, "/resume": self._cmd_reanudar,
             "/cerrar": self._cmd_cerrar,
+            "/carry": self._cmd_carry,
             "/ayuda": self._cmd_ayuda, "/start": self._cmd_ayuda, "/help": self._cmd_ayuda,
         }.get(command)
         if handler is None:
@@ -151,7 +153,8 @@ class TelegramBot:
             "📆 /mes — resumen del mes en curso\n"
             "⏸️ /pausa — no abro nuevas operaciones (las abiertas siguen protegidas)\n"
             "▶️ /reanudar — vuelvo a operar\n"
-            "✋ /cerrar BTC — cierro la operación de ese par", chat_id)
+            "✋ /cerrar BTC — cierro la operación de ese par\n"
+            "🧲 /carry — estado de la captura de funding (/carry cerrar BTC si · /carry cerrar todo si)", chat_id)
 
     def _today(self) -> list[dict]:
         tz = ZoneInfo(self.s.timezone)
@@ -183,8 +186,10 @@ class TelegramBot:
         ), chat_id)
 
         by_symbol = {p.symbol: p for p in positions}
-        extra = [p.symbol for p in positions if p.symbol not in self.s.symbols]
-        for symbol in self.s.symbols + extra:
+        carry_symbols = set(self.carry.active_symbols()) if self.carry else set()
+        directional = self.s.directional_symbols
+        extra = [p.symbol for p in positions if p.symbol not in directional and p.symbol not in carry_symbols]
+        for symbol in directional + extra:
             position = by_symbol.get(symbol)
             last_price = position.mark_price if position else None
             if last_price is None:
@@ -240,6 +245,25 @@ class TelegramBot:
         assert self.store
         self.store.update(paused=False)
         self.send("▶️ Reanudado: vuelvo a operar cuando aparezca un setup.", chat_id)
+
+    def _cmd_carry(self, args, chat_id) -> None:
+        if self.carry is None:
+            self.send("El modo carry no está disponible.", chat_id)
+            return
+        if args and args[0].lower() == "cerrar":
+            target = args[1].upper() if len(args) > 1 else ""
+            confirmed = len(args) > 2 and args[2].lower() in ("si", "sí", "yes")
+            if not target or not confirmed:
+                self.send("Para cerrar confirmá así: /carry cerrar BTC si  (o /carry cerrar todo si)", chat_id)
+                return
+            symbols = self.carry.active_symbols() if target == "TODO" else [normalize_symbol(target + "-USDT")]
+            for sym in symbols:
+                try:
+                    self.send(f"🧲 {esc(self.carry.unwind(sym))}", chat_id)
+                except Exception as exc:
+                    self.send(f"🚨 No pude cerrar el carry de {esc(sym)}: {esc(exc)}", chat_id)
+            return
+        self.send(self.carry.status_text(), chat_id)
 
     def _cmd_cerrar(self, args, chat_id) -> None:
         assert self.executor

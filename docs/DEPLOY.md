@@ -104,3 +104,25 @@ Los resúmenes quedan en **Mi unidad / Bot Trading BingX / Semanales** y **/ Men
 
 Para pasar a real: en `.env` poner `BINGX_MODE=live` (y el margen que quieras, 1–2 USDT) →
 `docker compose up -d` → `python -m bot.cli check` muestra el saldo real.
+
+## 8. Modo carry (captura de funding)
+
+Compra spot + short del mismo tamaño en 4 pares (BTC, ETH, DOGE, XRP) para cobrar el funding sin
+exposición al precio. Detalle de la lógica en `bot/carry.py`; validación en `scripts/backtest_funding.py`.
+
+1. **Permisos de la API key** (BingX → Gestión de API → editar): además de Perpetual Futures, habilitar
+   **Spot Trading** y **transferencias internas / Universal Transfer**. **Nunca** habilitar retiros.
+2. En el `.env`:
+   ```
+   CARRY_ENABLED=true
+   CARRY_SYMBOLS=BTC-USDT,ETH-USDT,DOGE-USDT,XRP-USDT
+   CARRY_CAPITAL_USDT=200
+   CARRY_LEVERAGE=2
+   ```
+3. `docker compose up -d` y en Telegram `/carry`.
+
+Qué hace solo: arma cada par (si hay una operación direccional abierta en ese par, espera a que cierre),
+protege el short si el precio sube ±15 % (primero con el funding acumulado, después vendiendo spot),
+reinvierte lo ganado cuando supera el 3 % del capital del par y alcanza para al menos un paso de contrato,
+y corrige la cobertura si spot y short se desbalancean. Para desarmar: `/carry cerrar BTC si` o
+`/carry cerrar todo si`. Los pares del carry quedan fuera de la estrategia direccional.

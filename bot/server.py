@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from bot.bingx import BingXClient, BingXError
+from bot.carry import CarryManager
 from bot.config import load_settings
 from bot.drive import DriveUploader
 from bot.executor import Executor
@@ -88,6 +89,8 @@ class App:
         self.scanner = None if s.uses_tradingview else Scanner(
             s, self.client, self.store, self.executor, self.telegram.send, delay_s=s.scan_delay_s,
             market=BingXClient("", "", "live"))
+        self.carry = CarryManager(s, self.client, self.store, self.narrator, self.telegram.send)
+        self.telegram.carry = self.carry
         self.telegram.client, self.telegram.store = self.client, self.store
         self.telegram.executor, self.telegram.reporter = self.executor, self.reporter
         self.pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="signal")
@@ -119,13 +122,19 @@ class App:
             self.telegram.send(self.narrator.alert(f"No pude leer el saldo de BingX: {exc}", critical=True))
 
         self.monitor.start()
+        self.carry.start()
         if self.scanner is not None:
             self.scanner.start()
         self.telegram.start_listener()
-        self.telegram.send(self.narrator.started(balance, s.symbols, s.sizing_label(), s.rules_label()))
+        self.telegram.send(self.narrator.started(balance, s.directional_symbols, s.sizing_label(), s.rules_label()))
+        if s.carry_enabled:
+            self.telegram.send(f"🧲 <b>Modo carry activado</b> · {', '.join(x.split('-')[0] for x in s.carry_symbols)} · "
+                               f"short ×{s.carry_leverage:g} · capital {s.carry_capital_usdt:g} USDT\n"
+                               f"Estos pares quedan fuera de la estrategia direccional. /carry para ver el estado.")
 
     def shutdown(self) -> None:
         self.monitor.stop()
+        self.carry.stop()
         if self.scanner is not None:
             self.scanner.stop()
         self.telegram.stop()

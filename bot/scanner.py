@@ -47,7 +47,7 @@ class Scanner:
         self.notify = notify
         self.params = params or settings.strategy_params()
         self.delay_s = delay_s
-        self.engines = {sym: SymbolStrategy(sym, self.params) for sym in settings.symbols}
+        self.engines = {sym: SymbolStrategy(sym, self.params) for sym in settings.directional_symbols}
         self.last_index: dict[str, int] = {}
         self._zones_cache: dict[str, tuple[int, object]] = {}
         self._last_close: dict[str, float] = {}
