@@ -194,6 +194,33 @@ Riesgo fijo 0,50 USDT, sin break-even ni parciales, sólo filtro EMA50 diaria, 2
 - El bot quedó configurable por `.env` para correr cualquiera de estas variantes en la demo:
   `SL_MODE` (fib | atr | structure), `FILTER_TREND`, `MIN_RR`, `SIZING_MODE` (margin | risk), `RISK_PER_TRADE_USDT`.
 
+### 7.d Captura de funding delta-neutral (spot + short) — `scripts/backtest_funding.py`
+
+Comprar la moneda en spot y abrir un short del mismo tamaño en el perpetuo: el precio se compensa y queda
+el funding. Comisiones reales de la cuenta (spot 0,10 %, perp 0,05 % taker / 0,02 % maker) + 0,03 % de
+deslizamiento por pierna, rebalanceo cuando el precio se mueve ±50 %/L, chequeo horario de liquidación.
+Rendimiento sobre el capital total (spot + margen). Canasta en partes iguales.
+
+| Prueba | Período | Modo | Anual | Caída máx. | Meses + | Por año |
+|---|---|---|---|---|---|---|
+| BingX · BTC ETH SOL XRP DOGE XLM | feb-2023 → sep-2026 | siempre dentro ×1 | **+5,4 %** | 0,13 % | 100 % | 23: +4,6 · 24: +10,1 · 25: +3,5 · 26: +1,4 |
+| | | siempre dentro ×2 | **+7,3 %** | 0,26 % | 98 % | 23: +5,7 · 24: +13,5 · 25: +4,9 · 26: +2,0 |
+| | | siempre dentro ×3 | +8,0 % | 0,52 % | 98 % | 23: +6,2 · 24: +15,0 · 25: +5,4 · 26: +2,2 |
+| | | entra/sale según funding ×2 | +5,8 % | 1,02 % | 86 % | 26: −0,3 (las comisiones se lo comen) |
+| BingX · BTC XLM (incluye 2022) | mar-2022 → sep-2026 | siempre dentro ×2 | +5,3 % | 0,41 % | 93 % | 22: +1,8 · 26: +1,7 |
+| Binance · 6 pares (estrés: incluye caída de FTX) | sep-2022 → sep-2026 | siempre dentro ×1 | +2,2 % | 3,14 % | 82 % | 22: −2,8 · 24: +6,5 · 26: +0,2 |
+
+**Conclusiones:**
+- Es la única estrategia positiva en todas las pruebas y con caídas muy chicas; no depende de la dirección del precio.
+- **Rinde poco y viene bajando:** 2024 fue el mejor año (+10–15 %); en 2026 va +1–2 %. Sobre 210 USDT son
+  ~4–17 USDT por año según el régimen.
+- Conviene **siempre dentro** (entrar y salir según el funding pierde por comisiones) y short ×2 (buen
+  equilibrio rendimiento / margen de seguridad). Usar maker en el short casi no cambia nada.
+- En BingX el funding promedio fue más alto que en Binance para los mismos pares.
+- Riesgos no modelados: custodia del exchange (todo el capital queda en BingX), diferencia de precio
+  spot/perp en movimientos bruscos, cambios en las reglas de funding, ADL. La demo de BingX no tiene spot,
+  así que no se puede probar en demo tal cual.
+
 ## 8. En qué nos puede ayudar Gemini para mejorar la tasa de acierto
 
 Queremos subir la tasa de acierto **sin sobreajustar**. Todo lo que propongas lo vamos a probar en el
