@@ -213,7 +213,8 @@ def simulate_trade(bars, i: int, side: str, entry: float, sl: float, tp: float, 
 
 # ───────────────────────── trabajo por par (proceso aparte) ─────────────────────────
 
-def run_symbol(symbol: str, spec: dict, start_ms: int, end_ms: int, risk: float) -> dict:
+def run_symbol(symbol: str, spec: dict, start_ms: int, end_ms: int, risk: float,
+               min_rr: float = MIN_RR, engines: tuple = tuple(ENGINES), mgmt_modes: tuple = tuple(MGMT)) -> dict:
     spec_obj = ContractSpec(**spec)
     daily = as_candles(fetch(symbol, "1d", start_ms - 450 * MS_1D, end_ms))
     hourly = as_candles(fetch(symbol, "1h", start_ms - 30 * MS_1D, end_ms))
@@ -224,7 +225,7 @@ def run_symbol(symbol: str, spec: dict, start_ms: int, end_ms: int, risk: float)
     bars = build_bars(m5, build_hourly(hourly, BASE), zones, BASE)
 
     trades, rejects, entries = [], {}, {}
-    for eng_name, params in ENGINES.items():
+    for eng_name, params in ((e, ENGINES[e]) for e in engines):
         engine = SymbolStrategy(symbol, params)
         n_entries = 0
         for i, bar in enumerate(bars):
@@ -236,13 +237,13 @@ def run_symbol(symbol: str, spec: dict, start_ms: int, end_ms: int, risk: float)
                 entry = ev["price"] * (1 + SLIPPAGE if long else 1 - SLIPPAGE)
                 plan = build_plan_fixed_risk(symbol=symbol, direction=ev["side"], entry=entry,
                                              stop_loss=ev["sl"], take_profit=ev["tp"], spec=spec_obj,
-                                             risk_usdt=risk, max_leverage=MAX_LEVERAGE, min_rr=MIN_RR)
+                                             risk_usdt=risk, max_leverage=MAX_LEVERAGE, min_rr=min_rr)
                 if not plan.ok:
                     key = ("R:R" if plan.reason.startswith("R:R") else
                            "mínimo de contrato" if "no llego al mínimo" in plan.reason else "otro")
                     rejects[(eng_name, key)] = rejects.get((eng_name, key), 0) + 1
                     continue
-                modes = ["—"] if eng_name == "REF" else list(MGMT)
+                modes = ["—"] if eng_name == "REF" else list(mgmt_modes)
                 for mgmt in modes:
                     move_be, partial = MGMT[mgmt]
                     res = simulate_trade(bars, i, ev["side"], entry, ev["sl"], ev["tp"], plan.qty,
@@ -314,8 +315,13 @@ def main():
     ap.add_argument("--max-open", type=int, default=3)
     ap.add_argument("--daily-loss", type=float, default=3.0)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--min-rr", type=float, default=MIN_RR, help="R:R neto mínimo para aceptar la entrada")
+    ap.add_argument("--engines", default=",".join(ENGINES), help="REF,BASE,BASE+IMP,BASE+VOL,BASE+IMP+VOL")
+    ap.add_argument("--mgmt", default=",".join(MGMT), help="—,BE,PARC,BE+PARC (— = SL/TP fijos)")
     args = ap.parse_args()
 
+    engines = tuple(e.strip() for e in args.engines.split(",") if e.strip())
+    mgmt_modes = tuple(m.strip() for m in args.mgmt.split(",") if m.strip())
     now_ms = int(time.time() * 1000) // 300_000 * 300_000
     start_ms = now_ms - args.months * 30 * MS_1D
     split_ms = now_ms - args.oos_months * 30 * MS_1D
@@ -331,7 +337,8 @@ def main():
     print(f"\nPeríodo: {datetime.fromtimestamp(start_ms / 1000, TZ):%d/%m/%Y} → "
           f"{datetime.fromtimestamp(now_ms / 1000, TZ):%d/%m/%Y} · OOS desde "
           f"{datetime.fromtimestamp(split_ms / 1000, TZ):%d/%m/%Y} · riesgo {args.risk} USDT/op · "
-          f"máx. {args.max_open} abiertas · {len(pairs)} pares", flush=True)
+          f"máx. {args.max_open} abiertas · R:R mín. {args.min_rr} · motores {engines} · gestión {mgmt_modes} · "
+          f"{len(pairs)} pares", flush=True)
 
     # Descarga secuencial (respeta límites de la API) y después procesamiento en paralelo
     for sym in pairs:
@@ -343,7 +350,8 @@ def main():
 
     results = []
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(run_symbol, sym, asdict(specs[sym]), start_ms, now_ms, args.risk): sym
+        futures = {pool.submit(run_symbol, sym, asdict(specs[sym]), start_ms, now_ms, args.risk,
+                               args.min_rr, engines, mgmt_modes): sym
                    for sym in pairs if sym in specs}
         for fut in as_completed(futures):
             res = fut.result()
@@ -356,7 +364,8 @@ def main():
         for k, v in r["rejects"].items():
             rejects[k] = rejects.get(k, 0) + v
 
-    variants = [("REF", "—")] + [(e, m) for e in ENGINES if e != "REF" for m in MGMT]
+    variants = [(e, "—") if e == "REF" else (e, m) for e in engines for m in (("—",) if e == "REF" else mgmt_modes)]
+    variants = list(dict.fromkeys(variants))
     table = []
     print(f"\n{'variante':<24} {'período':<4} resultado")
     for eng, mgmt in variants:
@@ -366,7 +375,8 @@ def main():
         oos = stats([t for t in accepted if t["time"] >= split_ms])
         table.append((eng, mgmt, ins, oos, accepted, skipped, max_margin))
         name = f"{eng} · {mgmt}"
-        print(f"{name:<24} IS   {line(ins)}")
+        print(f"{name:<24} TOT  {line(stats(accepted))}")
+        print(f"{'':<24} IS   {line(ins)}")
         print(f"{'':<24} OOS  {line(oos)}   (salteadas por límites: {skipped} · margen máx. simultáneo "
               f"{max_margin:.2f} USDT)")
 
