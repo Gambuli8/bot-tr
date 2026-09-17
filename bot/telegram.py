@@ -179,6 +179,7 @@ class TelegramBot:
             day_pnl=sum(t["pnl_usdt"] for t in today), day_count=len(today),
             daily_limit=self.s.daily_loss_limit_usdt, margin=self.s.margin_per_trade_usdt,
             max_positions=self.s.max_open_positions, demo=not self.s.is_live,
+            sizing=f"{self.s.sizing_label()}\n📐 {self.s.rules_label()}",
         ), chat_id)
 
         by_symbol = {p.symbol: p for p in positions}

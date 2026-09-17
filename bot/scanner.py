@@ -45,7 +45,7 @@ class Scanner:
         self.store = store
         self.executor = executor
         self.notify = notify
-        self.params = params or StrategyParams()
+        self.params = params or settings.strategy_params()
         self.delay_s = delay_s
         self.engines = {sym: SymbolStrategy(sym, self.params) for sym in settings.symbols}
         self.last_index: dict[str, int] = {}

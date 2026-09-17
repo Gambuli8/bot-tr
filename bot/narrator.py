@@ -161,7 +161,8 @@ class Narrator:
 
     def status_header(self, *, paused: bool, balance: Optional[dict], balance_error: str, open_count: int,
                       positions_error: str, setups_count: int, day_pnl: float, day_count: int,
-                      daily_limit: float, margin: float, max_positions: int, demo: bool) -> str:
+                      daily_limit: float, margin: float, max_positions: int, demo: bool,
+                      sizing: str = "") -> str:
         lines = [f"📊 <b>Estado general</b> · <i>{self.mode_label}</i> · {self.stamp()}", "", "💼 <b>Cuenta</b>"]
         if balance:
             suffix = " <i>(saldo de prueba)</i>" if demo else ""
@@ -175,7 +176,7 @@ class Narrator:
         lines.append(f"🛡️ Límite de pérdida diaria: {money(-abs(daily_limit), True)}")
         lines += ["", "⚙️ <b>Operativa</b>",
                   f"🚦 Nuevas entradas: {'⏸️ en pausa' if paused else '▶️ activas'}",
-                  f"💰 Margen por operación: {money(margin)}",
+                  f"💰 {sizing}" if sizing else f"💰 Margen por operación: {money(margin)}",
                   f"📂 Operaciones abiertas: {'no disponible' if positions_error else f'{open_count}/{max_positions}'}",
                   f"🔎 Setups en análisis: {setups_count}",
                   "", "👇 Detalle por moneda:"]
@@ -225,13 +226,14 @@ class Narrator:
 
     # ───────── sistema ─────────
 
-    def started(self, balance: Optional[float], symbols: list[str], margin: float) -> str:
+    def started(self, balance: Optional[float], symbols: list[str], sizing: str, rules: str = "") -> str:
         bal = money(balance) if balance is not None else "no disponible"
         return (f"{self._head('🤖', 'Bot encendido')}\n\n"
                 f"💵 Saldo: <b>{bal}</b>\n"
                 f"🪙 Pares: {' · '.join(asset_of(s) for s in symbols)}\n"
-                f"💰 Margen por operación: {money(margin)}\n\n"
-                f"💬 Escribí /ayuda para ver los comandos.")
+                f"💰 {sizing}\n"
+                + (f"📐 Reglas: {rules}\n" if rules else "")
+                + "\n💬 Escribí /ayuda para ver los comandos.")
 
     def alert(self, text: str, critical: bool = False) -> str:
         return f"{self._head('🚨' if critical else '⚠️', 'Atención')}\n\n{esc(text)}"

@@ -177,6 +177,23 @@ python scripts/backtest.py --pairs BTC-USDT,ETH-USDT --risk 0.5 --max-open 3 --d
 de volatilidad, IFVG y tendencia diaria multi-activo tampoco pasaron validaciones de varios años. Lo único que
 se sostuvo fue **captura de funding delta-neutral** (≈ +7,6 %/año, 92 % de meses positivos, drawdown ~0,3 %).
 
+### 7.c Iteración 3 (pedido de Gemini): cerrojo R:R 1:4
+
+Riesgo fijo 0,50 USDT, sin break-even ni parciales, sólo filtro EMA50 diaria, 20 pares, 24 meses.
+
+| Variante | Operaciones (2 años) | Acierto | Resultado |
+|---|---|---|---|
+| SL en inicio del impulso + R:R ≥ 4 | **0** | — | 0 R |
+| SL Fibo 0,786 + R:R ≥ 4 | **402** (IS 269 · OOS 133) | **11 %** (IS 14 % · OOS 7 %) | **−109,5 R · −57,61 USDT** (t −2,45) |
+
+- Con SL en el inicio del impulso y TP en el techo, el R:R es geométricamente imposible de llevar a 1:4:
+  de 3.814 entradas, R:R neto mediana 0,99, p90 1,63, máximo 2,71 (con entrada en 0,618 el techo teórico ≈ 1,6).
+- Con SL en 0,786 sí aparecen R:R ≥ 4 (entradas profundas, cerca del 0,75), pero el SL queda tan pegado que
+  se acierta 11 %: para ser rentable con 1:4 hace falta > 20 %. La premisa "30 % de acierto con 1:4" no se
+  cumple con estas reglas.
+- El bot quedó configurable por `.env` para correr cualquiera de estas variantes en la demo:
+  `SL_MODE` (fib | atr | structure), `FILTER_TREND`, `MIN_RR`, `SIZING_MODE` (margin | risk), `RISK_PER_TRADE_USDT`.
+
 ## 8. En qué nos puede ayudar Gemini para mejorar la tasa de acierto
 
 Queremos subir la tasa de acierto **sin sobreajustar**. Todo lo que propongas lo vamos a probar en el

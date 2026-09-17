@@ -73,6 +73,13 @@ class Settings:
     strategy_source: str
     scan_delay_s: float
 
+    # Tamaño: "margin" (margen fijo, apalancamiento mínimo) | "risk" (riesgo fijo en USDT por operación)
+    sizing_mode: str
+    risk_per_trade_usdt: float
+    # Estrategia: tipo de SL (fib | atr | structure) y filtro de tendencia EMA50 diaria
+    sl_mode: str
+    filter_trend: bool
+
     # Webhook TradingView
     webhook_secret: str
     enforce_tv_ips: bool
@@ -104,6 +111,23 @@ class Settings:
     def mode_label(self) -> str:
         return "REAL 💵" if self.is_live else "DEMO 🧪"
 
+    def sizing_label(self) -> str:
+        from bot.fmt import money
+        if self.sizing_mode == "risk":
+            return f"Riesgo fijo por operación: {money(self.risk_per_trade_usdt)}"
+        return f"Margen fijo por operación: {money(self.margin_per_trade_usdt)}"
+
+    def rules_label(self) -> str:
+        from bot.fmt import ratio
+        sl = {"fib": "SL Fibo 0,786", "atr": "SL 0,75 − ATR 1H", "structure": "SL en inicio del impulso"}.get(
+            self.sl_mode, self.sl_mode)
+        trend = " · sólo a favor de la EMA50 diaria" if self.filter_trend else ""
+        return f"{sl} · TP techo del impulso · R:R mín. 1 : {ratio(self.min_rr)}{trend}"
+
+    def strategy_params(self):
+        from bot.strategy import StrategyParams
+        return StrategyParams(sl_mode=self.sl_mode, filter_trend=self.filter_trend)
+
     @property
     def uses_tradingview(self) -> bool:
         return self.strategy_source == "tradingview"
@@ -126,8 +150,14 @@ class Settings:
             errors.append("STRATEGY_SOURCE debe ser 'internal' o 'tradingview'")
         if len(self.webhook_secret) < 16:
             errors.append("WEBHOOK_SECRET debe tener al menos 16 caracteres")
-        if not 0.5 <= self.margin_per_trade_usdt <= 5:
+        if self.sizing_mode not in ("margin", "risk"):
+            errors.append("SIZING_MODE debe ser 'margin' o 'risk'")
+        if self.sizing_mode == "margin" and not 0.5 <= self.margin_per_trade_usdt <= 5:
             errors.append("MARGIN_PER_TRADE_USDT fuera de rango seguro (0.5–5)")
+        if self.sizing_mode == "risk" and not 0.1 <= self.risk_per_trade_usdt <= 5:
+            errors.append("RISK_PER_TRADE_USDT fuera de rango seguro (0.1–5)")
+        if self.sl_mode not in ("fib", "atr", "structure"):
+            errors.append("SL_MODE debe ser fib, atr o structure")
         if not 1 <= self.max_leverage <= 25:
             errors.append("MAX_LEVERAGE fuera de rango seguro (1–25)")
         if self.margin_type not in ("ISOLATED", "CROSSED"):
@@ -173,6 +203,10 @@ def load_settings(env_file: str | None = None) -> Settings:
         max_slippage_pct=_env_float("MAX_SLIPPAGE_PCT", 0.4),
         strategy_source=_env("STRATEGY_SOURCE", "internal").lower(),
         scan_delay_s=_env_float("SCAN_DELAY_S", 8.0),
+        sizing_mode=_env("SIZING_MODE", "margin").lower(),
+        risk_per_trade_usdt=_env_float("RISK_PER_TRADE_USDT", 0.5),
+        sl_mode=_env("SL_MODE", "fib").lower(),
+        filter_trend=_env_bool("FILTER_TREND", False),
         webhook_secret=_env("WEBHOOK_SECRET"),
         enforce_tv_ips=_env_bool("ENFORCE_TV_IPS", True),
         telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),

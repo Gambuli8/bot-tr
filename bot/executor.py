@@ -26,7 +26,7 @@ from bot.config import Settings
 from bot.fmt import money, pct, price
 from bot.narrator import Narrator
 from bot.signals import Signal
-from bot.sizing import build_plan
+from bot.sizing import build_plan, build_plan_fixed_risk
 from bot.store import Store
 
 log = logging.getLogger(__name__)
@@ -142,10 +142,12 @@ class Executor:
             return self._reject(sig, f"el precio se movió {pct(slippage)} desde la señal "
                                      f"({price(sig.price)} → {price(live)}); máximo {pct(self.s.max_slippage_pct)}")
 
-        plan = build_plan(symbol=sig.symbol, direction=sig.side, entry=live,
-                          stop_loss=float(sig.sl), take_profit=float(sig.tp), spec=spec,
-                          margin_usdt=self.s.margin_per_trade_usdt,
-                          max_leverage=self.s.max_leverage, min_rr=self.s.min_rr)
+        common = dict(symbol=sig.symbol, direction=sig.side, entry=live, stop_loss=float(sig.sl),
+                      take_profit=float(sig.tp), spec=spec, max_leverage=self.s.max_leverage, min_rr=self.s.min_rr)
+        if self.s.sizing_mode == "risk":
+            plan = build_plan_fixed_risk(risk_usdt=self.s.risk_per_trade_usdt, **common)
+        else:
+            plan = build_plan(margin_usdt=self.s.margin_per_trade_usdt, **common)
         if not plan.ok:
             return self._reject(sig, plan.reason)
 

@@ -38,7 +38,9 @@ hPivotLen      = input.int(3, "Pivote 1H (velas a cada lado)", minval = 1, group
 fibEntry       = input.float(0.618, "Nivel de entrada", step = 0.001, group = grpH)
 fibInval       = input.float(0.75, "Nivel de invalidación", step = 0.01, group = grpH)
 invalMode      = input.string("Cierre 1H", "Se invalida si rompe el 0.75 por", options = ["Cierre 1H", "Mecha"], group = grpH)
-slMode         = input.string("Fibo fijo", "Stop Loss", options = ["Fibo fijo", "0.75 − ATR"], group = grpH)
+slMode         = input.string("Fibo fijo", "Stop Loss", options = ["Fibo fijo", "0.75 − ATR", "Inicio del impulso"], group = grpH)
+filterTrend    = input.bool(false, "Sólo a favor de la EMA50 diaria (FILTER_TREND)", group = grpH)
+minRR          = input.float(1.5, "R:R mínimo para marcar la entrada (el bot lo exige neto de comisiones)", step = 0.5, group = grpH)
 slFib          = input.float(0.786, "Nivel Fibo del SL (modo Fibo fijo)", step = 0.001, group = grpH)
 slBufAtr       = input.float(0.1, "Colchón bajo el 0.75 (× ATR 1H, modo ATR)", step = 0.05, group = grpH)
 chochExpiryH   = input.int(48, "Horas máx. para el cambio 1H tras tocar la zona", minval = 1, group = grpH)
@@ -97,6 +99,9 @@ f_h1(int len) =>
 
 [hHigh, hLow, hClose, hLastPH, hLastPL, hAtr, hTime] = request.security(syminfo.tickerid, "60", f_h1(hPivotLen), lookahead = barmerge.lookahead_on)
 newH1 = hTime != hTime[1]
+
+// ───────── 1D: tendencia (último día cerrado) ─────────
+[dClose, dEma] = request.security(syminfo.tickerid, "D", [close[1], ta.ema(close, 50)[1]], lookahead = barmerge.lookahead_on)
 
 // ───────── 5m: pivotes para la diagonal ─────────
 ph5 = ta.pivothigh(high, mPivotLen, mPivotLen)
@@ -258,10 +263,14 @@ step(Setup s) =>
                     linePrev = lineNow - slope
                     breakout = isLong ? (close > lineNow and close[1] <= linePrev) : (close < lineNow and close[1] >= linePrev)
                     insideFib = isLong ? close > s.f75 : close < s.f75
-                    if breakout and insideFib
-                        sl = slMode == "Fibo fijo" ? s.fSL : (isLong ? s.f75 - slBufAtr * hAtr : s.f75 + slBufAtr * hAtr)
+                    againstTrend = filterTrend and (na(dEma) or (isLong ? dClose <= dEma : dClose >= dEma))
+                    if breakout and insideFib and againstTrend
+                        cancel(s, "va contra la tendencia diaria (EMA50)")
+                    else if breakout and insideFib
+                        sl = slMode == "Fibo fijo" ? s.fSL : slMode == "Inicio del impulso" ? (isLong ? s.extreme - slBufAtr * hAtr : s.extreme + slBufAtr * hAtr) : (isLong ? s.f75 - slBufAtr * hAtr : s.f75 + slBufAtr * hAtr)
                         tp = s.impEnd
-                        emit(s, "entry", close, sl, tp, "ruptura de la diagonal en 5m")
+                        rr = math.abs(tp - close) / math.abs(close - sl)
+                        emit(s, "entry", close, sl, tp, rr >= minRR ? "ruptura de la diagonal en 5m" : "ruptura de la diagonal en 5m (R:R bajo: el bot la descarta)")
                         if showDraw
                             line.new(x1, y1, bar_index, lineNow, color = color.yellow, width = 2)
                             line.new(bar_index, sl, bar_index + 36, sl, color = color.red, width = 2)

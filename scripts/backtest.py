@@ -13,6 +13,7 @@ Matriz de pruebas (se activan de a una sobre la BASE):
   BASE     SL estructural (inicio del impulso − 0,1×ATR 1H) + tendencia EMA50 diaria + TP impulso + R:R ≥ 1,5
   +IMP     impulso 1H ≥ 1,5 × ATR(14) 1H
   +VOL     vela gatillo con volumen > SMA(20)
+  FIB+TREND SL Fibo 0,786 + tendencia EMA50 diaria (para R:R altos: --min-rr 4)
   gestión  —: SL/TP fijos · BE: SL a break-even en +1R · PARC: cierra 50 % en +1R · BE+PARC: ambas
 
 Anti-sobreajuste: in-sample (IS) = primeros meses, out-of-sample (OOS) = últimos --oos-months,
@@ -67,6 +68,7 @@ ENGINES = {
     "BASE+IMP": replace(BASE, filter_impulse=True),
     "BASE+VOL": replace(BASE, filter_volume=True),
     "BASE+IMP+VOL": replace(BASE, filter_impulse=True, filter_volume=True),
+    "FIB+TREND": StrategyParams(sl_mode="fib", filter_trend=True),   # SL Fibo 0,786 + EMA50 diaria
 }
 MGMT = {"—": (False, False), "BE": (True, False), "PARC": (False, True), "BE+PARC": (True, True)}
 

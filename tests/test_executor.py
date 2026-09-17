@@ -112,3 +112,24 @@ def test_exchange_error_on_order_is_reported(executor, client, store, messages):
     assert executor.handle(entry())["status"] == "error"
     assert "BTC-USDT" not in store.open_trades
     assert "error al abrir" in messages[-1]
+
+
+def test_fixed_risk_mode_sizes_by_stop_distance(settings, client, store, narrator, messages, monkeypatch):
+    from dataclasses import replace
+    monkeypatch.setattr("bot.executor.time.sleep", lambda s: None)
+    risk_settings = replace(settings, sizing_mode="risk", risk_per_trade_usdt=0.5, min_rr=1.5)
+    ex = Executor(risk_settings, client, store, narrator, messages.append)
+    result = ex.handle(entry(sl=PRICE * 0.99, tp=PRICE * 1.04))          # SL a 1 %
+    assert result["status"] == "opened"
+    trade = result["trade"]
+    assert trade["risk_usdt"] <= 0.5 and trade["risk_usdt"] > 0.35      # riesgo ≈ 0,50 USDT
+    assert float([c for c in client.calls if c[0] == "market"][0][3]) > 0.0001  # más que el mínimo
+
+
+def test_settings_labels_and_params(settings):
+    from dataclasses import replace
+    s = replace(settings, sizing_mode="risk", sl_mode="fib", filter_trend=True, min_rr=4.0)
+    assert "Riesgo fijo" in s.sizing_label() and "$0,500" in s.sizing_label()
+    assert "R:R mín. 1 : 4,0" in s.rules_label() and "EMA50" in s.rules_label()
+    p = s.strategy_params()
+    assert p.sl_mode == "fib" and p.filter_trend is True

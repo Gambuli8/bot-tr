@@ -122,7 +122,7 @@ class App:
         if self.scanner is not None:
             self.scanner.start()
         self.telegram.start_listener()
-        self.telegram.send(self.narrator.started(balance, s.symbols, s.margin_per_trade_usdt))
+        self.telegram.send(self.narrator.started(balance, s.symbols, s.sizing_label(), s.rules_label()))
 
     def shutdown(self) -> None:
         self.monitor.stop()
