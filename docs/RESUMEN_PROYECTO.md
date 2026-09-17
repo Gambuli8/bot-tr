@@ -218,8 +218,8 @@ Rendimiento sobre el capital total (spot + margen). Canasta en partes iguales.
   equilibrio rendimiento / margen de seguridad). Usar maker en el short casi no cambia nada.
 - En BingX el funding promedio fue más alto que en Binance para los mismos pares.
 - Riesgos no modelados: custodia del exchange (todo el capital queda en BingX), diferencia de precio
-  spot/perp en movimientos bruscos, cambios en las reglas de funding, ADL. La demo de BingX no tiene spot,
-  así que no se puede probar en demo tal cual.
+  spot/perp en movimientos bruscos, cambios en las reglas de funding, ADL. La cuenta spot de la demo responde por API
+  pero tiene saldo 0: hay que confirmar si se puede pasar VST de futuros a spot para probarlo en demo.
 
 ## 8. En qué nos puede ayudar Gemini para mejorar la tasa de acierto
 
