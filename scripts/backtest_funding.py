@@ -296,6 +296,8 @@ def main():
     ap.add_argument("--pairs", default=",".join(DEFAULT_PAIRS))
     ap.add_argument("--maker", action="store_true", help="short con órdenes limit (0,02 %)")
     ap.add_argument("--rebalance-pct", type=float, default=0.5)
+    ap.add_argument("--leverages", default="1,2,3", help="apalancamientos del short a probar, ej. 2,5,10")
+    ap.add_argument("--modes", default="always,switch")
     args = ap.parse_args()
 
     now_ms = int(time.time() * 1000) // MS_H * MS_H
@@ -333,8 +335,8 @@ def main():
           f"rebalanceo ±{args.rebalance_pct / 1:.0%}/L")
 
     summary = {}
-    for mode in ("always", "switch"):
-        for lev in (1.0, 2.0, 3.0):
+    for mode in [m.strip() for m in args.modes.split(",")]:
+        for lev in [float(x) for x in args.leverages.split(",")]:
             curves, books = [], []
             print(f"\n=== modo {mode} · short ×{lev:g} (capital en spot {lev / (lev + 1):.0%}) ===")
             for sym, (prices, fund, _) in data.items():
