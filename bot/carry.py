@@ -114,8 +114,14 @@ class CarryManager:
                 log.exception("Error en ciclo carry")
             self._stop.wait(self.s.carry_interval_s)
 
+    @property
+    def paper(self) -> bool:
+        return bool(getattr(self.client, "paper", False))
+
     def run_once(self) -> None:
         with self.lock:
+            if hasattr(self.client, "tick"):
+                self.client.tick()          # simulador: aplica funding real y liquidaciones
             positions = {p.symbol: p for p in self.client.positions()}
             balances = self.client.spot_balances()
             for symbol in self.s.carry_symbols:
@@ -123,7 +129,9 @@ class CarryManager:
                 try:
                     if pair and pair.get("status") == "active":
                         self._manage(symbol, pair, positions.get(symbol), balances)
-                    elif self.s.carry_enabled and (not pair or pair.get("status") in ("pending", "error")):
+                    elif self.s.carry_enabled and (
+                            not pair or pair.get("status") == "pending"
+                            or (pair.get("status") == "error" and time.time() * 1000 >= pair.get("retry_after", 0))):
                         self._build(symbol, positions.get(symbol), balances)
                 except (BingXError, CarryError) as exc:
                     log.error("Carry %s: %s", symbol, exc)
@@ -136,7 +144,8 @@ class CarryManager:
     # ───────── utilidades ─────────
 
     def _head(self, emoji: str, title: str) -> str:
-        return f"{emoji} <b>{esc(title)}</b> · <i>{self.s.mode_label}</i>"
+        label = "CARRY SIMULADO 🧪" if self.paper else self.s.mode_label
+        return f"{emoji} <b>{esc(title)}</b> · <i>{label}</i>"
 
     def _alert_once(self, key: str, text: str, critical: bool = False) -> None:
         alerts = self.store.state.setdefault("alerts", {})
@@ -168,7 +177,25 @@ class CarryManager:
         return Decimal(1).scaleb(-self.client.contract(symbol).qty_precision)
 
     def _asset(self) -> str:
+        if self.paper:
+            return "USDT"
         return self.state.get("asset") or self.s.carry_asset or ("VST" if not self.s.is_live else "USDT")
+
+    def _fail(self, symbol: str, reason: str) -> CarryError:
+        """Marca el par con error y lo reintenta recién en 1 hora (nunca en cada ciclo)."""
+        self.pairs[symbol] = {"status": "error", "reason": reason,
+                              "retry_after": int(time.time() * 1000) + 3_600_000}
+        return CarryError(reason)
+
+    def _refund_spot(self, max_amount: float) -> float:
+        """Devuelve a futuros el saldo que quedó en spot tras una operación fallida."""
+        available = self.client.spot_balances().get(self._asset(), 0.0)
+        amount = min(max_amount, available)
+        try:
+            return self._transfer(amount, SPOT_ACCOUNT, FUTURES_ACCOUNT) if amount >= 0.01 else 0.0
+        except (BingXError, CarryError) as exc:
+            log.error("No pude devolver %.2f a futuros: %s", amount, exc)
+            return 0.0
 
     def _transfer(self, amount: float, from_acc: str, to_acc: str) -> float:
         amount = float(Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
@@ -260,15 +287,18 @@ class CarryManager:
                            perp.min_qty * px, float(spot.get("minQty") or 0) * px)
         if float(qty) * px < min_notional or float(qty) < perp.min_qty:
             need = min_notional * (self.L + 1) / self.L * 1.02 * len(self.s.carry_symbols)
-            self.pairs[symbol] = {"status": "error", "reason": "capital insuficiente"}
-            raise CarryError(f"con {money(capital)} por par no llego al mínimo de {symbol} "
-                             f"(hace falta CARRY_CAPITAL_USDT ≥ {money(need)})")
+            raise self._fail(symbol, f"con {money(capital)} por par no llego al mínimo de {symbol} "
+                                     f"(hace falta CARRY_CAPITAL_USDT ≥ {money(need)})")
 
         cursor = int(time.time() * 1000)
         buy_qty = self._buy_qty_for(symbol, float(qty))
         transfer_amt = float(buy_qty) * px * (1 + BUY_BUFFER)
         sent = self._transfer(transfer_amt, FUTURES_ACCOUNT, SPOT_ACCOUNT)
-        received, spent = self._spot_trade(symbol, "BUY", buy_qty)
+        try:
+            received, spent = self._spot_trade(symbol, "BUY", buy_qty)
+        except (BingXError, CarryError) as exc:
+            refunded = self._refund_spot(sent)
+            raise self._fail(symbol, f"falló la compra spot de {symbol} ({exc}); devolví {money(refunded)} a futuros")
 
         short_qty = min(qty, floor_step(received, perp_step))
         try:
@@ -278,10 +308,10 @@ class CarryManager:
                 raise CarryError("no veo el short abierto")
         except (BingXError, CarryError) as exc:
             # Nunca dejar el spot sin cubrir: se deshace la compra.
-            sold, proceeds = self._spot_trade(symbol, "SELL", floor_step(received, self._spot_step(symbol)))
-            self._transfer(proceeds, SPOT_ACCOUNT, FUTURES_ACCOUNT)
-            self.pairs[symbol] = {"status": "error", "reason": f"falló el short: {exc}"}
-            raise CarryError(f"falló el short de {symbol} ({exc}); vendí el spot comprado para no quedar expuesto")
+            self._spot_trade(symbol, "SELL", floor_step(received, self._spot_step(symbol)))
+            self._refund_spot(sent * 1.01)
+            raise self._fail(symbol, f"falló el short de {symbol} ({exc}); vendí el spot comprado para no quedar "
+                                     f"expuesto y devolví los fondos a futuros")
 
         leftover = sent - spent
         returned = self._transfer(leftover, SPOT_ACCOUNT, FUTURES_ACCOUNT) if leftover >= 1 else 0.0
@@ -484,7 +514,8 @@ class CarryManager:
 
     def status_text(self) -> str:
         pairs = {s: p for s, p in self.pairs.items() if p.get("status") in ("active", "pending", "error")}
-        lines = [f"🧲 <b>Carry (captura de funding)</b> · <i>{self.s.mode_label}</i>",
+        label = "SIMULADO 🧪 (precios y funding reales, órdenes simuladas)" if self.paper else self.s.mode_label
+        lines = [f"🧲 <b>Carry (captura de funding)</b> · <i>{label}</i>",
                  f"⚙️ {'activado' if self.s.carry_enabled else 'desactivado (sólo gestiono lo abierto)'} · "
                  f"short ×{self.L:g} · capital {money(self.s.carry_capital_usdt)}"]
         if not pairs:

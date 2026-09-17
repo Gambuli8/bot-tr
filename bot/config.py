@@ -111,6 +111,7 @@ class Settings:
     carry_min_trade_usdt: float = 5.0
     carry_interval_s: int = 300
     carry_asset: str = ""
+    carry_paper: str = "auto"          # auto (simulado en demo) | true | false
 
     extra: dict = field(default_factory=dict)
 
@@ -140,9 +141,14 @@ class Settings:
         return StrategyParams(sl_mode=self.sl_mode, filter_trend=self.filter_trend)
 
     @property
+    def carry_is_paper(self) -> bool:
+        """La demo de BingX no permite operar spot con VST: en demo el carry corre simulado."""
+        return self.carry_paper == "true" or (self.carry_paper == "auto" and not self.is_live)
+
+    @property
     def directional_symbols(self) -> list[str]:
-        """Pares de la estrategia direccional: se excluyen los del carry (en one-way se anularían)."""
-        excluded = set(self.carry_symbols) if self.carry_enabled else set()
+        """Pares de la estrategia direccional: se excluyen los del carry real (en one-way se anularían)."""
+        excluded = set(self.carry_symbols) if self.carry_enabled and not self.carry_is_paper else set()
         return [s for s in self.symbols if s not in excluded]
 
     @property
@@ -238,6 +244,7 @@ def load_settings(env_file: str | None = None) -> Settings:
         carry_min_trade_usdt=_env_float("CARRY_MIN_TRADE_USDT", 5.0),
         carry_interval_s=_env_int("CARRY_INTERVAL_S", 300),
         carry_asset=_env("CARRY_ASSET", ""),
+        carry_paper=_env("CARRY_PAPER", "auto").lower(),
         webhook_secret=_env("WEBHOOK_SECRET"),
         enforce_tv_ips=_env_bool("ENFORCE_TV_IPS", True),
         telegram_bot_token=_env("TELEGRAM_BOT_TOKEN"),

@@ -90,7 +90,7 @@ class Monitor:
             if symbol not in positions:
                 self._on_closed(symbol)
 
-        carry = self.store.state.get("carry", {}).get("pairs", {})
+        carry = {} if self.s.carry_is_paper else self.store.state.get("carry", {}).get("pairs", {})
         for symbol, pos in positions.items():
             if carry.get(symbol, {}).get("status") in ("active", "pending") and symbol not in self.store.open_trades:
                 continue  # la gestiona el modo carry

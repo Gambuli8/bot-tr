@@ -89,7 +89,11 @@ class App:
         self.scanner = None if s.uses_tradingview else Scanner(
             s, self.client, self.store, self.executor, self.telegram.send, delay_s=s.scan_delay_s,
             market=BingXClient("", "", "live"))
-        self.carry = CarryManager(s, self.client, self.store, self.narrator, self.telegram.send)
+        carry_client = self.client
+        if s.carry_is_paper:
+            from bot.carry_paper import PaperCarryExchange
+            carry_client = PaperCarryExchange(BingXClient("", "", "live"), self.store, s.carry_capital_usdt)
+        self.carry = CarryManager(s, carry_client, self.store, self.narrator, self.telegram.send)
         self.telegram.carry = self.carry
         self.telegram.client, self.telegram.store = self.client, self.store
         self.telegram.executor, self.telegram.reporter = self.executor, self.reporter
@@ -128,9 +132,12 @@ class App:
         self.telegram.start_listener()
         self.telegram.send(self.narrator.started(balance, s.directional_symbols, s.sizing_label(), s.rules_label()))
         if s.carry_enabled:
-            self.telegram.send(f"🧲 <b>Modo carry activado</b> · {', '.join(x.split('-')[0] for x in s.carry_symbols)} · "
+            self.telegram.send(f"🧲 <b>Modo carry {'SIMULADO 🧪' if s.carry_is_paper else 'activado'}</b> · "
+                               f"{', '.join(x.split('-')[0] for x in s.carry_symbols)} · "
                                f"short ×{s.carry_leverage:g} · capital {s.carry_capital_usdt:g} USDT\n"
-                               f"Estos pares quedan fuera de la estrategia direccional. /carry para ver el estado.")
+                               + ("Precios y funding reales, órdenes simuladas (la demo no opera spot). "
+                                  if s.carry_is_paper else "Estos pares quedan fuera de la estrategia direccional. ")
+                               + "/carry para ver el estado.")
 
     def shutdown(self) -> None:
         self.monitor.stop()

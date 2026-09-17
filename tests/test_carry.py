@@ -284,3 +284,75 @@ def test_status_text(tmp_path):
     m.run_once()
     text = m.status_text()
     assert "BTC" in text and "Spot" in text and "Funding" in text
+
+
+# ───────── fallas con devolución de fondos ─────────
+
+def test_failed_spot_buy_refunds_and_backs_off(tmp_path):
+    ex = FakeExchange({"BTC-USDT": 76000.0})
+
+    def broken_order(symbol, side, qty):
+        raise BingXError(100202, "balance not enough", "/spot/order")
+
+    ex.spot_market_order = broken_order
+    m, notes = manager(tmp_path, ex)
+    wallet_before = ex.wallet
+    m.run_once()
+    assert ex.spot["VST"] < 0.01                                       # nada quedó varado en spot
+    assert ex.wallet == pytest.approx(wallet_before)
+    pair = m.pairs["BTC-USDT"]
+    assert pair["status"] == "error" and pair["retry_after"] > time.time() * 1000
+    transfers = len([c for c in ex.calls if c[0] == "transfer"])
+    m.run_once()                                                       # siguiente ciclo: no reintenta todavía
+    assert len([c for c in ex.calls if c[0] == "transfer"]) == transfers
+    assert "devolví" in notes[-1]
+
+
+# ───────── modo simulado (precios/funding reales, órdenes simuladas) ─────────
+
+class FakeMarket:
+    def __init__(self, px):
+        self.px = px
+        self.funding_rows = []
+
+    def contract(self, symbol):
+        return PERP[symbol]
+
+    def contracts(self, force=False):
+        return PERP
+
+    def price(self, symbol):
+        return self.px
+
+    def spot_symbols(self):
+        return SPOT
+
+    def _request(self, method, path, params=None, signed=True):
+        assert path == "/openApi/swap/v2/quote/fundingRate" and signed is False
+        return [r for r in self.funding_rows if int(r["fundingTime"]) >= params["startTime"]]
+
+
+def test_paper_carry_builds_and_collects_real_funding(tmp_path):
+    from bot.carry_paper import PaperCarryExchange
+    market = FakeMarket(76000.0)
+    settings_store = Store(tmp_path / "paper")
+    paper = PaperCarryExchange(market, settings_store, starting_futures_usdt=200)
+    settings = make_settings(tmp_path, carry_enabled=True, carry_symbols=["BTC-USDT"], carry_capital_usdt=200,
+                             carry_leverage=2.0, carry_paper="true")
+    notes = []
+    m = CarryManager(settings, paper, settings_store, Narrator(settings.mode_label, settings.timezone),
+                     notes.append, sleep=lambda s: None)
+    m.run_once()
+    assert m.pairs["BTC-USDT"]["status"] == "active"
+    assert "SIMULADO" in notes[-1]
+    qty = paper.positions("BTC-USDT")[0].qty
+    assert paper.spot_balances()["BTC"] >= qty
+
+    now = int(time.time() * 1000)
+    market.funding_rows = [{"fundingTime": now - 1000, "fundingRate": "0.0001"}]
+    paper.st["funding_checked"]["BTC-USDT"] = now - 5000
+    m.pairs["BTC-USDT"]["income_cursor"] = now - 5000                 # el par ya estaba armado antes del pago
+    m.run_once()
+    assert m.pairs["BTC-USDT"]["funding"] == pytest.approx(0.0001 * qty * 76000)
+    assert settings_store.state["carry_paper"]["positions"]["BTC-USDT"]["qty"] == qty   # persistido
+    assert "SIMULADO" in m.status_text()

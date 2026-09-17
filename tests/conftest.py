@@ -25,7 +25,7 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         margin_per_trade_usdt=2.0, max_leverage=20, margin_type="ISOLATED", min_rr=1.5,
         max_open_positions=3, daily_loss_limit_usdt=3.0, max_signal_age_s=180, max_slippage_pct=0.4,
         strategy_source="tradingview", scan_delay_s=8.0,
-        sizing_mode="margin", risk_per_trade_usdt=0.5, sl_mode="fib", filter_trend=False,
+        sizing_mode="margin", risk_per_trade_usdt=0.5, sl_mode="fib", filter_trend=False, carry_paper="false",
         webhook_secret="x" * 32, enforce_tv_ips=False,
         telegram_bot_token="", telegram_chat_id="", telegram_admin_ids=set(),
         google_client_id="", google_client_secret="", google_refresh_token="", google_drive_folder_id="",
