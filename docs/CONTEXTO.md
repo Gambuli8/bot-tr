@@ -1,4 +1,4 @@
-# Contexto para continuar el proyecto (actualizado 17/09/2026, 07:30 hora argentina)
+# Contexto para continuar el proyecto (actualizado 18/09/2026, 14:00 hora argentina)
 
 > Pegá este archivo al empezar un chat nuevo. Resume qué es el proyecto, cómo está desplegado, qué se
 > probó, qué decidió el usuario y qué falta. Detalle técnico y tablas completas en `docs/RESUMEN_PROYECTO.md`.
@@ -18,7 +18,7 @@
 
 ## 2. Repositorio
 
-- GitHub `Gambuli8/bot-tr`, rama de trabajo **`feat/bingx-bot`** (commit `c44d34e`). **No está mergeada a
+- GitHub `Gambuli8/bot-tr`, rama de trabajo **`feat/bingx-bot`** (commit `75a831d`). **No está mergeada a
   `main`** (`main` todavía tiene el bot viejo de Binance). Pendiente: abrir PR a `main` si el usuario lo pide.
 - Bot viejo archivado en la rama `legacy/binance-bot` y el tag `legacy-binance-v1`.
 - Local: `C:\Users\aleja\Desktop\agent-trading` (venv en `venv/`, `venv/Scripts/python.exe -m pytest -q` → 88 tests).
@@ -60,12 +60,14 @@ Comandos de Telegram: `/estado` (general + uno por moneda), `/hoy`, `/semana`, `
   `CARRY_PAPER` automático (= simulado en demo). `GOOGLE_REFRESH_TOKEN` **vacío** (Drive sin configurar).
 - API key BingX con permisos: futuros, spot y Universal Transfer; **sin retiros**; restringida a la IP del VPS.
 
-### Estado al 17/09 07:30 (AR)
-- **Direccional (demo, reglas originales):** 1 operación abierta, XRP LONG desde 1,2879 (SL 1,2834, TP 1,3174),
-  abierta el 16/09 ~19:25. Todavía ningún trade cerrado.
-- **Carry SIMULADO:** 4 pares armados el 16/09 ~23:40 con 50 USDT c/u (BTC 0,0004 · ETH 0,01 · DOGE 411 ·
-  XRP 25). Primeros cobros de funding registrados (~0,001–0,002 USDT por par); capital por par ~49,92–49,95
-  (comisiones de entrada).
+### Estado al 18/09 14:00 (AR)
+- **Direccional (demo, reglas originales):** **primera operación cerrada** — XRP LONG, entrada 16/09 20:05 a
+  1,2879, salida por **TP** el 17/09 11:25 a 1,3177: **+0,0852 USDT** (R:R real 4,85). Sin posiciones abiertas;
+  5 setups en seguimiento esperando el retroceso al 0,618.
+- **Carry SIMULADO:** los 4 pares siguen activos desde el 16/09 23:21 (BTC 0,0004 · ETH 0,01 · DOGE 411 ·
+  XRP 25, 50 USDT c/u). **20 cobros de funding** (cada 8 h: 05:00, 13:00 y 21:00 AR), +0,0436 USDT en total,
+  contra 0,1806 de comisiones de entrada → neto −0,137 por ahora (las comisiones se recuperan en ~8 días).
+  La cobertura funciona: el precio subió ~6 % y el capital por par sigue en 49,91–49,97 de 50.
 - 95,82 VST quedaron varados en el spot de la demo por un bug ya corregido (irrelevante, es dinero de prueba).
 
 ## 5. Qué se probó y qué dio (conclusiones clave)
@@ -115,5 +117,9 @@ Comandos de Telegram: `/estado` (general + uno por moneda), `/hoy`, `/semana`, `
    con cuenta real (implica `BINGX_MODE=live` o separar el carry del bot demo) — **decisión del usuario**.
 3. Configurar Google Drive (`GOOGLE_REFRESH_TOKEN` vía `python -m bot.google_auth`).
 4. Opcional: PR `feat/bingx-bot` → `main`.
-5. Opcional: agregar al resumen semanal/mensual el funding cobrado por el carry.
-6. La estrategia direccional sigue corriendo en demo solo para validar el sistema; **no pasar a real**.
+5. La estrategia direccional sigue corriendo en demo solo para validar el sistema; **no pasar a real**.
+
+Hecho el 18/09: el funding del carry entra en los resúmenes semanales y mensuales (commit `75a831d`). Cada
+cobro, comisión y PnL de ajuste queda como evento `carry_income` con la hora del exchange; el resumen de
+Telegram y el informe de Drive suman una sección de carry (por par y total) y el total combinado. El historial
+previo se rellenó a mano en el VPS (28 eventos, backup en `data/bingx/events.jsonl.bak-20260918`).
