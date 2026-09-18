@@ -56,6 +56,38 @@ def previous_month(now: datetime) -> Period:
     return Period("monthly", f"{start:%Y-%m}", start, first_this)
 
 
+def carry_stats(events: list[dict]) -> dict:
+    """Funding, comisiones y PnL del modo carry en el período (eventos `carry_income`)."""
+    rows = [e for e in events if e.get("kind") == "carry_income"]
+    by_symbol: dict[str, dict] = defaultdict(lambda: {"funding": 0.0, "fees": 0.0, "realized": 0.0})
+    funding = fees = realized = 0.0
+    payments = 0
+    for e in rows:
+        amount = float(e.get("amount") or 0.0)
+        row = by_symbol[e.get("symbol", "—")]
+        kind = e.get("income")
+        if kind == "FUNDING_FEE":
+            funding += amount
+            row["funding"] += amount
+            payments += 1
+        elif kind in ("TRADING_FEE", "SPOT_FEE"):
+            fees -= amount          # llegan en negativo (son un costo)
+            row["fees"] -= amount
+        elif kind == "REALIZED_PNL":
+            realized += amount
+            row["realized"] += amount
+    return {
+        "active": bool(rows),
+        "paper": any(e.get("paper") for e in rows),
+        "funding": funding,
+        "fees": fees,
+        "realized": realized,
+        "net": funding + realized - fees,
+        "payments": payments,
+        "by_symbol": {k: dict(v, net=v["funding"] + v["realized"] - v["fees"]) for k, v in by_symbol.items()},
+    }
+
+
 def compute_stats(trades: list[dict], events: list[dict]) -> dict:
     trades = sorted(trades, key=lambda t: t["closed_at"])
     pnls = [t["pnl_usdt"] for t in trades]
@@ -106,6 +138,7 @@ def compute_stats(trades: list[dict], events: list[dict]) -> dict:
         "cancels": signal_events.get("cancel", 0),
         "entries_signaled": signal_events.get("entry", 0),
         "rejections": rejections,
+        "carry": carry_stats(events),
         "list": trades,
     }
 
@@ -128,6 +161,21 @@ def telegram_text(period: Period, st: dict, mode_label: str, drive_link: Optiona
         for sym, row in sorted(st["by_symbol"].items(), key=lambda kv: -kv[1]["pnl"]):
             icon = "🟢" if row["pnl"] > 0 else "🔴" if row["pnl"] < 0 else "⚪"
             lines.append(f"{icon} {esc(sym.split('-')[0])}: {row['trades']} ops · <b>{money(row['pnl'], True)}</b>")
+    carry = st.get("carry") or {}
+    if carry.get("active"):
+        tag = " · <i>SIMULADO 🧪</i>" if carry["paper"] else ""
+        lines += [
+            "",
+            f"🧲 <b>Carry (captura de funding)</b>{tag}",
+            f"💸 Funding cobrado: <b>{money(carry['funding'], True)}</b> en {carry['payments']} cobros",
+            f"🧾 Comisiones: {money(-carry['fees'], True)} · 📊 Resultado del carry: "
+            f"<b>{money(carry['net'], True)}</b>",
+        ]
+        for sym, row in sorted(carry["by_symbol"].items(), key=lambda kv: -kv[1]["net"]):
+            lines.append(f"• {esc(sym.split('-')[0])}: funding {money(row['funding'], True)} · "
+                         f"neto {money(row['net'], True)}")
+        lines.append(f"💼 <b>Total del período</b> (operaciones + carry): "
+                     f"<b>{money(st['net'] + carry['net'], True)}</b>")
     lines += [
         "",
         "🔎 <b>Análisis</b>",
@@ -163,6 +211,20 @@ def html_report(period: Period, st: dict, mode_label: str, tz: ZoneInfo) -> str:
     rejection_rows = "".join(row([esc(reason), str(n)]) for reason, n in st["rejections"].most_common(8)) \
         or row(["Ninguna", "0"])
 
+    carry = st.get("carry") or {}
+    carry_html = ""
+    if carry.get("active"):
+        carry_rows = "".join(
+            row([esc(sym), money(r["funding"], True), money(-r["fees"], True), money(r["realized"], True),
+                 money(r["net"], True)])
+            for sym, r in sorted(carry["by_symbol"].items(), key=lambda kv: -kv[1]["net"]))
+        carry_html = f"""<h2>Carry (captura de funding){' — SIMULADO' if carry['paper'] else ''}</h2>
+<p>Funding cobrado: <b>{money(carry['funding'], True)}</b> en {carry['payments']} cobros ·
+Comisiones: {money(-carry['fees'], True)} · PnL de ajustes: {money(carry['realized'], True)} ·
+Resultado del carry: <b>{money(carry['net'], True)}</b></p>
+<table border="1" cellpadding="6">{row(["Par", "Funding", "Comisiones", "PnL ajustes", "Neto"], "th")}{carry_rows}</table>
+<p>Total del período (operaciones + carry): <b>{money(st['net'] + carry['net'], True)}</b></p>"""
+
     best, worst = st["best"], st["worst"]
     return f"""<html><head><meta charset="utf-8"><title>{esc(period.title)}</title></head><body>
 <h1>{esc(period.title)}</h1>
@@ -183,6 +245,7 @@ def html_report(period: Period, st: dict, mode_label: str, tz: ZoneInfo) -> str:
 </table>
 <h2>Por par</h2>
 <table border="1" cellpadding="6">{row(["Par", "Operaciones", "Acierto", "Resultado"], "th")}{symbol_rows}</table>
+{carry_html}
 <h2>Actividad de análisis</h2>
 <p>Zonas diarias detectadas: {st['zones']} · Cambios de tendencia 1H: {st['chochs']} ·
 Retrocesos al 0.618: {st['fibs']} · Setups cancelados: {st['cancels']} · Señales de entrada: {st['entries_signaled']}</p>

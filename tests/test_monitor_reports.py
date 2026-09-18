@@ -6,7 +6,7 @@ import pytest
 
 from bot.executor import Executor
 from bot.monitor import Monitor, classify_exit
-from bot.reports import Reporter, compute_stats, previous_month, previous_week
+from bot.reports import Reporter, compute_stats, html_report, previous_month, previous_week, telegram_text
 from bot.signals import Signal
 from tests.conftest import FakeClient
 
@@ -99,3 +99,40 @@ def test_first_run_does_not_send_old_reports(settings, store, messages):
     reporter.maybe_send_scheduled()
     assert sum("Resumen semanal" in m for m in messages) == 1
     assert list((settings.data_dir / "reports").glob("*.html"))
+
+
+def test_carry_income_enters_the_summary():
+    trades = [{"symbol": "BTC-USDT", "direction": "LONG", "pnl_usdt": 0.10, "opened_at": 1_789_599_912_589,
+               "closed_at": 1_789_655_129_834, "entry_price": 76000.0, "exit_price": 77000.0,
+               "exit_reason": "TP", "fees_usdt": 0.01}]
+    events = [
+        {"kind": "carry_income", "symbol": "BTC-USDT", "income": "FUNDING_FEE", "amount": 0.02, "paper": True},
+        {"kind": "carry_income", "symbol": "BTC-USDT", "income": "FUNDING_FEE", "amount": 0.03, "paper": True},
+        {"kind": "carry_income", "symbol": "BTC-USDT", "income": "SPOT_FEE", "amount": -0.04, "paper": True},
+        {"kind": "carry_income", "symbol": "DOGE-USDT", "income": "FUNDING_FEE", "amount": 0.05, "paper": True},
+        {"kind": "carry_income", "symbol": "DOGE-USDT", "income": "TRADING_FEE", "amount": -0.01, "paper": True},
+        {"kind": "carry_income", "symbol": "DOGE-USDT", "income": "REALIZED_PNL", "amount": -0.02, "paper": True},
+    ]
+    st = compute_stats(trades, events)
+    carry = st["carry"]
+    assert carry["active"] and carry["paper"] and carry["payments"] == 3
+    assert carry["funding"] == pytest.approx(0.10)
+    assert carry["fees"] == pytest.approx(0.05)
+    assert carry["realized"] == pytest.approx(-0.02)
+    assert carry["net"] == pytest.approx(0.03)
+    assert carry["by_symbol"]["BTC-USDT"]["net"] == pytest.approx(0.01)
+
+    period = previous_week(datetime(2026, 9, 16, 10, 0, tzinfo=ZoneInfo("America/Argentina/Buenos_Aires")))
+    text = telegram_text(period, st, "DEMO", None)
+    assert "Carry (captura de funding)" in text and "SIMULADO" in text
+    assert "Total del período" in text
+    html = html_report(period, st, "DEMO", ZoneInfo("America/Argentina/Buenos_Aires"))
+    assert "Carry (captura de funding)" in html and "DOGE-USDT" in html
+
+
+def test_summary_without_carry_has_no_carry_section():
+    st = compute_stats([], [{"kind": "signal", "event": "zone"}])
+    assert st["carry"]["active"] is False
+    period = previous_week(datetime(2026, 9, 16, 10, 0, tzinfo=ZoneInfo("America/Argentina/Buenos_Aires")))
+    assert "Carry" not in telegram_text(period, st, "DEMO", None)
+    assert "Carry" not in html_report(period, st, "DEMO", ZoneInfo("America/Argentina/Buenos_Aires"))

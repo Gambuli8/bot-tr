@@ -229,6 +229,12 @@ class CarryManager:
         sold = before - after if before > after else float(qty)
         return sold, quote * (1 - SPOT_FEE)
 
+    def _charge_spot_fee(self, symbol: str, pair: dict, amount: float) -> None:
+        """Comisión del spot (no viene en el income de futuros): al libro del par y al diario."""
+        pair["fees"] = pair.get("fees", 0.0) + amount
+        self.store.log_event("carry_income", symbol=symbol, income="SPOT_FEE",
+                             amount=-amount, paper=self.paper)
+
     def _sync_income(self, symbol: str, pair: dict) -> None:
         cursor = int(pair.get("income_cursor", 0))
         rows = self.client.income(symbol, cursor + 1)
@@ -248,6 +254,9 @@ class CarryManager:
             else:
                 continue
             pair["fut_cash"] = pair.get("fut_cash", 0.0) + amount
+            # Con la hora del exchange, así los resúmenes lo reparten en el período correcto.
+            self.store.log_event("carry_income", ts=t, symbol=symbol, income=kind,
+                                 amount=amount, paper=self.paper)
             latest = max(latest, t)
         pair["income_cursor"] = latest
 
@@ -319,9 +328,10 @@ class CarryManager:
             "status": "active", "capital": capital, "opened_at": cursor, "anchor": px,
             "spot_qty": received, "short_qty": float(short_qty),
             "fut_cash": capital - sent + returned, "spot_cash": leftover - returned,
-            "funding": 0.0, "fees": spent * SPOT_FEE, "realized": 0.0,
+            "funding": 0.0, "fees": 0.0, "realized": 0.0,
             "income_cursor": cursor - 1, "last_reset": cursor, "resets": 0, "protections": 0,
         }
+        self._charge_spot_fee(symbol, self.pairs[symbol], spent * SPOT_FEE)
         self.store.log_event("carry_open", symbol=symbol, spot_qty=received, short_qty=float(short_qty), price=px)
         self.notify(
             f"{self._head('🧲', f'Carry armado en {self._coin(symbol)}')}\n\n"
@@ -414,7 +424,7 @@ class CarryManager:
                 pair["fut_cash"] += moved
                 pair["spot_cash"] = pair.get("spot_cash", 0.0) + proceeds - moved
                 pair["spot_qty"] -= sold
-                pair["fees"] = pair.get("fees", 0.0) + proceeds * SPOT_FEE
+                self._charge_spot_fee(symbol, pair, proceeds * SPOT_FEE)
                 sold_qty = sold
                 try:
                     self.client.add_isolated_margin(symbol, min(need - added, moved))
@@ -450,14 +460,14 @@ class CarryManager:
                 pair["fut_cash"] -= sent
                 pair["spot_cash"] = pair.get("spot_cash", 0.0) + sent - spent
                 pair["spot_qty"] += received
-                pair["fees"] = pair.get("fees", 0.0) + spent * SPOT_FEE
+                self._charge_spot_fee(symbol, pair, spent * SPOT_FEE)
             elif pair["spot_qty"] - float(target_qty) >= float(perp_step) and \
                     (pair["spot_qty"] - float(target_qty)) * px >= self.s.carry_min_trade_usdt:
                 delta = floor_step(pair["spot_qty"] - float(target_qty), self._spot_step(symbol))
                 sold, proceeds = self._spot_trade(symbol, "SELL", delta)
                 pair["spot_qty"] -= sold
                 pair["spot_cash"] = pair.get("spot_cash", 0.0) + proceeds
-                pair["fees"] = pair.get("fees", 0.0) + proceeds * SPOT_FEE
+                self._charge_spot_fee(symbol, pair, proceeds * SPOT_FEE)
             if pair.get("spot_cash", 0.0) >= 1:
                 moved = self._transfer(pair["spot_cash"], SPOT_ACCOUNT, FUTURES_ACCOUNT)
                 pair["spot_cash"] -= moved
