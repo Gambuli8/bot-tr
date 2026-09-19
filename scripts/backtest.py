@@ -1,671 +1,423 @@
 """
-scripts/backtest.py
-Backtest del TechnicalEngine sobre OHLCV histórico.
+Backtest de la estrategia con el motor real del bot (bot/strategy.py).
+
+Qué simula (conservador):
+  - Riesgo FIJO por operación (--risk, default 0,50 USDT): la cantidad sale de la distancia al SL
+    + comisiones. Si con ese riesgo no se llega al mínimo del contrato de BingX, la operación se descarta.
+  - Entrada al cierre de la vela de 5m y salidas con 0,03 % de slippage en contra; comisiones taker.
+  - Si en la misma vela se tocan SL y TP (o +1R y el break-even) → se asume lo peor.
+  - Portafolio: 1 posición por par, máx. --max-open abiertas, pérdida diaria máx. --daily-loss (día argentino).
+
+Matriz de pruebas (se activan de a una sobre la BASE):
+  REF      reglas actuales del bot en vivo (SL Fibo 0,786, sin filtro de tendencia)
+  BASE     SL estructural (inicio del impulso − 0,1×ATR 1H) + tendencia EMA50 diaria + TP impulso + R:R ≥ 1,5
+  +IMP     impulso 1H ≥ 1,5 × ATR(14) 1H
+  +VOL     vela gatillo con volumen > SMA(20)
+  FIB+TREND SL Fibo 0,786 + tendencia EMA50 diaria (para R:R altos: --min-rr 4)
+  gestión  —: SL/TP fijos · BE: SL a break-even en +1R · PARC: cierra 50 % en +1R · BE+PARC: ambas
+
+Anti-sobreajuste: in-sample (IS) = primeros meses, out-of-sample (OOS) = últimos --oos-months,
+que no se usan para elegir. Se informa el estadístico t de la media de R en OOS.
+
+Datos: API pública de Binance Futures (BingX sólo guarda ~45 días de 5m), cache en data/backtest/.
+Pares: --pairs current (los 6 del bot) · auto (los N con mejor ATR% diario / spread de BingX,
+medidos en el período IS) · o lista separada por comas (BTC-USDT,ETH-USDT,...).
 
 Uso:
-    python scripts/backtest.py                 # 30 días, 1m
-    python scripts/backtest.py --days 7
-    python scripts/backtest.py --days 14 --timeframe 5m --symbol ETH/USDT
-
-Reproduce la lógica del bot:
-- IndicatorEngine para el snapshot
-- TechnicalEngine para la decisión
-- OrderManager simplificado para SL/TP/trailing
-- Posiciones bidireccionales (LONG y SHORT)
-- Riesgo: max_risk_per_trade * capital, ATR-based SL
+  python scripts/backtest.py --months 24 --oos-months 8 --pairs auto --n-pairs 20
+  python scripts/backtest.py --months 24 --oos-months 8 --pairs current
 """
 
+from __future__ import annotations
+
 import argparse
+import json
+import math
 import sys
-from dataclasses import dataclass, field
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from pathlib import Path
-from typing import Optional
-
-# Path hack: importar desde el root del proyecto
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-# Windows: consola cp1252 no soporta emojis ni flechas. Usamos utf-8 con replace.
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
-
-import ccxt
-import pandas as pd
-
-from config.settings import load_settings
-from core.indicators import IndicatorEngine, MarketSnapshot
-from core.technical_engine import TechnicalEngine
-from core.mtf_context import build_mtf_context
-
-
-# ───────── modelos internos ─────────
-
-@dataclass
-class SimPosition:
-    direction: str                 # "LONG" | "SHORT"
-    entry_price: float
-    amount_btc: float
-    amount_usdt: float
-    stop_loss: float
-    original_stop_loss: float
-    take_profit: float
-    entry_idx: int
-    entry_reason: str
-    trailing_active: bool = False
-    extreme_price: float = 0.0     # max para LONG, min para SHORT
-    # TP escalado:
-    tp1_price: float = 0.0         # nivel del TP parcial (1:1 vs SL por defecto)
-    tp1_filled: bool = False
-    tp1_partial_pct: float = 0.0   # fracción cerrada en TP1
-    original_amount_btc: float = 0.0  # cantidad inicial (para reportar bien)
-
-
-@dataclass
-class Trade:
-    direction: str
-    entry_price: float
-    exit_price: float
-    amount_btc: float
-    pnl_usdt: float          # PnL NETO (ya descontó fees)
-    pnl_pct: float
-    bars_held: int
-    entry_reason: str
-    exit_reason: str
-    trailing_was_active: bool
-    fee_paid: float = 0.0    # Fees pagadas (entrada + salida)
-    pnl_gross: float = 0.0   # PnL BRUTO (sin descontar fees)
-
-
-# ───────── descarga histórica ─────────
-
-def fetch_history(symbol: str, timeframe: str, days: int) -> pd.DataFrame:
-    """Trae N días de velas de Binance mainnet, paginando si es necesario."""
-    ex = ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
-
-    minutes_per_bar = {"1m": 1, "5m": 5, "15m": 15, "30m": 30,
-                       "1h": 60, "4h": 240, "1d": 1440}[timeframe]
-    total_bars = (days * 24 * 60) // minutes_per_bar
-
-    end_ms = ex.milliseconds()
-    start_ms = end_ms - (total_bars * minutes_per_bar * 60_000)
-
-    all_rows: list[list] = []
-    chunk_limit = 1000
-    cursor = start_ms
-    while cursor < end_ms:
-        rows = ex.fetch_ohlcv(symbol, timeframe, since=cursor, limit=chunk_limit)
-        if not rows:
-            break
-        all_rows.extend(rows)
-        cursor = rows[-1][0] + minutes_per_bar * 60_000
-        if len(rows) < chunk_limit:
-            break
-
-    df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df = df.drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df.set_index("timestamp", inplace=True)
-    return df
-
-
-# ───────── snapshot a partir del df pre-computado ─────────
-
-def snapshot_at(df_with_indicators: pd.DataFrame, i: int, settings) -> MarketSnapshot:
-    """
-    Construye un MarketSnapshot mirando hasta la vela i (cerrada).
-    Replica la lógica de IndicatorEngine._build_snapshot pero sin recalcular.
-    El precio "actual" es el close de la vela i.
-    """
-    if i < 3:
-        raise ValueError("Necesita al menos 3 velas")
-
-    current_price = float(df_with_indicators.iloc[i]["close"])
-    last = df_with_indicators.iloc[i]            # vela cerrada actual
-    prev = df_with_indicators.iloc[i - 1]        # vela anterior cerrada
-
-    minutes_per_bar = {"1m": 1, "5m": 5, "15m": 15, "30m": 30,
-                       "1h": 60, "4h": 240, "1d": 1440}.get(settings.timeframe, 15)
-    candles_1h = max(1, 60 // minutes_per_bar)
-    candles_24h = max(1, candles_1h * 24)
-    price_1h_ago = (
-        float(df_with_indicators.iloc[i - candles_1h]["close"])
-        if i >= candles_1h else current_price
-    )
-    price_24h_ago = (
-        float(df_with_indicators.iloc[i - candles_24h]["close"])
-        if i >= candles_24h else current_price
-    )
-    price_change_1h = ((current_price - price_1h_ago) / price_1h_ago) * 100
-    price_change_24h = ((current_price - price_24h_ago) / price_24h_ago) * 100
-
-    macd_crossover = (
-        float(last["macd"]) > float(last["macd_signal"]) and
-        float(prev["macd"]) <= float(prev["macd_signal"])
-    )
-
-    ema50 = float(last["ema50"])
-    ema200 = float(last["ema200"])
-
-    bb_upper = float(last["bb_upper"]) if not pd.isna(last["bb_upper"]) else current_price
-    bb_lower = float(last["bb_lower"]) if not pd.isna(last["bb_lower"]) else current_price
-    bb_middle = float(last["bb_middle"]) if not pd.isna(last["bb_middle"]) else current_price
-    bb_width = ((bb_upper - bb_lower) / bb_middle) * 100 if bb_middle else 0
-
-    # Donchian de la vela i-1 (mismo criterio que IndicatorEngine)
-    if i >= 2 and not pd.isna(df_with_indicators.iloc[i - 1]["donchian_high"]):
-        donchian_high = float(df_with_indicators.iloc[i - 1]["donchian_high"])
-        donchian_low = float(df_with_indicators.iloc[i - 1]["donchian_low"])
-        donchian_mid = float(df_with_indicators.iloc[i - 1]["donchian_mid"])
-    else:
-        donchian_high = donchian_low = donchian_mid = current_price
-
-    breakout_up = current_price > donchian_high
-    breakout_down = current_price < donchian_low
-
-    atr = float(last["atr"]) if not pd.isna(last["atr"]) else 0
-    atr_pct = (atr / current_price) * 100 if current_price else 0
-    adx_val = float(last["adx"]) if "adx" in df_with_indicators.columns and not pd.isna(last["adx"]) else 0.0
-
-    # Tendencia
-    if current_price > ema200 and ema50 > ema200:
-        trend, strength = "BULL", min(abs((current_price - ema200) / ema200) * 100 / 5.0, 1.0)
-    elif current_price < ema200 and ema50 < ema200:
-        trend, strength = "BEAR", min(abs((current_price - ema200) / ema200) * 100 / 5.0, 1.0)
-    else:
-        trend, strength = "LATERAL", 0.3
-
-    volume_current = float(last["volume"])
-    volume_avg = float(last["volume_avg_20"]) if not pd.isna(last["volume_avg_20"]) else volume_current
-    volume_ratio = volume_current / volume_avg if volume_avg > 0 else 1.0
-
-    return MarketSnapshot(
-        price=current_price,
-        price_change_1h=round(price_change_1h, 3),
-        price_change_24h=round(price_change_24h, 3),
-        rsi=round(float(last["rsi"]) if not pd.isna(last["rsi"]) else 50, 2),
-        rsi_prev=round(float(prev["rsi"]) if not pd.isna(prev["rsi"]) else 50, 2),
-        macd_line=round(float(last["macd"]) if not pd.isna(last["macd"]) else 0, 4),
-        macd_signal=round(float(last["macd_signal"]) if not pd.isna(last["macd_signal"]) else 0, 4),
-        macd_histogram=round(float(last["macd_hist"]) if not pd.isna(last["macd_hist"]) else 0, 4),
-        macd_crossover=macd_crossover,
-        ema50=round(ema50, 2),
-        ema200=round(ema200, 2),
-        price_vs_ema50=round(((current_price - ema50) / ema50) * 100, 3) if ema50 else 0,
-        price_vs_ema200=round(((current_price - ema200) / ema200) * 100, 3) if ema200 else 0,
-        bb_upper=round(bb_upper, 2),
-        bb_middle=round(bb_middle, 2),
-        bb_lower=round(bb_lower, 2),
-        bb_width=round(bb_width, 3),
-        donchian_high=round(donchian_high, 2),
-        donchian_low=round(donchian_low, 2),
-        donchian_mid=round(donchian_mid, 2),
-        breakout_up=breakout_up,
-        breakout_down=breakout_down,
-        distance_to_high_pct=round(((current_price - donchian_high) / donchian_high) * 100, 3) if donchian_high else 0,
-        distance_to_low_pct=round(((current_price - donchian_low) / donchian_low) * 100, 3) if donchian_low else 0,
-        atr=round(atr, 2),
-        atr_pct=round(atr_pct, 4),
-        adx=round(adx_val, 2),
-        volume_current=round(volume_current, 4),
-        volume_avg_20=round(volume_avg, 4),
-        volume_ratio=round(volume_ratio, 3),
-        trend=trend,
-        trend_strength=round(strength, 3),
-        symbol=settings.symbol,
-        timeframe=settings.timeframe,
-        candles_available=i + 1,
-        is_warmed_up=i + 1 >= settings.warmup_candles,
-    )
-
-
-# ───────── motor de simulación ─────────
-
-class Simulator:
-    def __init__(self, settings):
-        self.s = settings
-        self.te = TechnicalEngine(settings)
-        self.capital = settings.initial_capital
-        self.position: Optional[SimPosition] = None
-        self.trades: list[Trade] = []
-        self.equity_curve: list[tuple[pd.Timestamp, float]] = []
-        self.peak = self.capital
-        self.max_dd = 0.0
-        self.last_close_idx: int = -10**9
-
-    def _effective_risk_pct(self) -> float:
-        base = self.s.max_risk_per_trade
-        if not self.s.use_kelly_sizing or len(self.trades) < self.s.kelly_min_trades:
-            return base
-        wins = [t.pnl_pct / 100 for t in self.trades if t.pnl_usdt > 0]
-        losses = [abs(t.pnl_pct / 100) for t in self.trades if t.pnl_usdt <= 0]
-        if not wins or not losses:
-            return base
-        wr = len(wins) / (len(wins) + len(losses))
-        avg_w = sum(wins) / len(wins)
-        avg_l = sum(losses) / len(losses)
-        if avg_l <= 0:
-            return base
-        b = avg_w / avg_l
-        full = wr - (1 - wr) / b
-        if full <= 0:
-            return self.s.kelly_min_risk_pct
-        return max(
-            self.s.kelly_min_risk_pct,
-            min(self.s.kelly_max_risk_pct, full * self.s.kelly_fraction),
-        )
-
-    def _position_size_usdt(self, snap: MarketSnapshot, sl_pct: float) -> float:
-        risk_pct = self._effective_risk_pct()
-        max_risk = self.capital * risk_pct
-        position = max_risk / sl_pct if sl_pct > 0 else max_risk * 10
-        cap = self.capital * (1 - self.s.trade_reserve_pct)
-        return min(position, cap)
-
-    def _open(self, snap: MarketSnapshot, dec, idx: int) -> None:
-        # Cooldown: no abrir si no pasaron suficientes velas desde el último cierre
-        if self.s.cooldown_bars > 0 and (idx - self.last_close_idx) < self.s.cooldown_bars:
-            return
-        sl_pct = max(dec.stop_loss_pct, snap.atr_pct * self.s.atr_sl_multiplier / 100)
-        tp_pct = dec.take_profit_pct
-        size_usdt = self._position_size_usdt(snap, sl_pct)
-        if size_usdt <= 0:
-            return
-        price = snap.price
-        amt_btc = size_usdt / price
-
-        # TP1 (parcial) a 1:1 vs SL por defecto.
-        if dec.direction == "SHORT":
-            sl = price * (1 + sl_pct)
-            tp = price * (1 - tp_pct)
-            tp1 = price * (1 - sl_pct * self.s.tp1_rr_multiple)
-        else:
-            sl = price * (1 - sl_pct)
-            tp = price * (1 + tp_pct)
-            tp1 = price * (1 + sl_pct * self.s.tp1_rr_multiple)
-
-        self.position = SimPosition(
-            direction=dec.direction,
-            entry_price=price,
-            amount_btc=amt_btc,
-            amount_usdt=size_usdt,
-            stop_loss=sl,
-            original_stop_loss=sl,
-            take_profit=tp,
-            entry_idx=idx,
-            entry_reason=f"[{dec.razon[:80]}]",
-            extreme_price=price,
-            tp1_price=tp1,
-            tp1_partial_pct=self.s.tp1_partial_pct if self.s.tp_scaling_enabled else 0.0,
-            original_amount_btc=amt_btc,
-        )
-        self.capital -= size_usdt
-
-    def _partial_close(self, exit_price: float, reason: str, idx: int) -> None:
-        """Cierra una fracción tp1_partial_pct de la posición y mueve SL a breakeven."""
-        if self.position is None:
-            return
-        p = self.position
-        fraction = p.tp1_partial_pct
-        close_btc = p.original_amount_btc * fraction
-        close_usdt = close_btc * p.entry_price  # capital que estaba reservado para esta fracción
-
-        if p.direction == "LONG":
-            pnl_gross = (exit_price - p.entry_price) * close_btc
-        else:
-            pnl_gross = (p.entry_price - exit_price) * close_btc
-
-        # Comisión sobre el valor de la entrada parcial + valor del cierre parcial.
-        fee = (close_usdt + close_btc * exit_price) * self.s.commission_pct_per_side
-        pnl = pnl_gross - fee
-
-        pnl_pct = pnl / close_usdt * 100 if close_usdt else 0.0
-        self.capital += close_usdt + pnl
-        if self.capital > self.peak:
-            self.peak = self.capital
-        self.trades.append(Trade(
-            direction=p.direction,
-            entry_price=p.entry_price,
-            exit_price=exit_price,
-            amount_btc=close_btc,
-            pnl_usdt=pnl,
-            pnl_pct=pnl_pct,
-            bars_held=idx - p.entry_idx,
-            entry_reason=p.entry_reason,
-            exit_reason=reason,
-            trailing_was_active=False,
-            fee_paid=fee,
-            pnl_gross=pnl_gross,
-        ))
-        # Actualizar la posición restante
-        p.amount_btc -= close_btc
-        p.amount_usdt -= close_usdt
-        p.tp1_filled = True
-
-    def _close(self, exit_price: float, reason: str, idx: int) -> None:
-        if self.position is None:
-            return
-        p = self.position
-        if p.direction == "LONG":
-            pnl_gross = (exit_price - p.entry_price) * p.amount_btc
-        else:
-            pnl_gross = (p.entry_price - exit_price) * p.amount_btc
-
-        # Comisión: entrada (sobre amount_usdt original, que NO incluye lo cerrado en TP1)
-        # + salida (sobre el valor final). Si hubo TP1, la entrada ya pagó su parte en _partial_close.
-        entry_value = p.amount_usdt
-        exit_value = p.amount_btc * exit_price
-        fee = (entry_value + exit_value) * self.s.commission_pct_per_side
-        pnl = pnl_gross - fee
-
-        pnl_pct = pnl / p.amount_usdt * 100
-        self.capital += p.amount_usdt + pnl
-        if self.capital > self.peak:
-            self.peak = self.capital
-        dd = (self.peak - self.capital) / self.peak * 100
-        if dd > self.max_dd:
-            self.max_dd = dd
-        self.trades.append(Trade(
-            direction=p.direction,
-            entry_price=p.entry_price,
-            exit_price=exit_price,
-            amount_btc=p.amount_btc,
-            pnl_usdt=pnl,
-            pnl_pct=pnl_pct,
-            bars_held=idx - p.entry_idx,
-            entry_reason=p.entry_reason,
-            exit_reason=reason,
-            trailing_was_active=p.trailing_active,
-            fee_paid=fee,
-            pnl_gross=pnl_gross,
-        ))
-        self.position = None
-        self.last_close_idx = idx
-
-    def _update_trailing(self, current_price: float, snap: MarketSnapshot) -> None:
-        """
-        Bidireccional. Si dynamic_trailing_enabled, usa la regla nueva:
-          - Activa cuando profit cubre el SL original (R:R = 1:1).
-          - En activación mueve SL a breakeven (free trade).
-          - Después chasea el extreme a distancia (dynamic_trailing_atr_mult * ATR%).
-        Si no, usa la regla histórica (activation_pct fijo, distance_pct fijo).
-        """
-        if not self.s.trailing_stop_enabled or self.position is None:
-            return
-        p = self.position
-
-        if self.s.dynamic_trailing_enabled:
-            atr_dist = max(0.003, snap.atr_pct * self.s.dynamic_trailing_atr_mult / 100)
-            sl_pct_orig = abs(p.original_stop_loss - p.entry_price) / p.entry_price
-            if p.direction == "LONG":
-                if current_price > p.extreme_price:
-                    p.extreme_price = current_price
-                profit_pct = (current_price - p.entry_price) / p.entry_price
-                if not p.trailing_active and profit_pct >= sl_pct_orig:
-                    p.trailing_active = True
-                    # SL a breakeven (free trade)
-                    p.stop_loss = max(p.stop_loss, p.entry_price * 1.0005)
-                if p.trailing_active:
-                    new_sl = p.extreme_price * (1 - atr_dist)
-                    if new_sl > p.stop_loss:
-                        p.stop_loss = new_sl
-            else:  # SHORT
-                if current_price < p.extreme_price or p.extreme_price == p.entry_price:
-                    p.extreme_price = current_price
-                profit_pct = (p.entry_price - current_price) / p.entry_price
-                if not p.trailing_active and profit_pct >= sl_pct_orig:
-                    p.trailing_active = True
-                    p.stop_loss = min(p.stop_loss, p.entry_price * 0.9995)
-                if p.trailing_active:
-                    new_sl = p.extreme_price * (1 + atr_dist)
-                    if new_sl < p.stop_loss:
-                        p.stop_loss = new_sl
-            return
-
-        # Modo legacy
-        if p.direction == "LONG":
-            if current_price > p.extreme_price:
-                p.extreme_price = current_price
-            profit_pct = (current_price - p.entry_price) / p.entry_price
-            if not p.trailing_active and profit_pct >= self.s.trailing_activation_pct:
-                p.trailing_active = True
-            if p.trailing_active:
-                new_sl = p.extreme_price * (1 - self.s.trailing_distance_pct)
-                if new_sl > p.stop_loss:
-                    p.stop_loss = new_sl
-        else:  # SHORT
-            if current_price < p.extreme_price or p.extreme_price == p.entry_price:
-                p.extreme_price = current_price
-            profit_pct = (p.entry_price - current_price) / p.entry_price
-            if not p.trailing_active and profit_pct >= self.s.trailing_activation_pct:
-                p.trailing_active = True
-            if p.trailing_active:
-                new_sl = p.extreme_price * (1 + self.s.trailing_distance_pct)
-                if new_sl < p.stop_loss:
-                    p.stop_loss = new_sl
-
-    def step(self, snap: MarketSnapshot, bar: pd.Series, idx: int, ts, mtf=None) -> None:
-        # 1) Si hay posición, intentar cerrar por SL/TP usando high/low de la vela
-        if self.position is not None:
-            self._update_trailing(snap.price, snap)
-            p = self.position
-            high = float(bar["high"])
-            low = float(bar["low"])
-            # Con trailing dinámico, ignoramos el TP fijo (let winners run).
-            tp_enabled = not (
-                self.s.dynamic_trailing_enabled and self.s.disable_fixed_tp_with_trailing
-            )
-
-            # TP1 (parcial): si la vela tocó el nivel y todavía no se llenó.
-            tp1_active = (
-                self.s.tp_scaling_enabled
-                and not p.tp1_filled
-                and p.tp1_partial_pct > 0
-            )
-            if tp1_active:
-                tp1_touched = (
-                    (p.direction == "LONG" and high >= p.tp1_price) or
-                    (p.direction == "SHORT" and low <= p.tp1_price)
-                )
-                if tp1_touched:
-                    self._partial_close(p.tp1_price, "TP1 (parcial)", idx)
-                    # Mover SL a breakeven + buffer (free trade)
-                    if p.direction == "LONG":
-                        p.stop_loss = max(p.stop_loss, p.entry_price * (1 + self.s.breakeven_buffer_pct))
-                    else:
-                        p.stop_loss = min(p.stop_loss, p.entry_price * (1 - self.s.breakeven_buffer_pct))
-
-            if p.direction == "LONG":
-                if low <= p.stop_loss:
-                    self._close(p.stop_loss, "Stop-loss", idx)
-                elif tp_enabled and high >= p.take_profit and not p.trailing_active:
-                    self._close(p.take_profit, "Take-profit", idx)
-            else:  # SHORT
-                if high >= p.stop_loss:
-                    self._close(p.stop_loss, "Stop-loss", idx)
-                elif tp_enabled and low <= p.take_profit and not p.trailing_active:
-                    self._close(p.take_profit, "Take-profit", idx)
-
-        # 2) Si no hay posición, evaluar señal de entrada
-        if self.position is None:
-            decision = self.te.analyze(snap, mtf=mtf)
-            if decision.accion in ("COMPRAR", "VENDER"):
-                self._open(snap, decision, idx)
-
-        # 3) Equity tracking (capital + valor mark-to-market de la posición)
-        if self.position is not None:
-            p = self.position
-            if p.direction == "LONG":
-                upnl = (snap.price - p.entry_price) * p.amount_btc
-            else:
-                upnl = (p.entry_price - snap.price) * p.amount_btc
-            equity = self.capital + p.amount_usdt + upnl
-        else:
-            equity = self.capital
-        self.equity_curve.append((ts, equity))
-        if equity > self.peak:
-            self.peak = equity
-        dd = (self.peak - equity) / self.peak * 100
-        if dd > self.max_dd:
-            self.max_dd = dd
-
-
-# ───────── pre-computar indicadores en el df ─────────
-
-def add_indicators(df: pd.DataFrame, settings) -> pd.DataFrame:
-    eng = IndicatorEngine(settings)
-    return eng._add_all_indicators(df.copy())
-
-
-# ───────── reporte ─────────
-
-def report(sim: Simulator, settings) -> None:
-    initial = settings.initial_capital
-    final = sim.equity_curve[-1][1] if sim.equity_curve else initial
-    ret_pct = (final - initial) / initial * 100
-
-    n = len(sim.trades)
-    if n == 0:
-        print("\n=== BACKTEST — sin operaciones ===")
-        print(f"Capital final: ${final:,.2f} ({ret_pct:+.2f}%)")
-        return
-
-    wins = [t for t in sim.trades if t.pnl_usdt > 0]
-    losses = [t for t in sim.trades if t.pnl_usdt <= 0]
-    win_rate = len(wins) / n * 100
-    avg_win = sum(t.pnl_usdt for t in wins) / len(wins) if wins else 0
-    avg_loss = sum(t.pnl_usdt for t in losses) / len(losses) if losses else 0
-    profit_factor = (sum(t.pnl_usdt for t in wins) / abs(sum(t.pnl_usdt for t in losses))
-                     if losses and sum(t.pnl_usdt for t in losses) != 0 else float("inf"))
-
-    longs = [t for t in sim.trades if t.direction == "LONG"]
-    shorts = [t for t in sim.trades if t.direction == "SHORT"]
-
-    print("\n" + "=" * 60)
-    print("  RESULTADO DEL BACKTEST")
-    print("=" * 60)
-    print(f"Capital inicial:   ${initial:,.2f}")
-    print(f"Capital final:     ${final:,.2f}  ({ret_pct:+.2f}%)")
-    print(f"Max drawdown:      {sim.max_dd:.2f}%")
-    print()
-    print(f"Total operaciones: {n}  ({len(longs)} LONG, {len(shorts)} SHORT)")
-    print(f"Acertamos en:      {win_rate:.1f}%  ({len(wins)} ganadoras, {len(losses)} perdedoras)")
-    print(f"Ganancia promedio: ${avg_win:+.2f}")
-    print(f"Pérdida promedio:  ${avg_loss:+.2f}")
-    print(f"Profit factor:     {profit_factor:.2f}")
-    print()
-    by_reason: dict[str, int] = {}
-    for t in sim.trades:
-        by_reason[t.exit_reason] = by_reason.get(t.exit_reason, 0) + 1
-    print("Cómo cerraron:")
-    for r, c in sorted(by_reason.items(), key=lambda x: -x[1]):
-        print(f"  • {r}: {c}")
-
-    print()
-    print("Últimas 5 operaciones:")
-    for t in sim.trades[-5:]:
-        emoji = "🟢" if t.pnl_usdt > 0 else "🔴"
-        print(f"  {emoji} {t.direction} | entrada ${t.entry_price:,.2f} → salida ${t.exit_price:,.2f} "
-              f"| {t.pnl_usdt:+.2f} USDT ({t.pnl_pct:+.2f}%) | {t.exit_reason} | {t.bars_held} velas")
-    print("=" * 60)
-
-
-# ───────── entrada ─────────
+from statistics import mean, pstdev
+from zoneinfo import ZoneInfo
+
+import requests
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from bot.bingx import BingXClient, ContractSpec  # noqa: E402
+from bot.sizing import build_plan_fixed_risk  # noqa: E402
+from bot.strategy import (MS_1D, StrategyParams, SymbolStrategy, atr_series, build_bars,  # noqa: E402
+                          build_daily_zones, build_hourly)
+
+CACHE = ROOT / "data" / "backtest"
+TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+SLIPPAGE = 0.0003
+MAX_LEVERAGE = 20
+MIN_RR = 1.5
+INTERVAL_MS = {"5m": 300_000, "1h": 3_600_000, "1d": 86_400_000}
+CURRENT_PAIRS = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "ZEC-USDT", "DOGE-USDT"]
+BINANCE = "https://fapi.binance.com"
+
+BASE = StrategyParams(sl_mode="structure", filter_trend=True)
+ENGINES = {
+    "REF": StrategyParams(),
+    "BASE": BASE,
+    "BASE+IMP": replace(BASE, filter_impulse=True),
+    "BASE+VOL": replace(BASE, filter_volume=True),
+    "BASE+IMP+VOL": replace(BASE, filter_impulse=True, filter_volume=True),
+    "FIB+TREND": StrategyParams(sl_mode="fib", filter_trend=True),   # SL Fibo 0,786 + EMA50 diaria
+}
+MGMT = {"—": (False, False), "BE": (True, False), "PARC": (False, True), "BE+PARC": (True, True)}
+
+
+# ───────────────────────── datos ─────────────────────────
+
+def _get(url, params, tries=6):
+    for attempt in range(tries):
+        try:
+            resp = requests.get(url, params=params, timeout=20)
+            if resp.status_code == 429:
+                time.sleep(10)
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        except requests.RequestException as exc:
+            print(f"  reintento {url}: {exc}", flush=True)
+            time.sleep(2 * (attempt + 1))
+    raise SystemExit(f"Fallo definitivo pidiendo {url} {params}")
+
+
+def fetch(symbol: str, interval: str, start_ms: int, end_ms: int) -> list[list]:
+    """Velas [t, o, h, l, c, v] desde Binance Futures, con cache incremental."""
+    CACHE.mkdir(parents=True, exist_ok=True)
+    path = CACHE / f"{symbol}_{interval}.v2.json"
+    step = INTERVAL_MS[interval]
+    stored = json.loads(path.read_text()) if path.exists() else {"from": None, "rows": []}
+    rows: list[list] = stored["rows"]
+    covered_from = stored["from"]  # desde dónde ya se pidió (el par puede haber empezado a cotizar después)
+
+    def download(a: int, b: int) -> list[list]:
+        out, cursor = [], a
+        while cursor < b:
+            data = _get(f"{BINANCE}/fapi/v1/klines", {"symbol": symbol.replace("-", ""), "interval": interval,
+                                                      "startTime": cursor, "endTime": b, "limit": 1500})
+            if not data:
+                break
+            out += [[int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in data]
+            cursor = int(data[-1][0]) + step
+            time.sleep(0.12)
+        return out
+
+    changed = False
+    if covered_from is None or start_ms < covered_from:
+        head = download(start_ms, rows[0][0] if rows else end_ms)
+        rows = head + [r for r in rows if not head or r[0] > head[-1][0]]
+        covered_from = start_ms
+        changed = True
+    if rows and rows[-1][0] < end_ms - 2 * step:
+        tail = download(rows[-1][0] + step, end_ms)
+        rows += tail
+        changed = bool(tail) or changed
+    now_ms = int(time.time() * 1000)
+    rows = [r for r in rows if r[0] + step <= now_ms]
+    if changed:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"from": covered_from, "rows": rows}, separators=(",", ":")))
+        tmp.replace(path)
+    return [r for r in rows if start_ms <= r[0] < end_ms]
+
+
+def as_candles(rows: list[list]) -> list[dict]:
+    return [{"time": r[0], "open": r[1], "high": r[2], "low": r[3], "close": r[4], "volume": r[5]} for r in rows]
+
+
+# ───────────────────────── selección objetiva de pares ─────────────────────────
+
+def select_pairs(n: int, is_start: int, is_end: int, specs: dict[str, ContractSpec]) -> list[str]:
+    """Top N por ATR% diario (en el período IS) / spread actual de BingX, entre los 40 más líquidos."""
+    info = _get(f"{BINANCE}/fapi/v1/exchangeInfo", {})
+    binance_ok = {s["symbol"] for s in info["symbols"]
+                  if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT"
+                  and s.get("status") == "TRADING" and int(s.get("onboardDate", 0)) <= is_start - 30 * MS_1D}
+    common = [sym for sym, spec in specs.items()
+              if sym.endswith("-USDT") and spec.api_open and sym.replace("-", "") in binance_ok]
+    tickers = {t["symbol"]: float(t["quoteVolume"]) for t in _get(f"{BINANCE}/fapi/v1/ticker/24hr", {})}
+    liquid = sorted(common, key=lambda s: tickers.get(s.replace("-", ""), 0), reverse=True)[:40]
+
+    rows = []
+    for sym in liquid:
+        depth = _get("https://open-api.bingx.com/openApi/swap/v2/quote/depth", {"symbol": sym, "limit": 5})
+        book = depth.get("data") or {}
+        try:
+            ask = min(float(a[0]) for a in book["asks"])
+            bid = max(float(b[0]) for b in book["bids"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        spread_pct = (ask - bid) / ((ask + bid) / 2) * 100
+        daily = as_candles(fetch(sym, "1d", is_start - 20 * MS_1D, is_end))
+        daily_is = [c for c in daily if c["time"] >= is_start]
+        if len(daily_is) < 200 or spread_pct <= 0:
+            continue
+        atr = atr_series(daily)
+        atr_pct = mean(a / c["close"] * 100 for a, c in zip(atr, daily) if a and c["time"] >= is_start)
+        rows.append((sym, atr_pct, spread_pct, atr_pct / spread_pct, tickers.get(sym.replace("-", ""), 0)))
+        time.sleep(0.1)
+
+    rows.sort(key=lambda r: r[3], reverse=True)
+    print("\nSelección de pares (ATR% diario en IS / spread BingX, entre los 40 más líquidos):")
+    print(f"  {'par':<14}{'ATR%':>7}{'spread%':>10}{'ratio':>9}{'vol 24h (M)':>14}")
+    for i, (sym, atr_pct, spread, ratio, vol) in enumerate(rows):
+        mark = "✔" if i < n else " "
+        print(f"  {mark} {sym:<12}{atr_pct:>7.2f}{spread:>10.4f}{ratio:>9.0f}{vol / 1e6:>14.0f}")
+    chosen = [r[0] for r in rows[:n]]
+    print(f"  De los 6 actuales entran: {', '.join(p for p in CURRENT_PAIRS if p in chosen) or 'ninguno'}")
+    return chosen
+
+
+# ───────────────────────── simulación de una operación ─────────────────────────
+
+def simulate_trade(bars, i: int, side: str, entry: float, sl: float, tp: float, qty: float, taker: float,
+                   move_be: bool, partial: bool):
+    """Devuelve (hora_de_salida, pnl_usdt, motivo) o None si quedó abierta al final de los datos."""
+    long = side == "LONG"
+    sign = 1 if long else -1
+    risk_px = abs(entry - sl)
+    one_r = entry + sign * risk_px
+    be = entry * (1 + sign * 2 * taker)
+    cur_sl, remaining, pnl = sl, 1.0, -qty * entry * taker          # comisión de entrada
+    moved = took_partial = False
+
+    def close(px_trigger: float, part: float):
+        px = px_trigger * (1 - sign * SLIPPAGE)
+        return sign * (px - entry) * qty * part - qty * part * px * taker
+
+    for j in range(i + 1, len(bars)):
+        b = bars[j]
+        exit_time = b.time + 300_000
+        if (b.low <= cur_sl) if long else (b.high >= cur_sl):
+            return exit_time, pnl + close(cur_sl, remaining), ("BE" if moved else "SL")
+        if (b.high >= tp) if long else (b.low <= tp):
+            return exit_time, pnl + close(tp, remaining), "TP"
+        if (b.high >= one_r) if long else (b.low <= one_r):
+            if partial and not took_partial:
+                pnl += close(one_r, 0.5)
+                remaining = 0.5
+                took_partial = True
+            if move_be and not moved:
+                cur_sl, moved = be, True
+                if (b.low <= cur_sl) if long else (b.high >= cur_sl):   # misma vela: se asume lo peor
+                    return exit_time, pnl + close(cur_sl, remaining), "BE"
+    return None
+
+
+# ───────────────────────── trabajo por par (proceso aparte) ─────────────────────────
+
+def run_symbol(symbol: str, spec: dict, start_ms: int, end_ms: int, risk: float,
+               min_rr: float = MIN_RR, engines: tuple = tuple(ENGINES), mgmt_modes: tuple = tuple(MGMT)) -> dict:
+    spec_obj = ContractSpec(**spec)
+    daily = as_candles(fetch(symbol, "1d", start_ms - 450 * MS_1D, end_ms))
+    hourly = as_candles(fetch(symbol, "1h", start_ms - 30 * MS_1D, end_ms))
+    m5 = as_candles(fetch(symbol, "5m", start_ms - 7 * MS_1D, end_ms))
+    if len(m5) < 1000:
+        return {"symbol": symbol, "trades": [], "rejects": {}, "entries": {}, "bars": len(m5)}
+    zones = build_daily_zones(daily, BASE)
+    bars = build_bars(m5, build_hourly(hourly, BASE), zones, BASE)
+
+    trades, rejects, entries = [], {}, {}
+    for eng_name, params in ((e, ENGINES[e]) for e in engines):
+        engine = SymbolStrategy(symbol, params)
+        n_entries = 0
+        for i, bar in enumerate(bars):
+            for ev in engine.on_bar(bar):
+                if ev["event"] != "entry" or ev["time"] < start_ms:
+                    continue
+                n_entries += 1
+                long = ev["side"] == "LONG"
+                entry = ev["price"] * (1 + SLIPPAGE if long else 1 - SLIPPAGE)
+                plan = build_plan_fixed_risk(symbol=symbol, direction=ev["side"], entry=entry,
+                                             stop_loss=ev["sl"], take_profit=ev["tp"], spec=spec_obj,
+                                             risk_usdt=risk, max_leverage=MAX_LEVERAGE, min_rr=min_rr)
+                if not plan.ok:
+                    key = ("R:R" if plan.reason.startswith("R:R") else
+                           "mínimo de contrato" if "no llego al mínimo" in plan.reason else "otro")
+                    rejects[(eng_name, key)] = rejects.get((eng_name, key), 0) + 1
+                    continue
+                modes = ["—"] if eng_name == "REF" else list(mgmt_modes)
+                for mgmt in modes:
+                    move_be, partial = MGMT[mgmt]
+                    res = simulate_trade(bars, i, ev["side"], entry, ev["sl"], ev["tp"], plan.qty,
+                                         spec_obj.taker_fee, move_be, partial)
+                    if res is None:
+                        continue
+                    exit_time, pnl, why = res
+                    trades.append({"engine": eng_name, "mgmt": mgmt, "symbol": symbol, "side": ev["side"],
+                                   "time": ev["time"], "exit": exit_time, "pnl": pnl, "r": pnl / plan.risk_usdt,
+                                   "why": why, "margin": plan.margin_used, "sl_pct": plan.sl_distance_pct})
+        entries[eng_name] = n_entries
+    return {"symbol": symbol, "trades": trades, "rejects": {f"{k[0]}|{k[1]}": v for k, v in rejects.items()},
+            "entries": entries, "bars": len(m5)}
+
+
+# ───────────────────────── portafolio y métricas ─────────────────────────
+
+def portfolio(trades: list[dict], max_open: int, daily_loss: float) -> tuple[list[dict], int, float]:
+    accepted, open_now, day_pnl, skipped, max_margin = [], [], {}, 0, 0.0
+    for t in sorted(trades, key=lambda x: x["time"]):
+        for o in [o for o in open_now if o["exit"] <= t["time"]]:
+            d = datetime.fromtimestamp(o["exit"] / 1000, TZ).date()
+            day_pnl[d] = day_pnl.get(d, 0.0) + o["pnl"]
+        open_now = [o for o in open_now if o["exit"] > t["time"]]
+        today = datetime.fromtimestamp(t["time"] / 1000, TZ).date()
+        if any(o["symbol"] == t["symbol"] for o in open_now) or len(open_now) >= max_open \
+                or day_pnl.get(today, 0.0) <= -daily_loss:
+            skipped += 1
+            continue
+        accepted.append(t)
+        open_now.append(t)
+        max_margin = max(max_margin, sum(o["margin"] for o in open_now))
+    return accepted, skipped, max_margin
+
+
+def stats(trades: list[dict]) -> dict:
+    if not trades:
+        return {"n": 0}
+    rs = [t["r"] for t in trades]
+    gw, gl = sum(r for r in rs if r > 0), -sum(r for r in rs if r < 0)
+    eq = peak = dd = 0.0
+    for r in rs:
+        eq += r
+        peak = max(peak, eq)
+        dd = max(dd, peak - eq)
+    sd = pstdev(rs) if len(rs) > 1 else 0.0
+    return {"n": len(rs), "win": sum(1 for t in trades if t["pnl"] > 0) / len(rs) * 100, "avg": mean(rs),
+            "tot": sum(rs), "pf": gw / gl if gl else math.inf, "dd": dd, "usdt": sum(t["pnl"] for t in trades),
+            "t": mean(rs) / (sd / math.sqrt(len(rs))) if sd and len(rs) >= 10 else None}
+
+
+def line(st: dict) -> str:
+    if not st["n"]:
+        return "sin operaciones"
+    pf = "∞" if st["pf"] == math.inf else f"{st['pf']:.2f}"
+    return (f"{st['n']:>4} ops · acierto {st['win']:>3.0f}% · {st['avg']:+.3f} R/op · total {st['tot']:+6.1f} R · "
+            f"PF {pf:>4} · DD {st['dd']:>4.1f} R · {st['usdt']:+7.2f} USDT · t={'—' if st['t'] is None else format(st['t'], '+.2f')}")
+
+
+# ───────────────────────── main ─────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Backtest del bot")
-    parser.add_argument("--days", type=int, default=30, help="Días de histórico")
-    parser.add_argument("--timeframe", type=str, default=None, help="Override timeframe")
-    parser.add_argument("--symbol", type=str, default=None, help="Override symbol")
-    parser.add_argument("--cooldown", type=int, default=None, help="Cooldown en velas")
-    parser.add_argument("--adx-min", type=float, default=None, help="ADX mínimo para operar")
-    parser.add_argument("--macro-trend", action="store_true", help="Requerir EMA200 alineada")
-    parser.add_argument("--kelly", action="store_true", help="Position sizing por Kelly")
-    parser.add_argument("--mtf", action="store_true", help="Filtro de confluencia con TF 1h")
-    parser.add_argument("--dyn-trailing", action="store_true", help="Trailing dinámico (sin TP fijo)")
-    parser.add_argument("--tp-scaling", action="store_true", help="TP escalado: TP1 al 1:1 cierra 50% y mueve SL a breakeven")
-    parser.add_argument("--tp1-pct", type=float, default=None, help="Fracción cerrada en TP1 (0-1)")
-    parser.add_argument("--tp1-rr", type=float, default=None, help="Multiplicador de SL para TP1 (1.0 = 1:1 RR)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--months", type=int, default=24)
+    ap.add_argument("--oos-months", type=int, default=8)
+    ap.add_argument("--pairs", default="auto", help="auto | current | BTC-USDT,ETH-USDT,...")
+    ap.add_argument("--n-pairs", type=int, default=20)
+    ap.add_argument("--risk", type=float, default=0.5, help="USDT arriesgados por operación")
+    ap.add_argument("--max-open", type=int, default=3)
+    ap.add_argument("--daily-loss", type=float, default=3.0)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--min-rr", type=float, default=MIN_RR, help="R:R neto mínimo para aceptar la entrada")
+    ap.add_argument("--engines", default=",".join(ENGINES), help="REF,BASE,BASE+IMP,BASE+VOL,BASE+IMP+VOL")
+    ap.add_argument("--mgmt", default=",".join(MGMT), help="—,BE,PARC,BE+PARC (— = SL/TP fijos)")
+    args = ap.parse_args()
 
-    settings = load_settings()
-    if args.timeframe:
-        settings.timeframe = args.timeframe
-    if args.symbol:
-        settings.symbol = args.symbol
-    if args.cooldown is not None:
-        settings.cooldown_bars = args.cooldown
-    if args.adx_min is not None:
-        settings.adx_min_trending = args.adx_min
-    if args.macro_trend:
-        settings.require_macro_trend = True
-    if args.kelly:
-        settings.use_kelly_sizing = True
-    if args.mtf:
-        settings.require_mtf_confluence = True
-    if args.dyn_trailing:
-        settings.dynamic_trailing_enabled = True
-    if args.tp_scaling:
-        settings.tp_scaling_enabled = True
-    if getattr(args, "tp1_pct", None) is not None:
-        settings.tp1_partial_pct = args.tp1_pct
-    if getattr(args, "tp1_rr", None) is not None:
-        settings.tp1_rr_multiple = args.tp1_rr
+    engines = tuple(e.strip() for e in args.engines.split(",") if e.strip())
+    mgmt_modes = tuple(m.strip() for m in args.mgmt.split(",") if m.strip())
+    now_ms = int(time.time() * 1000) // 300_000 * 300_000
+    start_ms = now_ms - args.months * 30 * MS_1D
+    split_ms = now_ms - args.oos_months * 30 * MS_1D
+    specs = BingXClient("", "", "live").contracts()
 
-    flags = []
-    if settings.cooldown_bars > 0:
-        flags.append(f"cooldown={settings.cooldown_bars}")
-    if settings.adx_min_trending > 0:
-        flags.append(f"adx>={settings.adx_min_trending:.0f}")
-    if settings.require_macro_trend:
-        flags.append("macro_trend")
-    if settings.use_kelly_sizing:
-        flags.append("kelly")
-    if settings.require_mtf_confluence:
-        flags.append("mtf")
-    if settings.dynamic_trailing_enabled:
-        flags.append("dyn-trailing")
-    if settings.tp_scaling_enabled:
-        flags.append("tp-scaling")
-    print(f"Mejoras activas: {', '.join(flags) if flags else 'ninguna (baseline)'}")
+    if args.pairs == "auto":
+        pairs = select_pairs(args.n_pairs, start_ms, split_ms, specs)
+    elif args.pairs == "current":
+        pairs = CURRENT_PAIRS
+    else:
+        pairs = [p.strip().upper() for p in args.pairs.split(",") if p.strip()]
 
-    print(f"Bajando {args.days} días de {settings.symbol} @ {settings.timeframe} de Binance mainnet...")
-    df = fetch_history(settings.symbol, settings.timeframe, args.days)
-    print(f"  → {len(df)} velas ({df.index[0]} → {df.index[-1]})")
+    print(f"\nPeríodo: {datetime.fromtimestamp(start_ms / 1000, TZ):%d/%m/%Y} → "
+          f"{datetime.fromtimestamp(now_ms / 1000, TZ):%d/%m/%Y} · OOS desde "
+          f"{datetime.fromtimestamp(split_ms / 1000, TZ):%d/%m/%Y} · riesgo {args.risk} USDT/op · "
+          f"máx. {args.max_open} abiertas · R:R mín. {args.min_rr} · motores {engines} · gestión {mgmt_modes} · "
+          f"{len(pairs)} pares", flush=True)
 
-    print("Calculando indicadores...")
-    df = add_indicators(df, settings)
+    # Descarga secuencial (respeta límites de la API) y después procesamiento en paralelo
+    for sym in pairs:
+        t0 = time.time()
+        fetch(sym, "1d", start_ms - 450 * MS_1D, now_ms)
+        fetch(sym, "1h", start_ms - 30 * MS_1D, now_ms)
+        rows = fetch(sym, "5m", start_ms - 7 * MS_1D, now_ms)
+        print(f"  datos {sym:<14} {len(rows):>7} velas 5m · {time.time() - t0:4.0f}s", flush=True)
 
-    df_1h = df_4h = None
-    if settings.require_mtf_confluence:
-        print("Bajando 1h y 4h para MTF...")
-        df_1h = fetch_history(settings.symbol, "1h", max(args.days + 10, 30))
-        df_4h = fetch_history(settings.symbol, "4h", max(args.days + 30, 60))
-        print(f"  → 1h: {len(df_1h)} velas | 4h: {len(df_4h)} velas")
+    results = []
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(run_symbol, sym, asdict(specs[sym]), start_ms, now_ms, args.risk,
+                               args.min_rr, engines, mgmt_modes): sym
+                   for sym in pairs if sym in specs}
+        for fut in as_completed(futures):
+            res = fut.result()
+            results.append(res)
+            print(f"  motor {res['symbol']:<14} entradas {res['entries']}", flush=True)
 
-    print("Simulando...")
-    sim = Simulator(settings)
-    warmup = max(settings.warmup_candles, settings.ema_slow + 10)
-    for i in range(warmup, len(df)):
-        ts = df.index[i]
-        try:
-            snap = snapshot_at(df, i, settings)
-        except Exception:
-            continue
-        mtf = None
-        if df_1h is not None and df_4h is not None:
-            # Slice histórico: hasta ts (inclusive). Asume índices ordenados.
-            sub_1h = df_1h.loc[:ts]
-            sub_4h = df_4h.loc[:ts]
-            if len(sub_1h) > settings.ema_slow and len(sub_4h) > settings.ema_slow:
-                mtf = build_mtf_context(sub_1h, sub_4h)
-        sim.step(snap, df.iloc[i], i, ts, mtf=mtf)
-    # Cerrar posición abierta al final, si la hay
-    if sim.position is not None:
-        last_price = float(df.iloc[-1]["close"])
-        sim._close(last_price, "Fin del backtest", len(df) - 1)
+    all_trades = [t for r in results for t in r["trades"]]
+    rejects: dict[str, int] = {}
+    for r in results:
+        for k, v in r["rejects"].items():
+            rejects[k] = rejects.get(k, 0) + v
 
-    report(sim, settings)
+    variants = [(e, "—") if e == "REF" else (e, m) for e in engines for m in (("—",) if e == "REF" else mgmt_modes)]
+    variants = list(dict.fromkeys(variants))
+    table = []
+    print(f"\n{'variante':<24} {'período':<4} resultado")
+    for eng, mgmt in variants:
+        subset = [t for t in all_trades if t["engine"] == eng and t["mgmt"] == mgmt]
+        accepted, skipped, max_margin = portfolio(subset, args.max_open, args.daily_loss)
+        ins = stats([t for t in accepted if t["time"] < split_ms])
+        oos = stats([t for t in accepted if t["time"] >= split_ms])
+        table.append((eng, mgmt, ins, oos, accepted, skipped, max_margin))
+        name = f"{eng} · {mgmt}"
+        print(f"{name:<24} TOT  {line(stats(accepted))}")
+        print(f"{'':<24} IS   {line(ins)}")
+        print(f"{'':<24} OOS  {line(oos)}   (salteadas por límites: {skipped} · margen máx. simultáneo "
+              f"{max_margin:.2f} USDT)")
+
+    print("\nDescartadas antes de operar (todas las entradas del período):")
+    for k, v in sorted(rejects.items()):
+        print(f"  {k}: {v}")
+
+    candidates = [row for row in table if row[0] != "REF" and row[2]["n"] >= 50 and row[2]["avg"] > 0]
+    both = [row for row in table if row[2]["n"] and row[3]["n"] and row[2]["avg"] > 0 and row[3]["avg"] > 0]
+    both_names = ", ".join(f"{e} · {m}" for e, m, *_ in both) or "NINGUNA"
+    print(f"\nVariantes positivas en IS y en OOS a la vez: {both_names}")
+    if not candidates:
+        print("Ninguna variante con ≥ 50 operaciones es positiva in-sample: no hay nada que validar fuera de muestra.")
+    else:
+        best = max(candidates, key=lambda row: row[2]["avg"])
+        eng, mgmt, ins, oos, accepted, *_ = best
+        print(f"\n=== Elegida por IS (máx. R/op con ≥ 50 ops): {eng} · {mgmt} ===")
+        print(f"  IS : {line(ins)}")
+        print(f"  OOS: {line(oos)}")
+        verdict = ("POSITIVA y con t ≥ 2 (evidencia razonable)" if oos["n"] and oos["avg"] > 0 and (oos["t"] or 0) >= 2 else
+                   "positiva pero NO significativa (t < 2)" if oos["n"] and oos["avg"] > 0 else
+                   "NEGATIVA fuera de muestra")
+        print(f"  Veredicto OOS: {verdict}")
+        oos_trades = [t for t in accepted if t["time"] >= split_ms]
+        print("  OOS por par:")
+        for sym in sorted({t['symbol'] for t in oos_trades}):
+            print(f"    {sym:<14} {line(stats([t for t in oos_trades if t['symbol'] == sym]))}")
+        for side in ("LONG", "SHORT"):
+            print(f"  OOS {side:<5} {line(stats([t for t in oos_trades if t['side'] == side]))}")
+        why = {}
+        for t in oos_trades:
+            why[t["why"]] = why.get(t["why"], 0) + 1
+        print(f"  OOS salidas: {why}")
+
+    out = CACHE / "results.json"
+    out.write_text(json.dumps({"args": vars(args), "pairs": pairs, "split_ms": split_ms,
+                               "table": [{"engine": e, "mgmt": m, "is": i, "oos": o, "skipped": s, "max_margin": mm}
+                                         for e, m, i, o, _, s, mm in table]}, default=str, indent=1))
+    print(f"\nResultados guardados en {out}")
 
 
 if __name__ == "__main__":

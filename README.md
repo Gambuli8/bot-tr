@@ -1,118 +1,50 @@
-# Bot de Trading BTC/USDT
-> Python · Binance Testnet · Claude API · Telegram
+# Bot de trading BingX
 
----
+Bot para Futuros Perpetuos USDT-M de BingX. **Analiza solo** la estrategia Zona 1D + Fibonacci 1H +
+Diagonal 5m con velas de BingX (gratis, sin TradingView pago), opera con **margen fijo de 1–2 USDT**
+con SL y TP, y te cuenta todo por Telegram.
 
-## Setup en 5 pasos
+```
+bingx-bot (Docker, VPS)
+  ├─ scanner: cada 5 min baja velas 1D/1H/5m de los 6 pares → motor de estrategia (bot/strategy.py)
+  │     eventos: zona → cambio 1H → 0,618 → entrada (o cancelado)
+  ├─ ejecutor: valida (duplicados, pausa, slippage, límite diario) → sizing (margen fijo, apalancamiento
+  │     mínimo, liquidación vs SL, R:R neto) → BingX: orden + SL + TP (isolated, one-way, reduceOnly)
+  ├─ monitor: detecta cierres TP/SL, PnL real, SL faltante, posiciones desconocidas
+  ├─ Telegram: narra cada etapa, entradas, salidas · /estado /hoy /semana /mes /pausa /cerrar
+  └─ resúmenes semanales y mensuales → Telegram + Google Drive
 
-### 1. Clonar y crear entorno virtual
+TradingView (opcional): el indicador tradingview/bingx_fibo_mtf.pine dibuja lo mismo en el gráfico
+(funciona en el plan gratis). Con STRATEGY_SOURCE=tradingview las entradas llegan por webhook (plan pago).
+```
+
+## Estructura
+
+| Archivo | Qué hace |
+|---|---|
+| `bot/server.py` | Arranque, `/tv/health`, webhook opcional `/tv/webhook` |
+| `bot/strategy.py` | Motor de la estrategia (misma lógica que el Pine) |
+| `bot/scanner.py` | Baja velas cada 5 min y le pasa los eventos al ejecutor |
+| `bot/signals.py` | Formato del JSON que manda TradingView |
+| `bot/executor.py` | Controles y apertura de operaciones |
+| `bot/sizing.py` | Margen fijo → apalancamiento, cantidad, riesgo, R:R |
+| `bot/bingx.py` | Cliente REST de BingX (firma HMAC-SHA256, demo/real) |
+| `bot/monitor.py` | Cierres, PnL, protección, resúmenes programados |
+| `bot/narrator.py` | Mensajes en castellano simple |
+| `bot/telegram.py` | Envío y comandos |
+| `bot/reports.py`, `bot/drive.py` | Resúmenes y subida a Drive |
+| `bot/cli.py` | `check` (verifica todo), `replay` (motor sobre velas reales) y `test-signal` |
+| `tradingview/bingx_fibo_mtf.pine` | La estrategia para ver en el gráfico (y alertas opcionales) |
+| `docs/STRATEGY.md` | Reglas exactas de la estrategia |
+| `docs/DEPLOY.md` | Puesta en marcha: BingX, Telegram, VPS, TradingView, Drive, demo → real |
+
+## Desarrollo local
+
 ```bash
-git clone <tu-repo>
-cd trading-bot
 python -m venv venv
-source venv/bin/activate      # Linux/Mac
-# venv\Scripts\activate       # Windows
+venv\Scripts\activate          # Windows
+pip install -r requirements-dev.txt
+pytest -q
 ```
 
-### 2. Instalar dependencias
-```bash
-pip install -r requirements.txt
-```
-
-### 3. Configurar variables de entorno
-```bash
-cp .env.example .env
-# Editá .env con tus API keys
-```
-
-**Keys necesarias:**
-- **Binance Testnet:** https://testnet.binance.vision → Register → API Management
-- **Anthropic:** https://console.anthropic.com → API Keys
-- **Telegram:** Hablar con @BotFather → /newbot → obtener token. Luego hablar con @userinfobot para obtener tu chat_id
-
-### 4. Verificar configuración
-```bash
-python -c "from config.settings import load_settings; s = load_settings(); print('Config OK')"
-```
-
-### 5. Arrancar el bot
-```bash
-python main.py
-```
-
----
-
-## Estructura del proyecto
-```
-bot/
-├── config/
-│   ├── settings.py       # Variables globales y validación
-│   └── .env              # API keys (no en git)
-├── core/
-│   ├── exchange.py       # Conexión Binance via ccxt
-│   ├── indicators.py     # RSI, MACD, EMA, ATR, Bollinger
-│   └── claude_agent.py   # Agente de decisión con Claude
-├── strategies/
-│   └── main_strategy.py  # Orquestador del ciclo de trading
-├── execution/
-│   └── order_manager.py  # Órdenes, stop-loss, capital
-├── notifications/
-│   └── telegram.py       # Alertas en tiempo real
-├── logs/
-│   └── logger.py         # Sistema de logs con loguru
-├── data/                 # Estado y journal (generado en runtime)
-├── backtest/             # Motor de backtesting (Fase 7)
-├── tests/                # Tests unitarios
-├── requirements.txt
-├── .env.example
-└── main.py               # Entry point
-```
-
----
-
-## Indicadores utilizados
-| Indicador | Parámetros | Uso |
-|-----------|-----------|-----|
-| RSI | 14 | Entrada (< 35) / Salida (> 65) |
-| MACD | 12,26,9 | Confirmación de cruce alcista |
-| EMA50 | 50 | Tendencia de corto plazo |
-| EMA200 | 200 | Filtro de tendencia dominante |
-| Bollinger Bands | 20,2 | Volatilidad y extremos de precio |
-| ATR | 14 | Cálculo dinámico de stop-loss |
-
----
-
-## Gestión de riesgo
-- Máximo **2%** del capital por operación
-- **30%** del capital en reserva (nunca se toca)
-- Stop-loss dinámico basado en ATR × 1.5
-- Ratio mínimo riesgo/recompensa: **1:2**
-- Límite de drawdown diario: **10%** → bot se detiene automáticamente
-- Circuit breaker de Claude: 3 fallos consecutivos → modo SAFE
-
----
-
-## Criterios para pasar a dinero real (Fase 9)
-Después de mínimo **4 semanas** de paper trading:
-- ✅ Win rate > 50%
-- ✅ Profit Factor > 1.3
-- ✅ Max Drawdown < 12%
-- ✅ Cero errores críticos sin manejar
-- ✅ Logs limpios y completos
-
----
-
-## Comandos útiles
-```bash
-# Ver logs en tiempo real
-tail -f logs/bot_$(date +%Y-%m-%d).log
-
-# Estadísticas actuales
-python -c "
-from config.settings import load_settings
-from execution.order_manager import OrderManager
-s = load_settings()
-om = OrderManager(s)
-import json; print(json.dumps(om.get_stats(), indent=2))
-"
-```
+El bot anterior (Binance) está archivado en la rama `legacy/binance-bot` y el tag `legacy-binance-v1`.

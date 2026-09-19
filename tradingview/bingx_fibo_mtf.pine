@@ -1,0 +1,309 @@
+//@version=6
+// ─────────────────────────────────────────────────────────────────────────────
+//  BingX Bot — Zona 1D + Fibonacci 1H + Diagonal 5m
+//
+//  APLICAR EN EL GRÁFICO DE 5 MINUTOS del perpetuo de BingX (ej. BINGX:BTCUSDT.P).
+//  Una alerta por par: condición "Cualquier llamada a alert()" + webhook del bot.
+//
+//  Reglas (LONG; SHORT es el espejo):
+//   1D  Zona de soporte = nivel donde se agrupan ≥ N pivotes diarios (± ancho × ATR diario).
+//       Se usan sólo días CERRADOS (sin repintado).
+//   1H  El precio toca la zona y cierra sin perderla → etapa "zone".
+//       Cambio de tendencia = cierre 1H por encima del último máximo de swing → "choch".
+//       Impulso = mínimo desde el toque → máximo posterior (se extiende mientras sube).
+//   Fib El retroceso llega al 0.618 → "fib". Si rompe el 0.75 (cierre 1H o mecha,
+//       según config) → "cancel".
+//   5m  Diagonal = línea que une los 2 últimos máximos decrecientes del retroceso
+//       (o el techo del impulso + el último máximo). Cierre de 5m por encima → "entry".
+//   SL  nivel fijo 0.786 del impulso (configurable).   TP  techo del impulso (nivel 0).
+//
+//  El bot (backend) vuelve a validar todo: R:R mínimo, liquidación, slippage, etc.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("BingX Bot — Zona 1D + Fibo 1H + Diagonal 5m", shorttitle = "BingX Fibo MTF", overlay = true,
+     max_lines_count = 400, max_boxes_count = 150, max_labels_count = 300)
+
+// ───────── Inputs ─────────
+grpW = "Webhook"
+secret          = input.string("", "WEBHOOK_SECRET (igual que en el .env del bot)", group = grpW)
+sendStages      = input.bool(true, "Enviar etapas de análisis (zona, cambio 1H, 0.618, cancelado)", group = grpW)
+
+grpD = "1D · Zonas"
+dPivotLen   = input.int(3, "Pivote diario (velas a cada lado)", minval = 1, group = grpD)
+dMaxPivots  = input.int(40, "Pivotes diarios recordados", minval = 5, maxval = 100, group = grpD)
+dTolAtr     = input.float(0.5, "Ancho de zona (× ATR diario)", step = 0.1, group = grpD)
+dMinTouches = input.int(2, "Toques mínimos para validar la zona", minval = 1, group = grpD)
+
+grpH = "1H · Estructura y Fibonacci"
+hPivotLen      = input.int(3, "Pivote 1H (velas a cada lado)", minval = 1, group = grpH)
+fibEntry       = input.float(0.618, "Nivel de entrada", step = 0.001, group = grpH)
+fibInval       = input.float(0.75, "Nivel de invalidación", step = 0.01, group = grpH)
+invalMode      = input.string("Cierre 1H", "Se invalida si rompe el 0.75 por", options = ["Cierre 1H", "Mecha"], group = grpH)
+slMode         = input.string("Fibo fijo", "Stop Loss", options = ["Fibo fijo", "0.75 − ATR", "Inicio del impulso"], group = grpH)
+filterTrend    = input.bool(false, "Sólo a favor de la EMA50 diaria (FILTER_TREND)", group = grpH)
+minRR          = input.float(1.5, "R:R mínimo para marcar la entrada (el bot lo exige neto de comisiones)", step = 0.5, group = grpH)
+slFib          = input.float(0.786, "Nivel Fibo del SL (modo Fibo fijo)", step = 0.001, group = grpH)
+slBufAtr       = input.float(0.1, "Colchón bajo el 0.75 (× ATR 1H, modo ATR)", step = 0.05, group = grpH)
+chochExpiryH   = input.int(48, "Horas máx. para el cambio 1H tras tocar la zona", minval = 1, group = grpH)
+triggerExpiryH = input.int(48, "Horas máx. para retroceso + gatillo 5m", minval = 1, group = grpH)
+
+grpM = "5m · Gatillo"
+mPivotLen = input.int(3, "Pivote 5m para la diagonal", minval = 1, group = grpM)
+
+grpX = "General"
+allowLong  = input.bool(true, "Buscar LONG", group = grpX)
+allowShort = input.bool(true, "Buscar SHORT", group = grpX)
+showDraw   = input.bool(true, "Dibujar zonas, Fibonacci y diagonales", group = grpX)
+
+if timeframe.period != "5"
+    runtime.error("Aplicá este indicador en el gráfico de 5 minutos (las alertas dependen de eso).")
+
+// ───────── 1D: zonas de soporte / resistencia (días cerrados) ─────────
+f_zones(int len, int maxPiv, float tolMult, int minTouches) =>
+    var array<float> piv = array.new<float>()
+    ph = ta.pivothigh(high, len, len)
+    pl = ta.pivotlow(low, len, len)
+    if not na(ph)
+        piv.push(ph)
+    if not na(pl)
+        piv.push(pl)
+    while piv.size() > maxPiv
+        piv.shift()
+    tol = ta.atr(14) * tolMult
+    float sup = na
+    float res = na
+    n = piv.size()
+    if n > 0 and not na(tol)
+        for i = 0 to n - 1
+            lvl = piv.get(i)
+            int touches = 0
+            for j = 0 to n - 1
+                if math.abs(piv.get(j) - lvl) <= tol
+                    touches += 1
+            if touches >= minTouches
+                if lvl <= close + tol and (na(sup) or lvl > sup)
+                    sup := lvl
+                if lvl >= close - tol and (na(res) or lvl < res)
+                    res := lvl
+    [sup[1], res[1], tol[1]]
+
+[dSup, dRes, dTol] = request.security(syminfo.tickerid, "D", f_zones(dPivotLen, dMaxPivots, dTolAtr, dMinTouches), lookahead = barmerge.lookahead_on)
+
+// ───────── 1H: última vela cerrada, swings y ATR ─────────
+f_h1(int len) =>
+    ph = ta.pivothigh(high, len, len)
+    pl = ta.pivotlow(low, len, len)
+    lastPH = ta.valuewhen(not na(ph), ph, 0)
+    lastPL = ta.valuewhen(not na(pl), pl, 0)
+    atr = ta.atr(14)
+    [high[1], low[1], close[1], lastPH[1], lastPL[1], atr[1], time[1]]
+
+[hHigh, hLow, hClose, hLastPH, hLastPL, hAtr, hTime] = request.security(syminfo.tickerid, "60", f_h1(hPivotLen), lookahead = barmerge.lookahead_on)
+newH1 = hTime != hTime[1]
+
+// ───────── 1D: tendencia (último día cerrado) ─────────
+[dClose, dEma] = request.security(syminfo.tickerid, "D", [close[1], ta.ema(close, 50)[1]], lookahead = barmerge.lookahead_on)
+
+// ───────── 5m: pivotes para la diagonal ─────────
+ph5 = ta.pivothigh(high, mPivotLen, mPivotLen)
+pl5 = ta.pivotlow(low, mPivotLen, mPivotLen)
+
+// ───────── Estado de un setup ─────────
+type Setup
+    int dir                 // 1 = LONG, -1 = SHORT
+    int state = 0           // 0 libre · 1 en zona · 2 cambio 1H (esperando 0.618) · 3 en 0.618 (esperando gatillo)
+    string id = ""
+    float zoneLo
+    float zoneHi
+    int touchTime
+    float extreme           // inicio del impulso (nivel 1)
+    float structLvl         // swing a romper en 1H
+    float impEnd            // fin del impulso (nivel 0 = TP)
+    int impEndBar
+    float f618
+    float f75
+    float fSL               // nivel Fibo del SL (0.786 por defecto)
+    int stageTime
+    array<float> pivP
+    array<int> pivB
+
+f_str(float v) =>
+    str.tostring(v)
+
+f_json(Setup s, string ev, float price, float sl, float tp, string note) =>
+    string j = '{"secret":"' + secret + '","event":"' + ev + '","id":"' + s.id + '","symbol":"' + syminfo.ticker
+     + '","side":"' + (s.dir == 1 ? "LONG" : "SHORT") + '","price":' + f_str(price) + ',"time":' + str.tostring(time_close)
+    if not na(sl)
+        j += ',"sl":' + f_str(sl)
+    if not na(tp)
+        j += ',"tp":' + f_str(tp)
+    if not na(s.zoneLo)
+        j += ',"zone_low":' + f_str(s.zoneLo) + ',"zone_high":' + f_str(s.zoneHi)
+    if not na(s.impEnd)
+        j += ',"fib_start":' + f_str(s.extreme) + ',"fib_end":' + f_str(s.impEnd) + ',"fib_618":' + f_str(s.f618) + ',"fib_75":' + f_str(s.f75) + ',"fib_sl":' + f_str(s.fSL)
+    j + ',"note":"' + note + '"}'
+
+emit(Setup s, string ev, float price, float sl, float tp, string note) =>
+    if ev == "entry" or sendStages
+        alert(f_json(s, ev, price, sl, tp, note), alert.freq_once_per_bar_close)
+
+recalcFib(Setup s) =>
+    rng = s.impEnd - s.extreme       // positivo en LONG, negativo en SHORT
+    s.f618 := s.impEnd - fibEntry * rng
+    s.f75 := s.impEnd - fibInval * rng
+    s.fSL := s.impEnd - slFib * rng
+
+reset(Setup s) =>
+    s.state := 0
+    s.id := ""
+    s.zoneLo := na
+    s.zoneHi := na
+    s.extreme := na
+    s.structLvl := na
+    s.impEnd := na
+    s.impEndBar := na
+    s.f618 := na
+    s.f75 := na
+    s.fSL := na
+    s.pivP.clear()
+    s.pivB.clear()
+
+cancel(Setup s, string why) =>
+    emit(s, "cancel", close, na, na, why)
+    if showDraw
+        label.new(bar_index, s.dir == 1 ? low : high, "✕ " + why, color = color.new(color.gray, 20),
+             textcolor = color.white, style = s.dir == 1 ? label.style_label_up : label.style_label_down, size = size.tiny)
+    reset(s)
+
+step(Setup s) =>
+    isLong = s.dir == 1
+
+    // 0 → 1: el precio toca la zona diaria (evaluado al cierre de cada hora)
+    if s.state == 0 and newH1
+        lvl = isLong ? dSup : dRes
+        if not na(lvl) and not na(dTol)
+            zLo = lvl - dTol
+            zHi = lvl + dTol
+            touched = isLong ? (hLow <= zHi and hClose >= zLo) : (hHigh >= zLo and hClose <= zHi)
+            if touched
+                s.state := 1
+                s.id := syminfo.ticker + "-" + (isLong ? "L" : "S") + "-" + str.tostring(hTime)
+                s.zoneLo := zLo
+                s.zoneHi := zHi
+                s.touchTime := hTime
+                s.stageTime := hTime
+                s.extreme := isLong ? hLow : hHigh
+                s.structLvl := isLong ? hLastPH : hLastPL
+                emit(s, "zone", hClose, na, na, isLong ? "toco soporte diario" : "toco resistencia diaria")
+                if showDraw
+                    box.new(bar_index - 12, zHi, bar_index + 48, zLo, border_color = isLong ? color.teal : color.maroon,
+                         bgcolor = color.new(isLong ? color.teal : color.maroon, 85))
+
+    // 1 → 2: cambio de estructura en 1H
+    else if s.state == 1 and newH1
+        s.extreme := isLong ? math.min(s.extreme, hLow) : math.max(s.extreme, hHigh)
+        s.structLvl := isLong ? hLastPH : hLastPL
+        zoneLost = isLong ? hClose < s.zoneLo : hClose > s.zoneHi
+        broke = not na(s.structLvl) and (isLong ? hClose > s.structLvl : hClose < s.structLvl)
+        if zoneLost
+            cancel(s, "cerro del otro lado de la zona diaria")
+        else if hTime - s.touchTime > chochExpiryH * 3600000
+            cancel(s, "sin cambio de tendencia 1H a tiempo")
+        else if broke
+            s.state := 2
+            s.stageTime := hTime
+            s.impEnd := isLong ? hHigh : hLow
+            s.impEndBar := bar_index
+            recalcFib(s)
+            emit(s, "choch", hClose, na, na, "rompio el ultimo swing 1H")
+
+    // 2 y 3: impulso, retroceso y gatillo (vela a vela de 5m)
+    else if s.state >= 2
+        // El impulso se sigue extendiendo mientras no empiece el retroceso al 0.618.
+        if s.state == 2 and (isLong ? high > s.impEnd : low < s.impEnd)
+            s.impEnd := isLong ? high : low
+            s.impEndBar := bar_index
+            s.pivP.clear()
+            s.pivB.clear()
+            recalcFib(s)
+
+        // Máximos (LONG) / mínimos (SHORT) del retroceso para la diagonal
+        pivVal = isLong ? ph5 : pl5
+        pivBar = bar_index - mPivotLen
+        if not na(pivVal) and pivBar > s.impEndBar
+            s.pivP.push(pivVal)
+            s.pivB.push(pivBar)
+
+        brokeInval = invalMode == "Mecha" ? (isLong ? low < s.f75 : high > s.f75) : (newH1 and (isLong ? hClose < s.f75 : hClose > s.f75))
+        passedTarget = s.state == 3 and (isLong ? high >= s.impEnd : low <= s.impEnd)
+        if brokeInval
+            cancel(s, "rompio el 0.75")
+        else if passedTarget
+            cancel(s, "el precio volvio al objetivo sin gatillo en 5m")
+        else if time - s.stageTime > triggerExpiryH * 3600000
+            cancel(s, s.state == 2 ? "no retrocedio al 0.618 a tiempo" : "sin gatillo en 5m a tiempo")
+        else if s.state == 2 and (isLong ? low <= s.f618 : high >= s.f618)
+            s.state := 3
+            s.stageTime := time
+            emit(s, "fib", close, na, na, "retroceso en 0.618 sin romper 0.75")
+            if showDraw
+                line.new(s.impEndBar, s.f618, bar_index + 24, s.f618, color = color.orange, style = line.style_dashed)
+                line.new(s.impEndBar, s.f75, bar_index + 24, s.f75, color = color.red, style = line.style_dotted)
+                line.new(s.impEndBar, s.fSL, bar_index + 24, s.fSL, color = color.maroon, style = line.style_solid)
+        else if s.state == 3
+            n = s.pivP.size()
+            if n >= 1
+                y1 = n >= 2 ? s.pivP.get(n - 2) : s.impEnd
+                x1 = n >= 2 ? s.pivB.get(n - 2) : s.impEndBar
+                y2 = s.pivP.get(n - 1)
+                x2 = s.pivB.get(n - 1)
+                converging = isLong ? y2 < y1 : y2 > y1
+                if converging and x2 > x1
+                    slope = (y2 - y1) / (x2 - x1)
+                    lineNow = y2 + slope * (bar_index - x2)
+                    linePrev = lineNow - slope
+                    breakout = isLong ? (close > lineNow and close[1] <= linePrev) : (close < lineNow and close[1] >= linePrev)
+                    insideFib = isLong ? close > s.f75 : close < s.f75
+                    againstTrend = filterTrend and (na(dEma) or (isLong ? dClose <= dEma : dClose >= dEma))
+                    if breakout and insideFib and againstTrend
+                        cancel(s, "va contra la tendencia diaria (EMA50)")
+                    else if breakout and insideFib
+                        sl = slMode == "Fibo fijo" ? s.fSL : slMode == "Inicio del impulso" ? (isLong ? s.extreme - slBufAtr * hAtr : s.extreme + slBufAtr * hAtr) : (isLong ? s.f75 - slBufAtr * hAtr : s.f75 + slBufAtr * hAtr)
+                        tp = s.impEnd
+                        rr = math.abs(tp - close) / math.abs(close - sl)
+                        emit(s, "entry", close, sl, tp, rr >= minRR ? "ruptura de la diagonal en 5m" : "ruptura de la diagonal en 5m (R:R bajo: el bot la descarta)")
+                        if showDraw
+                            line.new(x1, y1, bar_index, lineNow, color = color.yellow, width = 2)
+                            line.new(bar_index, sl, bar_index + 36, sl, color = color.red, width = 2)
+                            line.new(bar_index, tp, bar_index + 36, tp, color = color.lime, width = 2)
+                            label.new(bar_index, isLong ? low : high, (isLong ? "LONG " : "SHORT ") + str.tostring(close, format.mintick),
+                                 color = isLong ? color.green : color.red, textcolor = color.white,
+                                 style = isLong ? label.style_label_up : label.style_label_down)
+                        reset(s)
+
+var Setup longSetup  = Setup.new(dir = 1, pivP = array.new<float>(), pivB = array.new<int>())
+var Setup shortSetup = Setup.new(dir = -1, pivP = array.new<float>(), pivB = array.new<int>())
+
+if allowLong
+    step(longSetup)
+if allowShort
+    step(shortSetup)
+
+// ───────── Visual ─────────
+plot(showDraw ? dSup : na, "Soporte diario", color = color.new(color.teal, 40), style = plot.style_circles, linewidth = 1)
+plot(showDraw ? dRes : na, "Resistencia diaria", color = color.new(color.maroon, 40), style = plot.style_circles, linewidth = 1)
+plot(showDraw and longSetup.state >= 2 ? longSetup.f618 : na, "LONG 0.618", color = color.orange, style = plot.style_linebr)
+plot(showDraw and longSetup.state >= 2 ? longSetup.f75 : na, "LONG 0.75", color = color.red, style = plot.style_linebr)
+plot(showDraw and shortSetup.state >= 2 ? shortSetup.f618 : na, "SHORT 0.618", color = color.orange, style = plot.style_linebr)
+plot(showDraw and shortSetup.state >= 2 ? shortSetup.f75 : na, "SHORT 0.75", color = color.red, style = plot.style_linebr)
+
+stageName(int st) =>
+    st == 0 ? "buscando zona" : st == 1 ? "en zona diaria" : st == 2 ? "esperando 0.618" : "esperando gatillo 5m"
+
+var table info = table.new(position.top_right, 2, 3, bgcolor = color.new(color.black, 30))
+if barstate.islast
+    table.cell(info, 0, 0, "LONG", text_color = color.lime)
+    table.cell(info, 1, 0, allowLong ? stageName(longSetup.state) : "off", text_color = color.white)
+    table.cell(info, 0, 1, "SHORT", text_color = color.red)
+    table.cell(info, 1, 1, allowShort ? stageName(shortSetup.state) : "off", text_color = color.white)
+    table.cell(info, 0, 2, "Secret", text_color = color.gray)
+    table.cell(info, 1, 2, secret == "" ? "⚠️ FALTA" : "ok", text_color = secret == "" ? color.orange : color.gray)

@@ -1,44 +1,15 @@
-# Local dev
 .git
 .gitignore
-.venv/
 venv/
+.venv/
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
 .pytest_cache/
-.mypy_cache/
-.ruff_cache/
-
-# Estado runtime (se monta como volumen, no se copia en el build).
-# OJO: NO ignoramos logs/ porque ahí vive el código (logs/logger.py).
-# Solo ignoramos los archivos generados dentro de logs/.
 data/
-logs/bot.log
-logs/bot.log.*
-logs/run_stdout.log
-logs/__pycache__/
-
-# Secretos (se inyectan vía env_file en compose)
-.env
-.env.local
-.env.*.local
-
-# IDE / OS
-.vscode/
-.idea/
-*.swp
-.DS_Store
-Thumbs.db
-desktop.ini
-
-# Docs / extras que no necesita la imagen
+_legacy_local/
+tests/
 docs/
-*.md
-!README.md
-
-# Backups y archivos generados
-*.bak
-*.before_*
-.env.example
+tradingview/
+.env
+.env.*
+.claude/
