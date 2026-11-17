@@ -357,6 +357,16 @@ class OrderManager:
 
         client_order_id = f"bot_{uuid.uuid4().hex[:12]}"
         amount_btc = trade_size_usdt / price
+        if self.exchange is not None:
+            # Cantidad ajustada al stepSize ANTES de mandar nada: así la entrada,
+            # el SL, el TP y el estado local usan exactamente la misma qty.
+            amount_btc = self.exchange.round_amount(amount_btc)
+            if amount_btc <= 0:
+                logger.warning(
+                    f"⚠️ Tamaño {trade_size_usdt:.2f} USDT < 1 stepSize. Posición saltada."
+                )
+                return None
+            trade_size_usdt = amount_btc * price
 
         position = Position(
             order_id="PAPER",
@@ -383,10 +393,9 @@ class OrderManager:
         if self.exchange is not None:
             # Pre-flight: validar filtros antes de gastar capital o intentar la orden.
             side = "buy" if direction == "LONG" else "sell"
-            check_btc = position.amount_btc
-            check_usdt = trade_size_usdt if side == "buy" else (check_btc * price)
             ok, reason = self.exchange.validate_order_filters(
-                amount_btc=float(check_btc), amount_usdt=float(check_usdt),
+                amount_btc=float(position.amount_btc),
+                amount_usdt=float(position.amount_btc) * price,
             )
             if not ok:
                 logger.warning(
@@ -396,9 +405,11 @@ class OrderManager:
                 return None
 
             try:
+                # LONG y SHORT usan la MISMA unidad (BTC): solo cambia el side.
                 order = self.exchange.place_market_order(
-                    side=side, amount_usdt=trade_size_usdt,
+                    side=side,
                     client_order_id=client_order_id,
+                    qty_base=float(position.amount_btc),
                 )
                 position.order_id = order.get("id", "UNKNOWN")
             except ValueError as e:
@@ -406,7 +417,6 @@ class OrderManager:
                 logger.warning(f"⚠️ {e}")
                 return None
             except Exception as e:
-                # En Spot, SHORT (sell sin BTC) cae acá con InsufficientFunds.
                 logger.error(f"Error al ejecutar orden de entrada: {e}")
                 return None
 
@@ -430,8 +440,8 @@ class OrderManager:
                 try:
                     self.exchange.place_market_order(
                         side=close_side,
-                        amount_usdt=float(position.amount_btc),  # qty en sell
                         client_order_id=f"{client_order_id}_rollback",
+                        qty_base=float(position.amount_btc),
                         reduce_only=True,
                     )
                 except Exception as e2:
@@ -509,8 +519,8 @@ class OrderManager:
             try:
                 self.exchange.place_market_order(
                     side=close_side,
-                    amount_usdt=float(pos.amount_btc),  # cantidad para sell
                     client_order_id=f"{pos.client_order_id}_close",
+                    qty_base=float(pos.amount_btc),
                     reduce_only=True,  # NUNCA abrir: si ya está flat, se rechaza
                 )
             except Exception as e:
@@ -872,8 +882,8 @@ class OrderManager:
                         close_side = "sell" if pos.direction == "LONG" else "buy"
                         self.exchange.place_market_order(
                             side=close_side,
-                            amount_usdt=float(pos.amount_btc),
                             client_order_id=f"{pos.client_order_id}_reconcile_close",
+                            qty_base=float(pos.amount_btc),
                             reduce_only=True,
                         )
                         result["actions"].append("posición cerrada a mercado (sin protecciones)")

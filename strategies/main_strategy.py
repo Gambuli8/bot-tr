@@ -50,9 +50,9 @@ class MainStrategy:
             logger.warning("⚠️  Motor: TechnicalEngine (legacy — sin edge en backtest 90d+)")
         self.engine_name = engine_name
 
-        # exchange_client conectado al testnet: SL/TP van como órdenes reales
-        # al exchange (idempotentes vs sleep/crash del proceso). Sólo soporta LONG
-        # en Spot; SHORT en Spot va a fallar en place_market_order.
+        # exchange_client conectado al testnet Futures: entrada, SL y TP van como
+        # órdenes reales al exchange (idempotentes vs sleep/crash del proceso).
+        # LONG y SHORT se operan igual (qty en BTC; sólo cambia el side).
         self.order_manager = OrderManager(settings, exchange_client=self.exchange)
         self.telegram = TelegramNotifier(settings)
         self._last_report_date = None

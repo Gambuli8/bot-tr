@@ -378,68 +378,80 @@ class ExchangeClient:
 
         return True, "OK"
 
+    def round_amount(self, qty_base: float, symbol: Optional[str] = None) -> float:
+        """Cantidad en moneda base ajustada al stepSize del par (trunca, como Binance)."""
+        sym = symbol or self.settings.symbol
+        return float(self.exchange.amount_to_precision(sym, qty_base))
+
     @retry(max_attempts=3, base_delay=1.0)
     def place_market_order(
         self,
         side: str,
-        amount_usdt: float,
         client_order_id: str,
+        *,
+        notional_usdt: Optional[float] = None,
+        qty_base: Optional[float] = None,
         reduce_only: bool = False,
     ) -> dict:
         """
-        Coloca una orden de mercado.
-        side: 'buy' o 'sell'
-        amount_usdt: capital a usar en USDT
-        client_order_id: ID único para idempotencia
+        Coloca una orden de mercado en Futures USDT-M.
+
+        side: 'buy' o 'sell' — en Futures ambos lados abren o cierran según la
+          posición; la UNIDAD de la cantidad NO depende del side.
+        Cantidad: exactamente UNO de
+          - notional_usdt: tamaño en USDT → qty = notional / precio actual.
+          - qty_base:      cantidad en moneda base (BTC) tal cual.
+          (Antes un solo parámetro `amount_usdt` significaba USDT en 'buy' y BTC
+          en 'sell': abrir SHORT vendía N *BTC* y cerrar SHORT compraba N/precio.)
         reduce_only: si True, la orden SOLO puede cerrar/reducir, NUNCA abrir una
           posición nueva. CRÍTICO para los cierres: si el estado local cree que
           hay posición pero el exchange ya la cerró (ej. el SL se ejecutó), una
           orden sin reduceOnly abriría una posición OPUESTA fantasma. Con
           reduceOnly, Binance la rechaza por "no hay nada que reducir" → seguro.
         """
+        if side not in ("buy", "sell"):
+            raise ValueError(f"side inválido: {side!r} (esperado 'buy' o 'sell')")
+        if (notional_usdt is None) == (qty_base is None):
+            raise ValueError("Pasá exactamente uno de notional_usdt o qty_base")
+
         symbol = self.settings.symbol
         # Asegurar leverage/margin configurados en el exchange antes de abrir
         # (idempotente: solo dispara API call si el símbolo cambió)
         self.configure_leverage_and_margin(symbol)
         price = self.get_price(symbol)
 
-        if side == "buy":
-            # Calculamos cuánto BTC podemos comprar
-            amount_btc = amount_usdt / price
-            # Ajustar a la precisión del par
-            amount_btc = self.exchange.amount_to_precision(symbol, amount_btc)
-            check_notional = amount_usdt
-        else:
-            # Para vender, amount_usdt representa la cantidad de BTC a vender
-            amount_btc = amount_usdt
-            amount_btc = self.exchange.amount_to_precision(symbol, amount_btc)
-            check_notional = float(amount_btc) * price
+        raw_qty = qty_base if qty_base is not None else float(notional_usdt) / price
+        if raw_qty <= 0:
+            raise ValueError(f"Cantidad no positiva: {raw_qty}")
+        amount_base = self.round_amount(raw_qty, symbol)
+        notional = amount_base * price
 
         # Pre-flight: validar filtros antes de mandar. Los cierres (reduce_only)
         # NO se validan contra MIN_NOTIONAL: hay que poder cerrar siempre, incluso
         # posiciones chicas/dust que quedaron por debajo del mínimo.
         if not reduce_only:
             ok, reason = self.validate_order_filters(
-                float(amount_btc), float(check_notional), symbol=symbol,
+                amount_base, notional, symbol=symbol,
             )
             if not ok:
                 raise ValueError(f"Orden rechazada por filtros: {reason}")
 
-        params = {"newClientOrderId": client_order_id}
+        params: dict = {"newClientOrderId": client_order_id}
         if reduce_only:
             params["reduceOnly"] = True
 
         order = self.exchange.create_market_order(
             symbol=symbol,
             side=side,
-            amount=float(amount_btc),
+            amount=amount_base,
             params=params,
         )
 
         base = symbol.split("/")[0] if "/" in symbol else symbol
         logger.info(
-            f"📋 Orden ejecutada | {side.upper()} {amount_btc} {base} "
-            f"@ ~${price:,.2f} | ID: {client_order_id}"
+            f"📋 Orden ejecutada | {side.upper()} {amount_base} {base} "
+            f"(~${notional:,.2f}) @ ~${price:,.2f} | "
+            f"{'reduceOnly | ' if reduce_only else ''}ID: {client_order_id}"
         )
         return order
 
