@@ -1,0 +1,5 @@
+# Investigación NQ / Apex (aparte del bot: no hace falta en el VPS)
+databento>=0.80,<1
+pandas>=2.2
+numpy>=1.26
+python-dotenv>=1.0

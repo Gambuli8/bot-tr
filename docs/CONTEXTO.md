@@ -123,3 +123,26 @@ Hecho el 18/09: el funding del carry entra en los resúmenes semanales y mensual
 cobro, comisión y PnL de ajuste queda como evento `carry_income` con la hora del exchange; el resumen de
 Telegram y el informe de Drive suman una sección de carry (por par y total) y el total combinado. El historial
 previo se rellenó a mano en el VPS (28 eventos, backup en `data/bingx/events.jsonl.bak-20260918`).
+
+## 8. Novedades 24/11/2026
+
+**Pruebas de estrés del carry** (`scripts/stress_carry.py`, sin internet; `--historical` usa datos reales):
+- Con ×2 el carry aguanta caídas de −50 %, subas de +100 % con el bot andando, mechas de hasta +40 % y
+  funding negativo (−0,1 %/8 h por 7 días ≈ −1,7 % del par).
+- Lo que lo rompe: (a) **mecha de +30 % cuando el precio ya subió ~15 % sin activar la protección** → −24 % del
+  par; se arregla protegiendo antes (guarda de liquidación 0,7/L en vez de 0,5/L, costo extra mínimo);
+  (b) **bot o API caídos varias horas durante una suba fuerte que después vuelve** → −20/−22 % del par;
+  (c) mecha de +60 % en 5 min. Con ×1,5 sobrevive a todos los escenarios sintéticos.
+- Pendiente: decidir guarda 0,7 y/o ×1,5 en el bot; correr `--historical` en el VPS o la PC.
+
+**Cuentas de fondeo (nuevo objetivo del usuario):** Apex 50K **EOD**, Tradovate, sin fee de activación,
+US$ 119 por única vez, vence a los 30 días, sin resets. Objetivo $3.000, drawdown $2.000 EOD, pérdida diaria
+máx. $1.000, 60 micros. PA: drawdown se congela en $50.100; retiro con 5 días ≥ $250, saldo ≥ $52.600 y
+consistencia 50 %. **Apex prohíbe bots en todas las cuentas** → se opera a mano. Instrumento: NQ en micros (MNQ).
+Plan de riesgo acordado: prueba ~0,75 % ($375; con 30 días el 0,5 % suele vencer), PA 0,5 % ($250),
+máximo 1 operación por día (no mínimo).
+
+**Investigación NQ** (`research/nq/`, instrucciones en su README): el usuario la corre en su PC con datos
+de Databento (la sesión en la nube no tiene salida a Databento). Estrategias: ORB 5m (Zarattini y Aziz 2023;
+réplicas dicen que con costos da ~0), momentum de la primera media hora, la de Alex (zona+Fibo, perdió en
+cripto) y un control al azar. Después `apex_sim.py` mide la chance real de pasar y cobrar.
